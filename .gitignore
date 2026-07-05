@@ -16,7 +16,13 @@ ENV/
 # Environment variables and local config
 .env
 .env.*
+!.env.example
 *.local
+
+# Runtime state and evidence exports
+audit_logs/
+automation_logs/
+broker_state/
 
 # Build/package output
 build/
