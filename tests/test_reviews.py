@@ -26,7 +26,7 @@ def test_post_trade_review_scores_winning_trade():
 
     assert review.outcome == "Win"
     assert review.rule_following_score == 100
-    assert "Aligned" in review.thesis_alignment
+    assert review.thesis_alignment == "Matched trade idea"
     assert review_records(review)
 
 
@@ -34,8 +34,8 @@ def test_post_trade_review_scores_losing_trade_as_invalidated():
     review = review_closed_trade(_trade(pnl=-150, pct=-0.3))
 
     assert review.outcome == "Loss"
-    assert review.thesis_alignment == "Invalidated or stopped out"
-    assert any("Loss was contained" in lesson for lesson in review.lessons)
+    assert review.thesis_alignment == "Stopped out or invalidated"
+    assert any("loss was contained" in lesson.lower() for lesson in review.lessons)
 
 
 def test_post_trade_review_penalizes_missing_stop_and_bad_bars():
@@ -47,6 +47,5 @@ def test_post_trade_review_penalizes_missing_stop_and_bad_bars():
     review = review_closed_trade(trade)
 
     assert review.rule_following_score < 100
-    assert any("Stop level" in lesson for lesson in review.lessons)
-    assert any("data integrity" in lesson for lesson in review.lessons)
-
+    assert any("stop was missing" in lesson.lower() for lesson in review.lessons)
+    assert any("check the data" in lesson.lower() for lesson in review.lessons)

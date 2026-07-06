@@ -27,26 +27,26 @@ def review_closed_trade(trade: dict, thesis: TradeThesis | None = None) -> PostT
 
     if "stop" not in trade or trade.get("stop") in (None, ""):
         score -= 30
-        lessons.append("Stop level was not recorded; require stop data for review.")
+        lessons.append("The stop was missing from the record. Do not review or reuse this trade without a stop.")
     if trade.get("exit_bar", 0) < trade.get("entry_bar", 0):
         score -= 40
-        lessons.append("Exit occurred before entry in the trade log; investigate data integrity.")
+        lessons.append("The exit appears before the entry in the record. Check the data before trusting this trade.")
     if abs(pct_account) > 2.0:
         score -= 15
-        lessons.append("Trade impact exceeded 2% of starting account; review sizing discipline.")
+        lessons.append("The trade moved the account by more than 2%. Check whether the size was too large.")
 
     if pnl > 0:
-        lessons.append("Winner followed the trend-following thesis; preserve exit discipline.")
-        thesis_alignment = "Aligned with trend thesis"
+        lessons.append("The winner matched the trend idea. Keep the same exit discipline.")
+        thesis_alignment = "Matched trade idea"
     elif pnl < 0:
-        lessons.append("Loss was contained; verify that the exit matched stop/channel rules.")
-        thesis_alignment = "Invalidated or stopped out"
+        lessons.append("The loss was contained. Check that the exit followed the stop or channel rule.")
+        thesis_alignment = "Stopped out or invalidated"
     else:
-        lessons.append("Flat result; review whether transaction costs/slippage would alter outcome.")
+        lessons.append("The result was flat. Check whether costs or slippage would have made it a loss.")
         thesis_alignment = "Neutral"
 
     if thesis is not None:
-        lessons.append(f"Original invalidation: {thesis.invalidation}")
+        lessons.append(f"What would have made the idea wrong: {thesis.invalidation}")
 
     return PostTradeReview(
         trade_id=int(trade.get("trade", 0)),
@@ -67,7 +67,6 @@ def review_records(review: PostTradeReview) -> list[dict]:
         {"Field": "Outcome", "Value": review.outcome},
         {"Field": "P&L", "Value": review.pnl},
         {"Field": "% Account", "Value": review.pct_account},
-        {"Field": "Rule Following Score", "Value": review.rule_following_score},
-        {"Field": "Thesis Alignment", "Value": review.thesis_alignment},
+        {"Field": "Rule Score", "Value": review.rule_following_score},
+        {"Field": "Matched Trade Idea", "Value": review.thesis_alignment},
     ]
-

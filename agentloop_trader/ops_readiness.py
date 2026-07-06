@@ -198,7 +198,7 @@ def paper_automation_gate_records(
         {"Check": "Alpaca connected", "Passed": broker_connected, "Detail": "Alpaca is connected." if broker_connected else "Connect Alpaca paper credentials."},
         {"Check": "Alpaca data current", "Passed": not broker_state_stale, "Detail": "Alpaca data is current." if not broker_state_stale else "Refresh Alpaca positions and orders."},
         {"Check": "Saved automation checks", "Passed": True, "Detail": f"{dry_run_snapshots_loaded} saved check(s) loaded."},
-        {"Check": "Paper automation allowed", "Passed": not blockers, "Detail": "No hard blocks found." if not blockers else "; ".join(blockers)},
+        {"Check": "Can ask for paper review", "Passed": not blockers, "Detail": "No hard blocks found." if not blockers else "; ".join(blockers)},
     ]
 
 

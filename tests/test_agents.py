@@ -31,8 +31,9 @@ def test_research_agent_generates_actionable_thesis_for_trade_intent():
 
     assert thesis.symbol == "AAPL"
     assert thesis.generated_by == "rules_research_agent"
-    assert "entry proposal" in thesis.thesis
-    assert thesis.data_basis
+    assert "buy setup" in thesis.thesis
+    assert any("Breakout distance" in item for item in thesis.data_basis)
+    assert any("Volatility" in item for item in thesis.data_basis)
 
 
 def test_research_agent_generates_no_trade_thesis_when_flat():
@@ -41,7 +42,7 @@ def test_research_agent_generates_no_trade_thesis_when_flat():
     thesis = generate_research_thesis("SYNTH", _live(signal="flat"), _stats(), None, risk)
 
     assert thesis.symbol == "SYNTH"
-    assert "not currently actionable" in thesis.thesis
+    assert "not actionable right now" in thesis.thesis
     assert "Reconsider" in thesis.invalidation
 
 
@@ -57,4 +58,3 @@ def test_trade_proposal_bundles_thesis_risk_and_execution_decision():
     assert proposal.risk_check.approved
     assert proposal.execution_decision.approved_for_execution
     assert any(row["Field"] == "Loop" for row in records)
-

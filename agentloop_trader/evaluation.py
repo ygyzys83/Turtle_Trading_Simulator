@@ -91,7 +91,7 @@ def evaluate_walk_forward(
     min_required = warmup_bars + 30
     if split_index < warmup_bars or (total_bars - split_index) < 30:
         raise ValueError(
-            f"Need at least {min_required} train bars and 30 out-of-sample bars; got {total_bars} total bars."
+            f"Need at least {min_required} older bars and 30 newer bars; got {total_bars} total bars."
         )
 
     train_data = data.iloc[:split_index].copy()

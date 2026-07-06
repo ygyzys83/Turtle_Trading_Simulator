@@ -72,7 +72,7 @@ def build_audit_events(
     events.append(
         AuditEvent(
             event_type="risk_check_completed",
-            message="Deterministic risk gate evaluated the trade intent.",
+            message="The rule-based risk check reviewed the trade idea.",
             payload=risk_check,
         )
     )

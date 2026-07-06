@@ -193,7 +193,7 @@ def build_preflight_check(
     if intent is None:
         blocked_reasons.append("No trade intent is present.")
     if not risk_check.approved:
-        blocked_reasons.extend(risk_check.rejected_reasons or ["Risk gate did not approve the trade."])
+        blocked_reasons.extend(risk_check.rejected_reasons or ["Risk check did not approve the trade."])
     if not execution_decision.approved_for_execution and risk_check.approved:
         blocked_reasons.append(execution_decision.reason)
     if execution_decision.requires_manual_approval:

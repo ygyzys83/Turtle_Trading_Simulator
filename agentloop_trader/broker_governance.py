@@ -186,7 +186,7 @@ def alpaca_order_lifecycle_records(tracked_orders: list[dict], alpaca_orders: li
             "Side": order.get("side", ""),
             "Quantity": order.get("quantity", ""),
             "Alpaca Status": _enum_value(order.get("status", "")),
-            "App Status": _display_order_status(str(order.get("lifecycle_status", ""))),
+            "Tracking Status": _display_order_status(str(order.get("lifecycle_status", ""))),
             "Filled Qty": order.get("filled_quantity", ""),
             "Avg Fill": order.get("average_fill_price", ""),
             "Last Updated": order.get("last_synced_at", ""),
@@ -232,7 +232,7 @@ def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orde
         latest_order = matched_orders[-1] if matched_orders else {}
         position_qty = _as_float(position.get("Quantity"))
         adopted_match = bool(matched_orders) and all(_is_adopted_position_order(order) for order in matched_orders)
-        lifecycle_status = (
+        tracking_status = (
             "adopted_alpaca_position"
             if adopted_match
             else "position_matched_to_filled_order"
@@ -245,11 +245,11 @@ def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orde
                 "Position Qty": position.get("Quantity", ""),
                 "Position Value": position.get("Market Value", ""),
                 "Avg Entry": position.get("Average Entry", ""),
-                "App Order Qty": _format_number(filled_qty) if matched_orders else "",
-                "App Avg Fill": latest_order.get("average_fill_price", ""),
-                "Matched App Orders": len(matched_orders),
+                "Tracked Order Qty": _format_number(filled_qty) if matched_orders else "",
+                "Tracked Avg Fill": latest_order.get("average_fill_price", ""),
+                "Matched Saved Orders": len(matched_orders),
                 "Exit Ready": position_qty > 0,
-                "App Status": _display_position_status(lifecycle_status),
+                "Tracking Status": _display_position_status(tracking_status),
             }
         )
 
@@ -264,20 +264,20 @@ def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orde
                 "Position Qty": "",
                 "Position Value": "",
                 "Avg Entry": "",
-                "App Order Qty": _format_number(filled_qty),
-                "App Avg Fill": latest_order.get("average_fill_price", ""),
-                "Matched App Orders": len(orders),
+                "Tracked Order Qty": _format_number(filled_qty),
+                "Tracked Avg Fill": latest_order.get("average_fill_price", ""),
+                "Matched Saved Orders": len(orders),
                 "Exit Ready": False,
-                "App Status": _display_position_status("filled_order_without_open_position"),
+                "Tracking Status": _display_position_status("filled_order_without_open_position"),
             }
         )
     return rows
 
 
 def alpaca_position_lifecycle_summary_records(position_lifecycle_rows: list[dict]) -> list[dict]:
-    statuses = [str(row.get("App Status", "")) for row in position_lifecycle_rows]
+    statuses = [str(row.get("Tracking Status", "")) for row in position_lifecycle_rows]
     return [
-        {"Metric": "Alpaca Positions", "Value": sum(bool(row.get("Position Qty")) for row in position_lifecycle_rows)},
+        {"Metric": "Open Alpaca positions", "Value": sum(bool(row.get("Position Qty")) for row in position_lifecycle_rows)},
         {"Metric": "Positions matched to app orders", "Value": statuses.count("Matched to app order")},
         {"Metric": "Positions manually added to app", "Value": statuses.count("Tracked manually")},
         {"Metric": "Positions needing app tracking", "Value": statuses.count("Needs app tracking")},

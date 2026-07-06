@@ -114,4 +114,4 @@ def test_paper_automation_gate_treats_dry_run_evidence_as_information():
     assert checks["Alpaca connected"]["Passed"]
     assert checks["Saved automation checks"]["Passed"]
     assert checks["Saved automation checks"]["Detail"] == "0 saved check(s) loaded."
-    assert checks["Paper automation allowed"]["Passed"]
+    assert checks["Can ask for paper review"]["Passed"]
