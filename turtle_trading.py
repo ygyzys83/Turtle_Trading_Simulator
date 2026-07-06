@@ -109,6 +109,7 @@ from agentloop_trader.safety import (
 )
 from agentloop_trader.session_journal import (
     PaperSessionSnapshot,
+    alpaca_paper_activity_records,
     new_session_id,
     paper_performance_records,
     session_summary_records,
@@ -233,6 +234,11 @@ def metric_card(col, label, value, sub, color_class=""):
 
 def plain_yes_no(value: bool) -> str:
     return "Yes" if value else "No"
+
+
+def count_waiting_alpaca_orders(order_rows: list[dict]) -> int:
+    waiting_statuses = {"accepted", "new", "pending_new", "partially_filled"}
+    return sum(str(row.get("Status", "")).strip().lower() in waiting_statuses for row in order_rows)
 
 
 def show_blockers(title: str, blockers: list[str]) -> None:
@@ -698,7 +704,7 @@ with trade_desk_tab:
     desk_cols = st.columns(4)
     metric_card(desk_cols[0], "Signal", str(live["signal"]).upper(), source_caption)
     metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
-    metric_card(desk_cols[2], "Paper Equity", f"${paper_equity:,.2f}", "Local paper broker")
+    metric_card(desk_cols[2], "Simulator Equity", f"${paper_equity:,.2f}", "Uses the sidebar account size")
     metric_card(desk_cols[3], "Session P&L", f"${session_pnl:,.2f}", "Since reset", "pos" if session_pnl >= 0 else "neg")
     if intent is None:
         st.info("No trade to review right now. The strategy is waiting.")
@@ -978,7 +984,7 @@ with st.expander("Broker connection", expanded=False):
         {"Item": "Alpaca connected", "Value": plain_yes_no(alpaca_status.connected)},
         {"Item": "Paper orders enabled", "Value": plain_yes_no(enable_alpaca_paper_orders)},
         {"Item": "Open Alpaca positions", "Value": len(alpaca_positions)},
-        {"Item": "Open Alpaca orders", "Value": len(alpaca_orders)},
+        {"Item": "Alpaca orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders)},
     ]
     st.dataframe(pd.DataFrame(broker_summary_rows), use_container_width=True, hide_index=True)
     if show_portfolio_evidence:
@@ -1881,19 +1887,23 @@ if show_portfolio_evidence:
     else:
         st.caption("No session events recorded yet.")
 
-    st.markdown("##### Paper account performance")
+    st.markdown("##### Local simulator performance")
     st.dataframe(pd.DataFrame(paper_performance_records(session_snapshot)), use_container_width=True, hide_index=True)
     if st.button("Save Paper Performance Review"):
         performance_event = AuditEvent(
             event_type="paper_performance_reviewed",
-            message="Paper performance dashboard was reviewed by the user.",
+            message="Local simulator performance was reviewed by the user.",
             payload={"session_id": st.session_state["paper_session_id"]},
         )
         st.session_state["session_audit_events"].append(performance_event)
         if persist_audit_log:
             audit_store.append(performance_event)
         st.rerun()
-    st.caption("This uses local paper records and Alpaca paper records. It does not submit or cancel orders.")
+    st.caption("This uses the sidebar account size and local simulator records. Alpaca account balance is shown above under Alpaca Account.")
+
+    st.markdown("##### Alpaca paper activity")
+    st.dataframe(pd.DataFrame(alpaca_paper_activity_records(session_snapshot)), use_container_width=True, hide_index=True)
+    st.caption("This is saved Alpaca paper order history. It does not affect simulator cash or simulator equity.")
 
     st.markdown("##### Risk details")
     st.dataframe(

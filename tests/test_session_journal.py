@@ -1,5 +1,6 @@
 from agentloop_trader.session_journal import (
     PaperSessionSnapshot,
+    alpaca_paper_activity_records,
     new_session_id,
     paper_performance_records,
     session_summary_records,
@@ -87,11 +88,19 @@ def test_session_timeline_records_extract_key_payload_fields():
     assert rows[1]["Status"] == "canceled"
 
 
-def test_paper_performance_records_report_local_and_alpaca_metrics():
+def test_paper_performance_records_report_only_local_simulator_metrics():
     metrics = {row["Metric"]: row["Value"] for row in paper_performance_records(_snapshot())}
 
-    assert metrics["Paper Cash"] == "$49,000.00"
+    assert metrics["Simulator cash"] == "$49,000.00"
     assert metrics["Session P&L"] == "$500.00"
     assert metrics["Filled app order value"] == "$1,000.00"
+    assert metrics["Filled simulator orders"] == 1
+    assert "Filled Alpaca shares" not in metrics
+
+
+def test_alpaca_paper_activity_records_report_saved_broker_history():
+    metrics = {row["Metric"]: row["Value"] for row in alpaca_paper_activity_records(_snapshot())}
+
+    assert metrics["Saved Alpaca orders"] == 3
     assert metrics["Filled Alpaca shares"] == "40"
-    assert metrics["Open Alpaca orders"] == 1
+    assert metrics["Alpaca orders waiting to fill"] == 1

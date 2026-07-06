@@ -69,23 +69,35 @@ def session_timeline_records(audit_records: list[dict], limit: int = 100) -> lis
 def paper_performance_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     local_filled = [order for order in snapshot.local_orders if _enum_value(order.get("Status")) == "filled"]
     local_notional = sum(_as_float(order.get("Notional")) for order in local_filled)
+    open_local_notional = sum(_as_float(position.get("Book Value")) for position in snapshot.local_positions)
+    return [
+        {"Metric": "Simulator cash", "Value": _money(snapshot.paper_cash)},
+        {"Metric": "Simulator equity", "Value": _money(snapshot.paper_equity)},
+        {"Metric": "Session P&L", "Value": _money(snapshot.session_pnl)},
+        {"Metric": "Filled app order value", "Value": _money(local_notional)},
+        {"Metric": "Open app position value", "Value": _money(open_local_notional)},
+        {"Metric": "Filled simulator orders", "Value": len(local_filled)},
+        {"Metric": "Open simulator positions", "Value": len(snapshot.local_positions)},
+    ]
+
+
+def alpaca_paper_activity_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     alpaca_filled = [order for order in snapshot.tracked_alpaca_orders if _enum_value(order.get("status")) == "filled"]
     alpaca_filled_qty = sum(_as_float(order.get("filled_quantity") or order.get("quantity")) for order in alpaca_filled)
     alpaca_canceled = [
         order for order in snapshot.tracked_alpaca_orders
         if _enum_value(order.get("status")) in {"canceled", "cancelled"}
     ]
-    open_local_notional = sum(_as_float(position.get("Book Value")) for position in snapshot.local_positions)
+    alpaca_waiting = [
+        order for order in snapshot.tracked_alpaca_orders
+        if _enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"}
+    ]
     return [
-        {"Metric": "Paper Cash", "Value": _money(snapshot.paper_cash)},
-        {"Metric": "Paper Equity", "Value": _money(snapshot.paper_equity)},
-        {"Metric": "Session P&L", "Value": _money(snapshot.session_pnl)},
-        {"Metric": "Filled app order value", "Value": _money(local_notional)},
-        {"Metric": "Open app position value", "Value": _money(open_local_notional)},
+        {"Metric": "Saved Alpaca orders", "Value": len(snapshot.tracked_alpaca_orders)},
         {"Metric": "Filled Alpaca shares", "Value": _format_number(alpaca_filled_qty)},
         {"Metric": "Filled Alpaca orders", "Value": len(alpaca_filled)},
         {"Metric": "Canceled Alpaca orders", "Value": len(alpaca_canceled)},
-        {"Metric": "Open Alpaca orders", "Value": sum(_enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"} for order in snapshot.tracked_alpaca_orders)},
+        {"Metric": "Alpaca orders waiting to fill", "Value": len(alpaca_waiting)},
     ]
 
 
