@@ -40,6 +40,16 @@ class AutomationDryRunSnapshot:
     created_at: str
 
 
+@dataclass(frozen=True)
+class AutoExitDecision:
+    status: str
+    ready: bool
+    preview_hash: str
+    symbol: str
+    quantity: str
+    reasons: list[str]
+
+
 class AutomationDryRunStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else DEFAULT_AUTOMATION_DRY_RUN_PATH
@@ -94,6 +104,96 @@ def automation_decision_records(decision: AutomationDecision) -> list[dict]:
         {"Field": "Action", "Value": decision.action},
         {"Field": "Ready", "Value": decision.ready},
         {"Field": "Reasons", "Value": "; ".join(decision.reasons)},
+    ]
+
+
+def auto_exit_decision(
+    automation_level: str,
+    execution_mode: str,
+    automatic_exits_started: bool,
+    broker_connected: bool,
+    broker_can_submit: bool,
+    paper_orders_enabled: bool,
+    kill_switch_enabled: bool,
+    broker_state_stale: bool,
+    market_open: bool,
+    exit_preview_records: list[dict],
+    exit_blockers: dict[str, list[str]],
+    already_sent_hashes: set[str] | None = None,
+) -> AutoExitDecision:
+    reasons: list[str] = []
+    already_sent_hashes = already_sent_hashes or set()
+    if automation_level == "Manual review only":
+        reasons.append("Automation level is Manual review only.")
+    if automation_level == "Auto entries and exits":
+        reasons.append("Auto entries and exits is preview-only in this version.")
+    if automation_level == "Auto exits only" and not automatic_exits_started:
+        reasons.append("Start automatic paper exits is off.")
+    if execution_mode != "paper":
+        reasons.append("How orders are handled must be Paper trading.")
+    if not broker_connected:
+        reasons.append("Alpaca paper is not connected.")
+    if not broker_can_submit:
+        reasons.append("Alpaca paper order submission is not available.")
+    if not paper_orders_enabled:
+        reasons.append("Allow Alpaca paper orders is off.")
+    if kill_switch_enabled:
+        reasons.append("Stop trading switch is on.")
+    if broker_state_stale:
+        reasons.append("Refresh Alpaca positions and orders.")
+    if not market_open:
+        reasons.append("Market is closed; automatic exits wait for market hours.")
+    if not exit_preview_records:
+        reasons.append("No paper exit is available.")
+
+    first_preview = next((row for row in exit_preview_records if row.get("Valid")), None)
+    if first_preview is None:
+        preview_hash = ""
+        symbol = ""
+        quantity = ""
+    else:
+        preview_hash = str(first_preview.get("Review ID", first_preview.get("Preview Hash", "")))
+        symbol = str(first_preview.get("Symbol", ""))
+        quantity = str(first_preview.get("Quantity", ""))
+        blockers = exit_blockers.get(preview_hash, [])
+        if blockers:
+            reasons.extend(blockers)
+        if preview_hash in already_sent_hashes:
+            reasons.append("This exact auto exit was already sent.")
+
+    reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+    if reasons:
+        status = "Off" if automation_level == "Manual review only" else "Blocked"
+        if exit_preview_records and not reasons[:1] == ["Automation level is Manual review only."]:
+            status = "Exit blocked"
+        elif not exit_preview_records and automation_level != "Manual review only":
+            status = "Watching position"
+        return AutoExitDecision(
+            status=status,
+            ready=False,
+            preview_hash=preview_hash,
+            symbol=symbol,
+            quantity=quantity,
+            reasons=reasons,
+        )
+    return AutoExitDecision(
+        status="Exit ready",
+        ready=True,
+        preview_hash=preview_hash,
+        symbol=symbol,
+        quantity=quantity,
+        reasons=["Automatic paper exit can be sent now."],
+    )
+
+
+def auto_exit_decision_records(decision: AutoExitDecision) -> list[dict]:
+    return [
+        {"Field": "Status", "Value": decision.status},
+        {"Field": "Ready To Send", "Value": decision.ready},
+        {"Field": "Symbol", "Value": decision.symbol},
+        {"Field": "Quantity", "Value": decision.quantity},
+        {"Field": "Review ID", "Value": decision.preview_hash},
+        {"Field": "Reason", "Value": "; ".join(decision.reasons)},
     ]
 
 

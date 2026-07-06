@@ -9,6 +9,8 @@ from agentloop_trader.audit_store import JsonlAuditStore
 from agentloop_trader.agents import build_trade_proposal, proposal_records
 from agentloop_trader.automation import (
     AutomationDryRunStore,
+    auto_exit_decision,
+    auto_exit_decision_records,
     automation_decision_records,
     automation_evidence_records,
     automation_readiness_records,
@@ -18,7 +20,11 @@ from agentloop_trader.automation import (
     evidence_dashboard_records,
     paper_automation_dry_run,
 )
-from agentloop_trader.backtest import simulate_turtle_strategy
+from agentloop_trader.backtest import (
+    simulate_trend_pullback_strategy,
+    simulate_turtle_strategy,
+    strategy_comparison_records,
+)
 from agentloop_trader.brokers import (
     AlpacaBrokerAdapterStub,
     PaperBrokerAdapter,
@@ -412,11 +418,19 @@ account = st.sidebar.number_input(
     step=1000,
     help="Used by the local simulator and strategy sizing. Alpaca account balance is read separately from Alpaca.",
 )
+strategy_options = {
+    "Breakout continuation": "breakout",
+    "Trend pullback continuation": "pullback",
+}
+strategy_label = st.sidebar.selectbox("Strategy type", list(strategy_options.keys()), index=0)
+strategy_type = strategy_options[strategy_label]
 entry_w = st.sidebar.slider("Buy breakout length (bars)", 10, 55, 20, step=5)
 exit_w = st.sidebar.slider("Sell exit length (bars)", 5, 30, 10, step=5)
 atr_mult = st.sidebar.slider("Stop distance (ATR multiplier)", 1.0, 4.0, 2.0, step=0.5)
 risk_pct = st.sidebar.slider("Strategy risk per trade (%)", 0.5, 3.0, 1.0, step=0.5)
 ma_w = st.sidebar.slider("Trend filter length (bars)", 50, 300, 200, step=50)
+pullback_w = st.sidebar.slider("Pullback average length (bars)", 10, 50, 20, step=5)
+momentum_w = st.sidebar.slider("Momentum turn length (bars)", 3, 20, 10, step=1)
 
 st.sidebar.markdown("### 4. Order Mode")
 mode_options = {
@@ -448,11 +462,43 @@ confirm_alpaca_paper_order = st.sidebar.checkbox("Confirm next paper buy", value
 confirm_alpaca_paper_cancel = st.sidebar.checkbox("Confirm next paper cancel", value=False)
 confirm_alpaca_paper_exit = st.sidebar.checkbox("Confirm next paper exit", value=False)
 
-st.sidebar.markdown("### 7. Research Tools")
+st.sidebar.markdown("### 7. Automation")
+automation_level_options = [
+    "Manual review only",
+    "Auto exits only",
+    "Auto entries and exits",
+]
+automation_level = st.sidebar.selectbox("Automation level", automation_level_options, index=0)
+st.sidebar.caption(
+    "Manual review only sends nothing automatically. Auto exits only can send paper sell orders for open Alpaca paper positions."
+)
+automatic_exits_started = st.sidebar.checkbox(
+    "Start automatic paper exits",
+    value=False,
+    disabled=automation_level != "Auto exits only",
+)
+if automation_level == "Auto entries and exits":
+    st.sidebar.caption("Auto entries and exits is preview-only in this version. It will not send paper buy orders yet.")
+
+st.sidebar.markdown("### 8. Research Tools")
 run_walk_forward = st.sidebar.checkbox("Test on newer price data", value=True)
 train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step=5) / 100
 run_parameter_loop = st.sidebar.checkbox("Compare nearby strategy settings", value=False)
 max_parameter_candidates = st.sidebar.slider("Settings to compare", 4, 16, 8, step=4)
+
+st.sidebar.markdown("### 9. Setup Quality Inputs")
+st.sidebar.caption("Trend and risk approval are always included. The selected strategy adds either breakout or pullback inputs.")
+setup_inputs = {
+    "breakout_strength": st.sidebar.checkbox("Breakout strength", value=True),
+    "volume": st.sidebar.checkbox("Volume confirmation", value=True),
+    "volatility": st.sidebar.checkbox("Volatility", value=True),
+    "room_above_exit": st.sidebar.checkbox("Room above exit", value=True),
+    "relative_strength": st.sidebar.checkbox("Relative strength", value=False),
+    "market_condition": st.sidebar.checkbox("Market condition", value=False),
+    "liquidity": st.sidebar.checkbox("Liquidity", value=True),
+    "event_risk": st.sidebar.checkbox("Event risk", value=False),
+    "rsi": st.sidebar.checkbox("RSI condition", value=True),
+}
 
 with st.sidebar.expander("Files and saved records", expanded=False):
     persist_audit_log = st.checkbox("Save activity log", value=True)
@@ -487,6 +533,8 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["armed_alpaca_cancel_order_id"] = None
     st.session_state["armed_alpaca_exit_hash"] = None
     st.session_state["armed_alpaca_exit_symbol"] = None
+    st.session_state["auto_exit_sent_hashes"] = []
+    st.session_state["last_auto_exit_decision_key"] = None
     st.session_state["tracked_alpaca_orders"] = []
     st.session_state["simulated_alpaca_positions"] = []
 if reset_paper_broker:
@@ -502,6 +550,8 @@ if reset_paper_broker:
     st.session_state["armed_alpaca_cancel_order_id"] = None
     st.session_state["armed_alpaca_exit_hash"] = None
     st.session_state["armed_alpaca_exit_symbol"] = None
+    st.session_state["auto_exit_sent_hashes"] = []
+    st.session_state["last_auto_exit_decision_key"] = None
     st.session_state["tracked_alpaca_orders"] = []
     st.session_state["simulated_alpaca_positions"] = []
     st.session_state["session_disabled"] = False
@@ -513,6 +563,8 @@ st.session_state.setdefault("armed_alpaca_cancel_hash", None)
 st.session_state.setdefault("armed_alpaca_cancel_order_id", None)
 st.session_state.setdefault("armed_alpaca_exit_hash", None)
 st.session_state.setdefault("armed_alpaca_exit_symbol", None)
+st.session_state.setdefault("auto_exit_sent_hashes", [])
+st.session_state.setdefault("last_auto_exit_decision_key", None)
 st.session_state.setdefault("tracked_alpaca_orders", [])
 st.session_state.setdefault("simulated_alpaca_positions", [])
 audit_store = JsonlAuditStore(audit_log_path)
@@ -551,16 +603,60 @@ session_pnl = paper_equity - st.session_state["paper_starting_cash"]
 effective_kill_switch = kill_switch or st.session_state.get("session_disabled", False)
 
 try:
-    prices, smas, atrs, trade_log, live, stats, labels = simulate_turtle_strategy(
+    breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = simulate_turtle_strategy(
         account, entry_w, exit_w, atr_mult, risk_dec, ma_w, seed, market_data
+    )
+    pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = simulate_trend_pullback_strategy(
+        account=account,
+        pullback_w=pullback_w,
+        exit_w=exit_w,
+        atr_mult=atr_mult,
+        risk_pct_dec=risk_dec,
+        trend_w=ma_w,
+        momentum_w=momentum_w,
+        seed=seed,
+        market_data=market_data,
     )
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
 
+strategy_results = {
+    "Breakout continuation": {
+        "prices": breakout_prices,
+        "smas": breakout_smas,
+        "atrs": breakout_atrs,
+        "trade_log": breakout_trade_log,
+        "live": breakout_live,
+        "stats": breakout_stats,
+        "labels": breakout_labels,
+    },
+    "Trend pullback continuation": {
+        "prices": pullback_prices,
+        "smas": pullback_smas,
+        "atrs": pullback_atrs,
+        "trade_log": pullback_trade_log,
+        "live": pullback_live,
+        "stats": pullback_stats,
+        "labels": pullback_labels,
+    },
+}
+selected_strategy_result = strategy_results[strategy_label]
+prices = selected_strategy_result["prices"]
+smas = selected_strategy_result["smas"]
+atrs = selected_strategy_result["atrs"]
+trade_log = selected_strategy_result["trade_log"]
+live = selected_strategy_result["live"]
+stats = selected_strategy_result["stats"]
+labels = selected_strategy_result["labels"]
+comparison_rows = strategy_comparison_records({
+    "Breakout continuation": breakout_stats,
+    "Trend pullback continuation": pullback_stats,
+})
+
 walk_forward_result = None
 walk_forward_error = None
-if run_walk_forward:
+if run_walk_forward and strategy_type == "breakout":
     try:
         walk_forward_result = evaluate_walk_forward(
             account=account,
@@ -575,8 +671,11 @@ if run_walk_forward:
         )
     except ValueError as exc:
         walk_forward_error = str(exc)
+elif run_walk_forward and strategy_type == "pullback":
+    walk_forward_error = "Newer-data test for trend pullback will be added after the pullback backtest has been reviewed."
 
 current_strategy_config = StrategyConfig(
+    name=strategy_label,
     entry_window=entry_w,
     exit_window=exit_w,
     atr_stop_multiplier=atr_mult,
@@ -586,7 +685,7 @@ current_strategy_config = StrategyConfig(
 parameter_candidates = []
 recommended_candidate = None
 parameter_loop_error = None
-if run_parameter_loop:
+if run_parameter_loop and strategy_type == "breakout":
     try:
         parameter_candidates = evaluate_parameter_candidates(
             current=current_strategy_config,
@@ -600,6 +699,8 @@ if run_parameter_loop:
         recommended_candidate = recommend_candidate(parameter_candidates)
     except ValueError as exc:
         parameter_loop_error = str(exc)
+elif run_parameter_loop and strategy_type == "pullback":
+    parameter_loop_error = "Nearby-setting comparison is currently available for breakout continuation only."
 
 risk_limits = RiskLimits(
     allowed_symbols=allowed_symbols,
@@ -692,6 +793,7 @@ audit_key = (
     mode_label,
     source_caption,
     live["signal"],
+    strategy_label,
     intent.symbol_clean if intent else None,
     intent.quantity if intent else None,
     risk_check.approved,
@@ -777,6 +879,8 @@ setup_scorecard_rows = setup_scorecard_records(
     live,
     risk_approved=risk_check.approved,
     blocked_reasons=preflight_check.blocked_reasons or risk_check.rejected_reasons,
+    enabled_inputs=setup_inputs,
+    strategy_type=strategy_type,
 )
 
 trade_desk_tab, agent_loop_tab, broker_risk_tab, evidence_tab, readiness_tab = st.tabs(
@@ -786,7 +890,7 @@ with trade_desk_tab:
     desk_cols = st.columns(4)
     metric_card(desk_cols[0], "Now", operator_state["State"], operator_state["Detail"])
     metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
-    metric_card(desk_cols[2], "Simulator Value", f"${paper_equity:,.2f}", "Uses the sidebar account size")
+    metric_card(desk_cols[2], "Strategy", strategy_label, "Selected in the sidebar")
     metric_card(desk_cols[3], "Session P&L", f"${session_pnl:,.2f}", "Since reset", "pos" if session_pnl >= 0 else "neg")
     st.info(f"Next action: {operator_state['Next Action']}")
     st.dataframe(pd.DataFrame(setup_scorecard_rows), use_container_width=True, hide_index=True)
@@ -933,6 +1037,7 @@ if show_portfolio_evidence:
         st.caption("These checks are local only. The lock file does not enable live trading.")
 
 page_section("2. Strategy test results", "Backtest results and optional research checks for the selected strategy settings.")
+st.info(f"Current trading rule: {strategy_label}. Only the selected strategy can create the trade idea shown in this run.")
 c1, c2, c3, c4 = st.columns(4)
 pnl_color = "pos" if stats["total_pnl"] >= 0 else "neg"
 metric_card(c1, "Final equity", f"${stats['final_equity']:,}", f"Started ${account:,}")
@@ -945,7 +1050,11 @@ metric_card(c5, "Worst drop", f"{stats['max_drawdown_pct']}%", "Largest equity p
 metric_card(c6, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
 metric_card(c7, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
 
-sub_section("2.1 Test on newer price data")
+sub_section("2.1 Strategy comparison")
+st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
+st.caption("This compares the existing breakout strategy against the new trend pullback strategy on the same ticker and settings.")
+
+sub_section("2.2 Test on newer price data")
 if walk_forward_result is None:
     if walk_forward_error:
         st.warning(walk_forward_error)
@@ -977,7 +1086,7 @@ else:
         for reason in walk_forward_result.reasons:
             st.markdown(f"- {reason}")
 
-sub_section("2.2 Compare nearby strategy settings")
+sub_section("2.3 Compare nearby strategy settings")
 if not run_parameter_loop:
     st.caption("This is turned off. Enable it in the sidebar to compare nearby strategy settings.")
 elif parameter_loop_error:
@@ -1020,13 +1129,24 @@ r1_status = "breakout confirmed" if lp > dh else "below channel"
 r2_status = "upward filter passed" if live["sma_up"] else "downward no entry"
 
 with st.expander("Current strategy rules", expanded=False):
-    st.markdown(f"""
-    <div class="rule-box"><b>1. Entry:</b> Buy when price breaks above {entry_w}-bar high (<b>${dh}</b>). Current: <b>${lp}</b> - {r1_status}</div>
-    <div class="rule-box"><b>2. Filter:</b> {ma_w}-bar SMA = <b>${ls}</b>. Trend filter: {r2_status}</div>
-    <div class="rule-box"><b>3. Volatility:</b> ATR (14d) = <b>${la}</b>. Stop distance = <b>{atr_mult}x ATR = ${live['stop_from_entry']}</b></div>
-    <div class="rule-box"><b>4. Position size:</b> Risk {risk_pct}% of ${live['balance']:,.0f} = <b>${live['balance'] * risk_dec:,.0f}</b>. Position = <b>{live['pos_size']} shares</b></div>
-    <div class="rule-box"><b>5. Exit:</b> Sell when price touches {exit_w}-bar low (<b>${dl}</b>). Current: <b>${lp}</b> - {'exit triggered' if lp <= dl else 'holding'}</div>
-    """, unsafe_allow_html=True)
+    if strategy_type == "pullback":
+        pullback_depth = live.get("pullback_depth_pct")
+        pullback_text = f"{float(pullback_depth):.1f}%" if pullback_depth else "n/a"
+        st.markdown(f"""
+        <div class="rule-box"><b>1. Trend:</b> Price should stay above a rising {ma_w}-bar average. Current trend filter: {r2_status}</div>
+        <div class="rule-box"><b>2. Pullback:</b> Look for a controlled pullback near the {pullback_w}-bar average. Current pullback depth: <b>{pullback_text}</b></div>
+        <div class="rule-box"><b>3. Momentum turn:</b> Buy only after price turns back up above the {momentum_w}-bar average. Current: <b>{'turn confirmed' if live.get('momentum_turn') else 'not confirmed'}</b></div>
+        <div class="rule-box"><b>4. Risk:</b> Stop distance = <b>{atr_mult}x ATR = ${live['stop_from_entry']}</b>. Risk {risk_pct}% of ${live['balance']:,.0f}; position = <b>{live['pos_size']} shares</b></div>
+        <div class="rule-box"><b>5. Exit:</b> Sell if price loses the pullback average or hits the ATR stop.</div>
+        """, unsafe_allow_html=True)
+    else:
+        st.markdown(f"""
+        <div class="rule-box"><b>1. Entry:</b> Buy when price breaks above {entry_w}-bar high (<b>${dh}</b>). Current: <b>${lp}</b> - {r1_status}</div>
+        <div class="rule-box"><b>2. Filter:</b> {ma_w}-bar SMA = <b>${ls}</b>. Trend filter: {r2_status}</div>
+        <div class="rule-box"><b>3. Volatility:</b> ATR (14d) = <b>${la}</b>. Stop distance = <b>{atr_mult}x ATR = ${live['stop_from_entry']}</b></div>
+        <div class="rule-box"><b>4. Position size:</b> Risk {risk_pct}% of ${live['balance']:,.0f} = <b>${live['balance'] * risk_dec:,.0f}</b>. Position = <b>{live['pos_size']} shares</b></div>
+        <div class="rule-box"><b>5. Exit:</b> Sell when price touches {exit_w}-bar low (<b>${dl}</b>). Current: <b>${lp}</b> - {'exit triggered' if lp <= dl else 'holding'}</div>
+        """, unsafe_allow_html=True)
 
 with st.expander("Agent trade idea", expanded=False):
     proposal_summary = pd.DataFrame(proposal_records(trade_proposal))
@@ -1473,8 +1593,146 @@ if show_portfolio_evidence and st.session_state.get("tracked_alpaca_orders"):
             st.rerun()
         st.caption("These practice tools update local records only. They never submit, cancel, or exit Alpaca orders.")
 
+exit_preview_rows_for_auto = exit_preview_records(exit_previews)
+exit_blockers_by_hash_for_auto = {
+    preview.preview_hash: (
+        preview.blocked_reasons
+        + exit_position_reasons(preview, alpaca_positions)
+        + open_exit_order_reasons(preview, alpaca_orders)
+    )
+    for preview in exit_previews
+}
+auto_exit_status = auto_exit_decision(
+    automation_level=automation_level,
+    execution_mode=execution_mode,
+    automatic_exits_started=automatic_exits_started,
+    broker_connected=alpaca_status.connected,
+    broker_can_submit=alpaca_status.can_submit_orders,
+    paper_orders_enabled=enable_alpaca_paper_orders,
+    kill_switch_enabled=effective_kill_switch,
+    broker_state_stale=alpaca_state_health.stale,
+    market_open=bool(current_market_advisory.get("Open", False)),
+    exit_preview_records=exit_preview_rows_for_auto,
+    exit_blockers=exit_blockers_by_hash_for_auto,
+    already_sent_hashes=set(st.session_state.get("auto_exit_sent_hashes", [])),
+)
+sub_section("4.7 Auto exit status")
+st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), use_container_width=True, hide_index=True)
+if automation_level == "Auto entries and exits":
+    st.info("Auto entries and exits is preview-only in this version. The app will not auto-submit buy orders yet.")
+auto_exit_key = (
+    automation_level,
+    auto_exit_status.status,
+    auto_exit_status.preview_hash,
+    tuple(auto_exit_status.reasons),
+)
+if automation_level != "Manual review only" and st.session_state.get("last_auto_exit_decision_key") != auto_exit_key:
+    auto_exit_event = AuditEvent(
+        event_type="auto_exit_decision_recorded",
+        message=f"Automatic paper exit decision: {auto_exit_status.status}.",
+        payload={
+            "automation_level": automation_level,
+            "status": auto_exit_status.status,
+            "ready": auto_exit_status.ready,
+            "symbol": auto_exit_status.symbol,
+            "quantity": auto_exit_status.quantity,
+            "preview_hash": auto_exit_status.preview_hash,
+            "reasons": auto_exit_status.reasons,
+            "broker_writes_submitted": 0,
+        },
+    )
+    st.session_state["session_audit_events"].append(auto_exit_event)
+    if persist_audit_log:
+        audit_store.append(auto_exit_event)
+    st.session_state["last_auto_exit_decision_key"] = auto_exit_key
+
+if auto_exit_status.ready:
+    auto_exit_preview = next((preview for preview in exit_previews if preview.preview_hash == auto_exit_status.preview_hash), None)
+    auto_exit_symbol = str(auto_exit_status.symbol).strip().upper()
+    auto_exit_position = next(
+        (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == auto_exit_symbol),
+        None,
+    )
+    auto_exit_intent = (
+        TradeIntent(
+            symbol=auto_exit_symbol,
+            side="sell",
+            quantity=int(float(auto_exit_status.quantity)),
+            order_type="market",
+            time_in_force="day",
+            rationale="Automatic paper exit generated from an existing Alpaca paper position.",
+            source_signals=["auto_exit_only", "alpaca_position_exit_preview"],
+        )
+        if auto_exit_preview is not None and auto_exit_position is not None
+        else None
+    )
+    auto_exit_execution_decision = ExecutionDecision(
+        mode="paper",
+        approved_for_execution=True,
+        requires_manual_approval=False,
+        reason="Auto exits only is enabled; paper exit passed all automation checks.",
+        risk_check=RiskCheckResult(approved=True, rejected_reasons=[], checks={"auto_exit_position": True}),
+    )
+    try:
+        if auto_exit_intent is None:
+            raise ValueError("Automatic exit could not match an open Alpaca paper position.")
+        alpaca_auto_exit_order = alpaca_adapter.submit_order(
+            auto_exit_intent,
+            auto_exit_execution_decision,
+            expected_preview_hash=auto_exit_status.preview_hash,
+        )
+        broker_order_id = str(getattr(alpaca_auto_exit_order, "id", ""))
+        if broker_order_id:
+            tracked_record = {
+                "broker_order_id": broker_order_id,
+                "preview_hash": auto_exit_status.preview_hash,
+                "symbol": auto_exit_symbol,
+                "side": "sell",
+                "quantity": auto_exit_intent.quantity if auto_exit_intent else "",
+                "status": str(getattr(alpaca_auto_exit_order, "status", "")),
+                "submitted_at": str(getattr(alpaca_auto_exit_order, "submitted_at", "")),
+                "source": "auto_exit_only",
+            }
+            st.session_state["tracked_alpaca_orders"].append(tracked_record)
+            broker_state_store.upsert(tracked_record)
+        st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
+        auto_submit_event = AuditEvent(
+            event_type="auto_paper_exit_submitted",
+            message="Automatic paper exit sent to Alpaca.",
+            payload={
+                "symbol": auto_exit_symbol,
+                "side": "sell",
+                "quantity": auto_exit_intent.quantity if auto_exit_intent else "",
+                "preview_hash": auto_exit_status.preview_hash,
+                "broker_order_id": broker_order_id,
+                "automation_level": automation_level,
+                "broker_writes_submitted": 1,
+            },
+        )
+        st.session_state["session_audit_events"].append(auto_submit_event)
+        if persist_audit_log:
+            audit_store.append(auto_submit_event)
+        st.success("Automatic paper exit sent to Alpaca.")
+        st.rerun()
+    except Exception as exc:
+        st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
+        auto_block_event = AuditEvent(
+            event_type="auto_paper_exit_blocked",
+            message=str(exc),
+            payload={
+                "symbol": auto_exit_symbol,
+                "preview_hash": auto_exit_status.preview_hash,
+                "automation_level": automation_level,
+                "broker_writes_submitted": 0,
+            },
+        )
+        st.session_state["session_audit_events"].append(auto_block_event)
+        if persist_audit_log:
+            audit_store.append(auto_block_event)
+        st.error(f"Automatic paper exit blocked: {exc}")
+
 if exit_previews:
-    sub_section("4.7 Exit paper position")
+    sub_section("4.8 Exit paper position")
     exit_options = [
         f"{preview.order.get('symbol', '')} {preview.order.get('side', '')} {preview.order.get('quantity', 0)} ({preview.preview_hash})"
         for preview in exit_previews
@@ -1615,7 +1873,7 @@ if exit_previews:
     st.caption("This contacts Alpaca paper only after review and confirmation.")
 
 if cancelable_alpaca_orders:
-    sub_section("4.8 Cancel paper order")
+    sub_section("4.9 Cancel paper order")
     cancel_options = [
         f"{row['Symbol']} {row['Side']} {row['Quantity']} {row['Status']} ({row['Order ID']})"
         for row in cancelable_alpaca_orders
@@ -1904,7 +2162,7 @@ with st.expander("Check what automation would do - no orders sent", expanded=Fal
 position_records = paper_broker.position_records()
 order_records = paper_broker.order_records()
 if show_portfolio_evidence:
-    sub_section("4.9 Practice decision log")
+    sub_section("4.10 Practice decision log")
     shadow_disabled = intent is None or execution_mode != "shadow"
     if st.button("Save Practice Decision", disabled=shadow_disabled):
         shadow_decision = record_shadow_decision(

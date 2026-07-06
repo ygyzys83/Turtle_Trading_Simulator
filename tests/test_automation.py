@@ -1,5 +1,7 @@
 from agentloop_trader.automation import (
     AutomationDryRunStore,
+    auto_exit_decision,
+    auto_exit_decision_records,
     automation_evidence_records,
     automation_readiness_records,
     automation_snapshot_record,
@@ -42,6 +44,70 @@ def test_paper_automation_dry_run_reports_candidate_when_all_gates_pass():
 
     assert decision.ready
     assert decision.action == "paper_order_candidate"
+
+
+def test_auto_exit_decision_is_ready_when_all_conditions_pass():
+    decision = auto_exit_decision(
+        automation_level="Auto exits only",
+        execution_mode="paper",
+        automatic_exits_started=True,
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=True,
+        exit_preview_records=[{"Symbol": "AAPL", "Quantity": "10", "Review ID": "exit-1", "Valid": True}],
+        exit_blockers={},
+        already_sent_hashes=set(),
+    )
+    records = {row["Field"]: row["Value"] for row in auto_exit_decision_records(decision)}
+
+    assert decision.ready
+    assert decision.status == "Exit ready"
+    assert records["Symbol"] == "AAPL"
+
+
+def test_auto_exit_decision_blocks_manual_mode_and_closed_market():
+    decision = auto_exit_decision(
+        automation_level="Manual review only",
+        execution_mode="paper",
+        automatic_exits_started=False,
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=False,
+        exit_preview_records=[{"Symbol": "AAPL", "Quantity": "10", "Review ID": "exit-1", "Valid": True}],
+        exit_blockers={},
+        already_sent_hashes=set(),
+    )
+
+    assert not decision.ready
+    assert decision.status == "Off"
+    assert "Manual review only" in decision.reasons[0]
+
+
+def test_auto_exit_decision_waits_for_start_switch():
+    decision = auto_exit_decision(
+        automation_level="Auto exits only",
+        execution_mode="paper",
+        automatic_exits_started=False,
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=True,
+        exit_preview_records=[{"Symbol": "AAPL", "Quantity": "10", "Review ID": "exit-1", "Valid": True}],
+        exit_blockers={},
+        already_sent_hashes=set(),
+    )
+
+    assert not decision.ready
+    assert decision.status == "Exit blocked"
+    assert "Start automatic paper exits is off." in decision.reasons
 
 
 def test_paper_automation_candidates_include_entry_exit_and_cancel_dry_runs():

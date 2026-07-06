@@ -132,7 +132,7 @@ def test_setup_scorecard_records_show_clean_setup():
     )
     reads = {row["Read"]: row for row in rows}
 
-    assert reads["Overall"]["Status"] == "Clean setup"
+    assert reads["Overall"]["Status"] == "A"
     assert reads["Breakout"]["Status"] == "Triggered"
     assert reads["Room above exit"]["Status"] == "2.0x stop"
 
@@ -153,5 +153,55 @@ def test_setup_scorecard_records_show_first_blocker():
     )
     reads = {row["Read"]: row for row in rows}
 
-    assert reads["Overall"]["Status"] == "Needs review"
+    assert reads["Overall"]["Status"] == "C"
     assert reads["Overall"]["Plain English"] == "Position would be too large."
+
+
+def test_setup_scorecard_records_follow_enabled_inputs():
+    rows = setup_scorecard_records(
+        {
+            "signal": "long",
+            "last_p": 105,
+            "don_high": 100,
+            "don_low": 95,
+            "last_atr": 2.5,
+            "stop_from_entry": 5,
+            "sma_up": True,
+            "volume_status": "Strong",
+            "rsi_status": "Good",
+        },
+        risk_approved=True,
+        blocked_reasons=[],
+        enabled_inputs={"volume": True, "rsi": True, "volatility": False, "room_above_exit": False},
+    )
+    reads = {row["Read"]: row for row in rows}
+
+    assert "Volume" in reads
+    assert "RSI condition" in reads
+    assert "Volatility" not in reads
+
+
+def test_setup_scorecard_records_show_pullback_core_inputs():
+    rows = setup_scorecard_records(
+        {
+            "setup_type": "pullback",
+            "signal": "long",
+            "last_p": 105,
+            "don_high": 100,
+            "don_low": 95,
+            "last_atr": 2.5,
+            "stop_from_entry": 5,
+            "sma_up": True,
+            "pullback_ready": True,
+            "pullback_depth_pct": 4.2,
+            "momentum_turn": True,
+        },
+        risk_approved=True,
+        blocked_reasons=[],
+        strategy_type="pullback",
+    )
+    reads = {row["Read"]: row for row in rows}
+
+    assert reads["Overall"]["Status"] == "A"
+    assert reads["Pullback"]["Status"] == "Controlled"
+    assert reads["Momentum turn"]["Status"] == "Yes"

@@ -124,50 +124,128 @@ def setup_scorecard_records(
     live: dict,
     risk_approved: bool,
     blocked_reasons: list[str] | None = None,
+    enabled_inputs: dict[str, bool] | None = None,
+    strategy_type: str | None = None,
 ) -> list[dict]:
     last_price = _as_float(live.get("last_p"))
     entry_level = _as_float(live.get("don_high"))
     exit_level = _as_float(live.get("don_low"))
     atr = _as_float(live.get("last_atr"))
     signal = str(live.get("signal", "flat")).lower()
+    setup_type = str(live.get("setup_type") or strategy_type or "breakout").lower()
     trend_ok = bool(live.get("sma_up"))
     breakout_gap = last_price - entry_level if last_price and entry_level else 0.0
     stop_distance = _as_float(live.get("stop_from_entry"))
     atr_pct = atr / last_price * 100 if last_price else 0.0
     reward_proxy = (last_price - exit_level) / stop_distance if stop_distance > 0 and exit_level else 0.0
     blocks = [reason for reason in (blocked_reasons or []) if reason]
+    enabled = enabled_inputs or {}
 
-    setup_clean = signal == "long" and trend_ok and breakout_gap > 0 and risk_approved and not blocks
-    setup_marginal = signal == "long" and trend_ok and breakout_gap > 0 and not setup_clean
-    overall = "Clean setup" if setup_clean else "Needs review" if setup_marginal else "No clean setup"
+    if setup_type == "pullback":
+        setup_ready = bool(live.get("pullback_ready")) or signal == "long"
+        core_rows = [
+            {
+                "Read": "Trend",
+                "Status": "Good" if trend_ok else "Weak",
+                "Plain English": "Stock is above a rising trend filter." if trend_ok else "Trend filter does not support a buy.",
+            },
+            {
+                "Read": "Pullback",
+                "Status": _pullback_status(live.get("pullback_depth_pct")),
+                "Plain English": _pullback_detail(live.get("pullback_depth_pct")),
+            },
+            {
+                "Read": "Momentum turn",
+                "Status": "Yes" if live.get("momentum_turn") else "No",
+                "Plain English": "Price is turning back up after the pullback." if live.get("momentum_turn") else "No clear turn back up yet.",
+            },
+            {
+                "Read": "Risk approval",
+                "Status": "Passed" if risk_approved and not blocks else "Blocked",
+                "Plain English": "Risk checks allow this idea." if risk_approved and not blocks else (blocks[0] if blocks else "Risk checks do not allow this idea."),
+            },
+        ]
+    else:
+        setup_ready = signal == "long" and breakout_gap > 0
+        core_rows = [
+            {
+                "Read": "Trend",
+                "Status": "Good" if trend_ok else "Weak",
+                "Plain English": "Trend filter supports a buy." if trend_ok else "Trend filter does not support a buy.",
+            },
+            {
+                "Read": "Breakout",
+                "Status": "Triggered" if signal == "long" and breakout_gap > 0 else "Not triggered",
+                "Plain English": _breakout_detail(breakout_gap),
+            },
+            {
+                "Read": "Risk approval",
+                "Status": "Passed" if risk_approved and not blocks else "Blocked",
+                "Plain English": "Risk checks allow this idea." if risk_approved and not blocks else (blocks[0] if blocks else "Risk checks do not allow this idea."),
+            },
+        ]
 
-    return [
+    grade = _setup_grade(setup_ready=setup_ready, trend_ok=trend_ok, risk_ok=risk_approved and not blocks)
+    rows = [
         {
             "Read": "Overall",
-            "Status": overall,
-            "Plain English": _overall_setup_detail(overall, blocks),
+            "Status": grade,
+            "Plain English": _grade_detail(grade, setup_type, blocks),
         },
-        {
-            "Read": "Trend",
-            "Status": "Good" if trend_ok else "Weak",
-            "Plain English": "Trend filter supports a buy." if trend_ok else "Trend filter does not support a buy.",
-        },
-        {
-            "Read": "Breakout",
-            "Status": "Triggered" if signal == "long" and breakout_gap > 0 else "Not triggered",
+    ]
+    rows.extend(core_rows)
+
+    optional_rows = {
+        "breakout_strength": {
+            "Read": "Breakout strength",
+            "Status": _breakout_strength_status(breakout_gap, last_price),
             "Plain English": _breakout_detail(breakout_gap),
         },
-        {
+        "volume": {
+            "Read": "Volume",
+            "Status": str(live.get("volume_status") or "Unknown"),
+            "Plain English": _volume_detail(live.get("volume_status")),
+        },
+        "volatility": {
             "Read": "Volatility",
             "Status": f"{atr_pct:.2f}% ATR",
             "Plain English": _volatility_detail(atr_pct),
         },
-        {
+        "room_above_exit": {
             "Read": "Room above exit",
             "Status": f"{reward_proxy:.1f}x stop" if reward_proxy > 0 else "n/a",
             "Plain English": "Price has room above the exit line." if reward_proxy > 1 else "Price is close to the exit line or no trade is active.",
         },
-    ]
+        "relative_strength": {
+            "Read": "Relative strength",
+            "Status": str(live.get("relative_strength") or "Unknown"),
+            "Plain English": "Compares this ticker against the market benchmark.",
+        },
+        "market_condition": {
+            "Read": "Market condition",
+            "Status": str(live.get("market_condition") or "Unknown"),
+            "Plain English": "Checks whether the broad market supports new long trades.",
+        },
+        "liquidity": {
+            "Read": "Liquidity",
+            "Status": str(live.get("liquidity_status") or "Unknown"),
+            "Plain English": "Checks whether average dollar volume is large enough for clean fills.",
+        },
+        "event_risk": {
+            "Read": "Event risk",
+            "Status": str(live.get("event_risk") or "Unknown"),
+            "Plain English": "Earnings/news calendar is not connected yet, so this stays informational.",
+        },
+        "rsi": {
+            "Read": "RSI condition",
+            "Status": str(live.get("rsi_status") or "Unknown"),
+            "Plain English": _rsi_detail(live.get("rsi_status")),
+        },
+    }
+    for key, row in optional_rows.items():
+        if enabled.get(key, key in {"volatility", "room_above_exit"}):
+            rows.append(row)
+    return rows
 
 
 def agent_decision_summary(
@@ -274,12 +352,74 @@ def _overall_setup_detail(overall: str, blocks: list[str]) -> str:
     return "Wait. The current bar does not show a clean buy setup."
 
 
+def _setup_grade(setup_ready: bool, trend_ok: bool, risk_ok: bool) -> str:
+    if not setup_ready:
+        return "No trade"
+    if trend_ok and risk_ok:
+        return "A"
+    if risk_ok:
+        return "B"
+    return "C"
+
+
+def _grade_detail(grade: str, setup_type: str, blocks: list[str]) -> str:
+    if blocks:
+        return blocks[0]
+    if grade == "A":
+        return "The selected strategy has a clean setup and risk checks pass."
+    if grade == "B":
+        return "The selected strategy has a setup, but one quality input is only okay."
+    if grade == "C":
+        return "The setup exists, but risk or quality checks need review."
+    strategy = "trend pullback" if setup_type == "pullback" else "breakout"
+    return f"No clean {strategy} setup right now."
+
+
 def _breakout_detail(value: float) -> str:
     if value > 0:
         return f"Price is ${value:,.2f} above the breakout level."
     if value < 0:
         return f"Price is ${abs(value):,.2f} below the breakout level."
     return "Price is sitting on the breakout level."
+
+
+def _breakout_strength_status(value: float, price: float) -> str:
+    if price <= 0 or value <= 0:
+        return "Not active"
+    pct = value / price * 100
+    if pct >= 2:
+        return "Strong"
+    if pct >= 0.5:
+        return "Good"
+    return "Thin"
+
+
+def _pullback_status(value) -> str:
+    depth = _as_float(value)
+    if depth <= 0:
+        return "Unknown"
+    if depth <= 3:
+        return "Shallow"
+    if depth <= 8:
+        return "Controlled"
+    return "Deep"
+
+
+def _pullback_detail(value) -> str:
+    depth = _as_float(value)
+    if depth <= 0:
+        return "Pullback depth is not available."
+    return f"Recent pullback is about {depth:.1f}% from the latest swing area."
+
+
+def _volume_detail(status) -> str:
+    if status == "Strong":
+        return "Volume is above recent average."
+    if status == "Normal":
+        return "Volume is near recent average."
+    if status == "Light":
+        return "Volume is below recent average."
+    return "Volume is unavailable for this data source."
 
 
 def _volatility_detail(atr_pct: float) -> str:
@@ -290,6 +430,18 @@ def _volatility_detail(atr_pct: float) -> str:
     if atr_pct <= 3:
         return "Normal movement for this setup."
     return "Wide movement; position size should be smaller."
+
+
+def _rsi_detail(status) -> str:
+    if status == "Good":
+        return "Momentum supports the setup without being extreme."
+    if status == "Strong":
+        return "Momentum is strong and close to extended."
+    if status == "Extended":
+        return "Momentum may be stretched; avoid chasing."
+    if status == "Weak":
+        return "Momentum does not support a long setup."
+    return "RSI is unavailable."
 
 
 def _as_float(value) -> float:
