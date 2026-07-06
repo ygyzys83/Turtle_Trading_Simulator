@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import uuid4
 
-from agentloop_trader.models import ExecutionDecision, PreflightCheckResult, RiskCheckResult, TradeIntent
+from agentloop_trader.models import ExecutionDecision, PACIFIC_TIME, PreflightCheckResult, RiskCheckResult, TradeIntent
 
 
 @dataclass(frozen=True)
@@ -29,7 +29,7 @@ def record_shadow_decision(
 ) -> ShadowDecision:
     return ShadowDecision(
         shadow_id=str(uuid4()),
-        created_at=datetime.now(UTC),
+        created_at=datetime.now(PACIFIC_TIME),
         symbol=intent.symbol_clean if intent else "NONE",
         intended_action=intent.side if intent else "none",
         quantity=intent.quantity if intent else 0,
@@ -44,7 +44,7 @@ def record_shadow_decision(
 def shadow_records(decisions: list[ShadowDecision]) -> list[dict]:
     return [
         {
-            "Time": decision.created_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+            "Time": decision.created_at.astimezone(PACIFIC_TIME).strftime("%Y-%m-%d %H:%M:%S %Z"),
             "Shadow ID": decision.shadow_id[:8],
             "Symbol": decision.symbol,
             "Action": decision.intended_action.upper(),
@@ -57,4 +57,3 @@ def shadow_records(decisions: list[ShadowDecision]) -> list[dict]:
         }
         for decision in decisions
     ]
-

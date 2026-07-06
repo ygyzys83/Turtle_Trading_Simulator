@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime
 
 from agentloop_trader.evidence import (
     approval_ledger_records,
@@ -55,3 +56,5 @@ def test_evidence_package_can_be_written_locally():
     assert rows["Session"] == "session-1"
     assert rows["Audit Records"] == 1
     assert '"session_id": "session-1"' in text
+    assert not package["exported_at"].endswith("+00:00")
+    assert datetime.fromisoformat(package["exported_at"]).utcoffset().total_seconds() in {-7 * 3600, -8 * 3600}

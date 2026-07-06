@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from agentloop_trader.models import PACIFIC_TIME
 
 DEFAULT_EVIDENCE_EXPORT_PATH = Path("audit_logs") / "latest_evidence_package.json"
 
@@ -66,7 +68,7 @@ def build_evidence_package(
     risk_halts: list[dict],
 ) -> dict:
     return {
-        "exported_at": datetime.now(UTC).isoformat(),
+        "exported_at": datetime.now(PACIFIC_TIME).isoformat(),
         "session_id": session_id,
         "manifest": manifest,
         "audit_records": audit_records,

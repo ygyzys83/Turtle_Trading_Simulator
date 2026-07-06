@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from uuid import uuid4
 
-from agentloop_trader.models import ExecutionDecision, TradeIntent
+from agentloop_trader.models import ExecutionDecision, PACIFIC_TIME, TradeIntent
 
 
 @dataclass
@@ -97,7 +97,7 @@ class PaperBroker:
             side=intent.side,
             quantity=intent.quantity,
             status=status,
-            submitted_at=datetime.now(UTC),
+            submitted_at=datetime.now(PACIFIC_TIME),
             filled_price=filled_price,
             message=message,
         )
@@ -107,7 +107,7 @@ class PaperBroker:
     def order_records(self) -> list[dict]:
         return [
             {
-                "Submitted": order.submitted_at.strftime("%Y-%m-%d %H:%M:%S UTC"),
+                "Submitted": order.submitted_at.astimezone(PACIFIC_TIME).strftime("%Y-%m-%d %H:%M:%S %Z"),
                 "Order ID": order.order_id[:8],
                 "Symbol": order.symbol,
                 "Side": order.side.upper(),
@@ -130,4 +130,3 @@ class PaperBroker:
             }
             for position in self.positions.values()
         ]
-

@@ -56,6 +56,16 @@ def test_new_session_id_is_display_ready():
     assert session_id.startswith("paper-")
 
 
+def test_new_session_id_uses_pacific_wall_clock_prefix():
+    from datetime import datetime
+    from agentloop_trader.models import PACIFIC_TIME
+
+    session_id = new_session_id()
+    prefix = datetime.now(PACIFIC_TIME).strftime("paper-%Y%m%d-")
+
+    assert session_id.startswith(prefix)
+
+
 def test_session_summary_records_count_local_and_alpaca_activity():
     metrics = {row["Metric"]: row["Value"] for row in session_summary_records(_snapshot())}
 

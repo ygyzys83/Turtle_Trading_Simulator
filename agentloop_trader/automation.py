@@ -2,11 +2,11 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 
 from agentloop_trader.broker_governance import BrokerStateHealth
-from agentloop_trader.models import PreflightCheckResult, RiskCheckResult, TradeIntent
+from agentloop_trader.models import PACIFIC_TIME, PreflightCheckResult, RiskCheckResult, TradeIntent
 
 
 DEFAULT_AUTOMATION_DRY_RUN_PATH = Path("automation_logs") / "paper_automation_dry_runs.jsonl"
@@ -213,7 +213,7 @@ def build_automation_snapshot(session_id: str, candidates: list[dict], readiness
         session_id=session_id,
         candidates=candidates,
         readiness=readiness,
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=datetime.now(PACIFIC_TIME).isoformat(),
     )
 
 

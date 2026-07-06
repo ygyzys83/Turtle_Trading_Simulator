@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from typing import Any
 from uuid import uuid4
+
+from agentloop_trader.models import PACIFIC_TIME
 
 
 @dataclass(frozen=True)
@@ -21,7 +23,7 @@ class PaperSessionSnapshot:
 
 
 def new_session_id() -> str:
-    return f"paper-{datetime.now(UTC).strftime('%Y%m%d-%H%M%S')}-{str(uuid4())[:8]}"
+    return f"paper-{datetime.now(PACIFIC_TIME).strftime('%Y%m%d-%H%M%S')}-{str(uuid4())[:8]}"
 
 
 def session_summary_records(snapshot: PaperSessionSnapshot) -> list[dict]:

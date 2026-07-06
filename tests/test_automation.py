@@ -13,6 +13,7 @@ from agentloop_trader.automation import (
 from agentloop_trader.broker_governance import BrokerStateHealth
 from agentloop_trader.models import PreflightCheckResult, RiskCheckResult, TradeIntent
 import tempfile
+from datetime import datetime
 
 
 def test_paper_automation_dry_run_holds_without_intent():
@@ -166,6 +167,8 @@ def test_automation_snapshot_records_candidate_evidence():
     evidence = {row["Metric"]: row["Value"] for row in automation_evidence_records([record])}
 
     assert record["candidate_count"] == 2
+    assert not record["created_at"].endswith("+00:00")
+    assert datetime.fromisoformat(record["created_at"]).utcoffset().total_seconds() in {-7 * 3600, -8 * 3600}
     assert record["ready_candidate_count"] == 1
     assert record["broker_write_candidate_count"] == 1
     assert record["hold_count"] == 1

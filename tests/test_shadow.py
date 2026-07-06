@@ -22,6 +22,7 @@ def test_shadow_decision_records_would_trade_context_without_order():
     assert shadow.risk_approved
     assert not shadow.preflight_ready
     assert records[0]["Action"] == "BUY"
+    assert records[0]["Time"].endswith(("PDT", "PST"))
     assert "manual approval" in records[0]["Blocked Reasons"].lower()
 
 
@@ -35,4 +36,3 @@ def test_shadow_decision_handles_absent_intent():
     assert shadow.symbol == "NONE"
     assert shadow.intended_action == "none"
     assert not shadow.risk_approved
-

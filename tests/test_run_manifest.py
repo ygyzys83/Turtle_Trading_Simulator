@@ -1,4 +1,5 @@
 import tempfile
+from datetime import datetime
 
 from agentloop_trader.brokers import AlpacaConfig
 from agentloop_trader.models import RiskLimits, StrategyConfig
@@ -30,6 +31,8 @@ def test_run_manifest_records_strategy_risk_and_broker_context():
     assert record["broker"]["mode"] == "paper"
     assert record["broker"]["live_writes_blocked"]
     assert rows[0]["Endpoint"] == "https://paper-api.alpaca.markets/v2"
+    assert not record["created_at"].endswith("+00:00")
+    assert datetime.fromisoformat(record["created_at"]).utcoffset().total_seconds() in {-7 * 3600, -8 * 3600}
 
 
 def test_run_manifest_store_appends_and_reads_recent():

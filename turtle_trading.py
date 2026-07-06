@@ -404,7 +404,7 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["paper_broker"] = PaperBroker(cash=float(account))
     st.session_state["paper_starting_cash"] = account
     st.session_state["paper_session_id"] = new_session_id()
-    st.session_state["paper_session_started_at"] = pd.Timestamp.utcnow().isoformat()
+    st.session_state["paper_session_started_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["session_audit_events"] = []
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
@@ -419,7 +419,7 @@ if reset_paper_broker:
     st.session_state["paper_broker"] = PaperBroker(cash=float(account))
     st.session_state["paper_starting_cash"] = account
     st.session_state["paper_session_id"] = new_session_id()
-    st.session_state["paper_session_started_at"] = pd.Timestamp.utcnow().isoformat()
+    st.session_state["paper_session_started_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["session_audit_events"] = []
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
@@ -433,7 +433,7 @@ if reset_paper_broker:
     st.session_state["session_disabled"] = False
 st.session_state.setdefault("shadow_decisions", [])
 st.session_state.setdefault("paper_session_id", new_session_id())
-st.session_state.setdefault("paper_session_started_at", pd.Timestamp.utcnow().isoformat())
+st.session_state.setdefault("paper_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
 st.session_state.setdefault("armed_alpaca_preview_hash", None)
 st.session_state.setdefault("armed_alpaca_cancel_hash", None)
 st.session_state.setdefault("armed_alpaca_cancel_order_id", None)

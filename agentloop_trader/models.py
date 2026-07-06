@@ -73,7 +73,7 @@ class TradeThesis:
     data_basis: list[str]
     invalidation: str
     generated_by: str = "human"
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(PACIFIC_TIME))
 
 
 @dataclass(frozen=True)

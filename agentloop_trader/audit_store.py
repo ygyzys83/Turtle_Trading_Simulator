@@ -6,7 +6,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
-from agentloop_trader.models import AuditEvent
+from agentloop_trader.models import AuditEvent, PACIFIC_TIME
 
 
 DEFAULT_AUDIT_DIR = Path("audit_logs")
@@ -20,9 +20,17 @@ def _json_safe(value: Any) -> Any:
         return {str(k): _json_safe(v) for k, v in value.items()}
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(v) for v in value]
-    if isinstance(value, (datetime, date)):
+    if isinstance(value, datetime):
+        return _to_pacific(value).isoformat()
+    if isinstance(value, date):
         return value.isoformat()
     return value
+
+
+def _to_pacific(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value.replace(tzinfo=PACIFIC_TIME)
+    return value.astimezone(PACIFIC_TIME)
 
 
 class JsonlAuditStore:
@@ -53,9 +61,8 @@ class JsonlAuditStore:
     @staticmethod
     def event_to_record(event: AuditEvent) -> dict:
         return {
-            "created_at": event.created_at.isoformat(),
+            "created_at": _to_pacific(event.created_at).isoformat(),
             "event_type": event.event_type,
             "message": event.message,
             "payload": _json_safe(event.payload),
         }
-

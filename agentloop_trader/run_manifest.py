@@ -2,12 +2,12 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 from agentloop_trader.brokers import AlpacaConfig
-from agentloop_trader.models import RiskLimits, StrategyConfig
+from agentloop_trader.models import PACIFIC_TIME, RiskLimits, StrategyConfig
 
 DEFAULT_RUN_MANIFEST_PATH = Path("audit_logs") / "run_manifests.jsonl"
 
@@ -53,7 +53,7 @@ def build_run_manifest(
 ) -> RunManifest:
     return RunManifest(
         session_id=session_id,
-        created_at=datetime.now(UTC).isoformat(),
+        created_at=datetime.now(PACIFIC_TIME).isoformat(),
         mode_label=mode_label,
         data_source=data_source,
         strategy={

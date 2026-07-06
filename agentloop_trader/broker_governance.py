@@ -8,7 +8,7 @@ from typing import Any
 from zoneinfo import ZoneInfo
 
 from agentloop_trader.brokers import AlpacaConfig, AlpacaOrderPreview, build_alpaca_order_preview
-from agentloop_trader.models import ExecutionDecision, RiskCheckResult, TradeIntent
+from agentloop_trader.models import ExecutionDecision, PACIFIC_TIME, RiskCheckResult, TradeIntent
 
 
 DEFAULT_BROKER_STATE_PATH = Path("broker_state") / "alpaca_paper_orders.json"
@@ -137,7 +137,7 @@ def cancelable_alpaca_order_records(alpaca_orders: list[dict]) -> list[dict]:
 
 
 def refresh_tracked_alpaca_orders(tracked_orders: list[dict], alpaca_orders: list[dict]) -> list[dict]:
-    now = datetime.now(UTC).isoformat()
+    now = datetime.now(PACIFIC_TIME).isoformat()
     alpaca_by_id = {
         str(order.get("Broker Order ID") or "").strip(): order
         for order in alpaca_orders
@@ -361,7 +361,10 @@ def simulated_alpaca_fill_order(
     record = dict(tracked_order or {})
     quantity = _as_float(record.get("filled_quantity") or record.get("quantity"))
     price = fill_price if fill_price is not None else _as_float(record.get("average_fill_price") or record.get("entry_price"))
-    now = (filled_at or datetime.now(UTC)).isoformat()
+    now_dt = None
+    if filled_at is not None:
+        now_dt = filled_at.astimezone(PACIFIC_TIME) if filled_at.tzinfo else filled_at.replace(tzinfo=PACIFIC_TIME)
+    now = (now_dt or datetime.now(PACIFIC_TIME)).isoformat()
     record.update(
         {
             "status": "filled",
@@ -452,7 +455,7 @@ class BrokerStateStore:
         key = record.get("broker_order_id")
         records = [item for item in records if item.get("broker_order_id") != key]
         record = dict(record)
-        record.setdefault("created_at", datetime.now(UTC).isoformat())
+        record.setdefault("created_at", datetime.now(PACIFIC_TIME).isoformat())
         records.append(record)
         self.replace_all(records)
 

@@ -1,5 +1,6 @@
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from datetime import UTC, datetime
 
 from agentloop_trader.audit_store import JsonlAuditStore
 from agentloop_trader.models import AuditEvent
@@ -38,3 +39,16 @@ def test_audit_event_defaults_to_pacific_time():
 
     assert event.created_at.tzinfo is not None
     assert event.created_at.tzinfo.key == "America/Los_Angeles"
+
+
+def test_jsonl_audit_store_normalizes_utc_events_to_pacific_time():
+    event = AuditEvent(
+        event_type="timezone",
+        message="UTC event should serialize as Pacific",
+        created_at=datetime(2026, 7, 6, 2, 7, 44, tzinfo=UTC),
+    )
+
+    record = JsonlAuditStore.event_to_record(event)
+
+    assert record["created_at"].startswith("2026-07-05T19:07:44")
+    assert record["created_at"].endswith("-07:00")

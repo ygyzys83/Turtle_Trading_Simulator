@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
-from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, TradeIntent, TradeProposal
+from agentloop_trader.models import AuditEvent, ExecutionDecision, PACIFIC_TIME, RiskCheckResult, TradeIntent, TradeProposal
 
 
 def _clean_payload(value: Any) -> Any:
@@ -89,8 +89,9 @@ def build_audit_events(
 def events_to_records(events: list[AuditEvent]) -> list[dict[str, Any]]:
     records = []
     for event in events:
+        event_time = event.created_at.astimezone(PACIFIC_TIME) if event.created_at.tzinfo else event.created_at.replace(tzinfo=PACIFIC_TIME)
         records.append({
-            "Time": event.created_at.strftime("%Y-%m-%d %H:%M:%S"),
+            "Time": event_time.strftime("%Y-%m-%d %H:%M:%S %Z"),
             "Type": event.event_type,
             "Message": event.message,
             "Payload": _clean_payload(event.payload),
