@@ -120,6 +120,56 @@ def strategy_context_records(live: dict, entry_window: int, exit_window: int, mo
     ]
 
 
+def setup_scorecard_records(
+    live: dict,
+    risk_approved: bool,
+    blocked_reasons: list[str] | None = None,
+) -> list[dict]:
+    last_price = _as_float(live.get("last_p"))
+    entry_level = _as_float(live.get("don_high"))
+    exit_level = _as_float(live.get("don_low"))
+    atr = _as_float(live.get("last_atr"))
+    signal = str(live.get("signal", "flat")).lower()
+    trend_ok = bool(live.get("sma_up"))
+    breakout_gap = last_price - entry_level if last_price and entry_level else 0.0
+    stop_distance = _as_float(live.get("stop_from_entry"))
+    atr_pct = atr / last_price * 100 if last_price else 0.0
+    reward_proxy = (last_price - exit_level) / stop_distance if stop_distance > 0 and exit_level else 0.0
+    blocks = [reason for reason in (blocked_reasons or []) if reason]
+
+    setup_clean = signal == "long" and trend_ok and breakout_gap > 0 and risk_approved and not blocks
+    setup_marginal = signal == "long" and trend_ok and breakout_gap > 0 and not setup_clean
+    overall = "Clean setup" if setup_clean else "Needs review" if setup_marginal else "No clean setup"
+
+    return [
+        {
+            "Read": "Overall",
+            "Status": overall,
+            "Plain English": _overall_setup_detail(overall, blocks),
+        },
+        {
+            "Read": "Trend",
+            "Status": "Good" if trend_ok else "Weak",
+            "Plain English": "Trend filter supports a buy." if trend_ok else "Trend filter does not support a buy.",
+        },
+        {
+            "Read": "Breakout",
+            "Status": "Triggered" if signal == "long" and breakout_gap > 0 else "Not triggered",
+            "Plain English": _breakout_detail(breakout_gap),
+        },
+        {
+            "Read": "Volatility",
+            "Status": f"{atr_pct:.2f}% ATR",
+            "Plain English": _volatility_detail(atr_pct),
+        },
+        {
+            "Read": "Room above exit",
+            "Status": f"{reward_proxy:.1f}x stop" if reward_proxy > 0 else "n/a",
+            "Plain English": "Price has room above the exit line." if reward_proxy > 1 else "Price is close to the exit line or no trade is active.",
+        },
+    ]
+
+
 def agent_decision_summary(
     intent_present: bool,
     thesis: str,
@@ -212,6 +262,34 @@ def _money_gap(value: float) -> str:
     if value < 0:
         return f"${abs(value):,.2f} below"
     return "$0.00"
+
+
+def _overall_setup_detail(overall: str, blocks: list[str]) -> str:
+    if overall == "Clean setup":
+        return "Trade idea, trend, breakout, and risk check line up."
+    if blocks:
+        return blocks[0]
+    if overall == "Needs review":
+        return "The chart setup exists, but one check still needs attention."
+    return "Wait. The current bar does not show a clean buy setup."
+
+
+def _breakout_detail(value: float) -> str:
+    if value > 0:
+        return f"Price is ${value:,.2f} above the breakout level."
+    if value < 0:
+        return f"Price is ${abs(value):,.2f} below the breakout level."
+    return "Price is sitting on the breakout level."
+
+
+def _volatility_detail(atr_pct: float) -> str:
+    if atr_pct <= 0:
+        return "Volatility is not available."
+    if atr_pct < 1:
+        return "Quiet movement; stops may be tighter."
+    if atr_pct <= 3:
+        return "Normal movement for this setup."
+    return "Wide movement; position size should be smaller."
 
 
 def _as_float(value) -> float:

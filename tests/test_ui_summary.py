@@ -4,6 +4,7 @@ from agentloop_trader.ui_summary import (
     compact_status_records,
     operator_state_record,
     portfolio_story_records,
+    setup_scorecard_records,
     strategy_context_records,
 )
 
@@ -113,3 +114,44 @@ def test_agent_decision_summary_names_next_action():
 
     assert "No entry signal" in summary
     assert "Wait" in summary
+
+
+def test_setup_scorecard_records_show_clean_setup():
+    rows = setup_scorecard_records(
+        {
+            "signal": "long",
+            "last_p": 105,
+            "don_high": 100,
+            "don_low": 95,
+            "last_atr": 2.5,
+            "stop_from_entry": 5,
+            "sma_up": True,
+        },
+        risk_approved=True,
+        blocked_reasons=[],
+    )
+    reads = {row["Read"]: row for row in rows}
+
+    assert reads["Overall"]["Status"] == "Clean setup"
+    assert reads["Breakout"]["Status"] == "Triggered"
+    assert reads["Room above exit"]["Status"] == "2.0x stop"
+
+
+def test_setup_scorecard_records_show_first_blocker():
+    rows = setup_scorecard_records(
+        {
+            "signal": "long",
+            "last_p": 105,
+            "don_high": 100,
+            "don_low": 95,
+            "last_atr": 2.5,
+            "stop_from_entry": 5,
+            "sma_up": True,
+        },
+        risk_approved=False,
+        blocked_reasons=["Position would be too large."],
+    )
+    reads = {row["Read"]: row for row in rows}
+
+    assert reads["Overall"]["Status"] == "Needs review"
+    assert reads["Overall"]["Plain English"] == "Position would be too large."
