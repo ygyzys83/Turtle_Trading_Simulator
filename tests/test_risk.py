@@ -71,7 +71,7 @@ def test_preflight_and_execution_preserve_specific_risk_rejection_reason():
     assert not risk.approved
     assert any("Estimated notional" in reason for reason in preflight.blocked_reasons)
     assert "Estimated notional" in decision.reason
-    assert not any("Rejected by deterministic risk controls" in reason for reason in preflight.blocked_reasons)
+    assert not any("Risk rules blocked this trade" in reason for reason in preflight.blocked_reasons)
 
 
 def test_preflight_includes_execution_reason_when_risk_passes_but_mode_blocks():
@@ -97,7 +97,7 @@ def test_preflight_includes_execution_reason_when_risk_passes_but_mode_blocks():
     )
 
     assert risk.approved
-    assert "Backtest-only mode does not send orders." in preflight.blocked_reasons
+    assert "Backtest only does not send orders." in preflight.blocked_reasons
 
 
 def test_constrain_trade_intent_reduces_quantity_to_strictest_risk_limit():

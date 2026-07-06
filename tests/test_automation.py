@@ -65,9 +65,9 @@ def test_paper_automation_candidates_include_entry_exit_and_cancel_dry_runs():
     )
 
     actions = [row["Action"] for row in rows]
-    assert actions == ["entry_candidate", "exit_candidate", "cancel_candidate"]
-    assert all(row["Dry Run Only"] for row in rows)
-    assert all(row["Broker Write Required"] for row in rows)
+    assert actions == ["Buy ready for review", "Exit ready for review", "Cancel ready for review"]
+    assert all(row["No Orders Sent"] for row in rows)
+    assert all(row["Would Need Approval"] for row in rows)
 
 
 def test_paper_automation_candidates_hold_blocked_exit_preview():
@@ -104,10 +104,10 @@ def test_automation_readiness_records_are_display_ready():
     )
 
     records = {row["Check"]: row for row in rows}
-    assert records["Dry Run Only"]["Passed"]
-    assert not records["Manual Order Gate"]["Passed"]
-    assert records["Ready Candidates"]["Passed"]
-    assert "1 ready candidate" in records["Ready Candidates"]["Detail"]
+    assert records["No orders sent"]["Passed"]
+    assert not records["Paper orders allowed"]["Passed"]
+    assert records["Actions to review"]["Passed"]
+    assert "1 action" in records["Actions to review"]["Detail"]
 
 
 def test_evidence_dashboard_records_count_key_events():
@@ -130,17 +130,17 @@ def test_evidence_dashboard_records_count_key_events():
     )
 
     metrics = {record["Metric"]: record["Value"] for record in records}
-    assert metrics["Alpaca Paper Orders Submitted"] == 1
-    assert metrics["Alpaca Paper Exits Submitted"] == 1
-    assert metrics["Alpaca Paper Exits Armed"] == 1
-    assert metrics["Alpaca Paper Exits Blocked"] == 1
-    assert metrics["Tracked Alpaca Orders"] == 4
-    assert metrics["Tracked Alpaca Open Orders"] == 1
-    assert metrics["Tracked Alpaca Filled Orders"] == 1
-    assert metrics["Tracked Alpaca Filled Quantity"] == "40"
-    assert metrics["Tracked Alpaca Canceled Orders"] == 1
-    assert metrics["Tracked Alpaca Missing Orders"] == 1
-    assert metrics["Local Paper Orders"] == 1
+    assert metrics["Paper buys sent"] == 1
+    assert metrics["Paper exits sent"] == 1
+    assert metrics["Paper exits reviewed"] == 1
+    assert metrics["Paper exits blocked"] == 1
+    assert metrics["Saved Alpaca orders"] == 4
+    assert metrics["Open Alpaca orders"] == 1
+    assert metrics["Filled Alpaca orders"] == 1
+    assert metrics["Filled Alpaca shares"] == "40"
+    assert metrics["Canceled Alpaca orders"] == 1
+    assert metrics["Saved orders missing at Alpaca"] == 1
+    assert metrics["App paper orders"] == 1
 
 
 def test_automation_snapshot_records_candidate_evidence():
@@ -148,19 +148,19 @@ def test_automation_snapshot_records_candidate_evidence():
         session_id="session-1",
         candidates=[
             {
-                "Action": "entry_candidate",
+                "Action": "Buy ready for review",
                 "Ready": True,
-                "Broker Write Required": True,
-                "Reasons": "Dry-run only.",
+                "Would Need Approval": True,
+                "Reasons": "Check only.",
             },
             {
-                "Action": "exit_hold",
+                "Action": "Exit blocked",
                 "Ready": False,
-                "Broker Write Required": False,
+                "Would Need Approval": False,
                 "Reasons": "Broker state is stale.",
             },
         ],
-        readiness=[{"Check": "Dry Run Only", "Passed": True}],
+        readiness=[{"Check": "No orders sent", "Passed": True}],
     )
 
     record = automation_snapshot_record(snapshot)
@@ -172,9 +172,9 @@ def test_automation_snapshot_records_candidate_evidence():
     assert record["ready_candidate_count"] == 1
     assert record["broker_write_candidate_count"] == 1
     assert record["hold_count"] == 1
-    assert evidence["Dry Run Snapshots"] == 1
-    assert evidence["Action: exit_hold"] == 1
-    assert evidence["Hold Reason: Broker state is stale."] == 1
+    assert evidence["Saved checks"] == 1
+    assert evidence["Action type: Exit blocked"] == 1
+    assert evidence["Blocked reason: Broker state is stale."] == 1
 
 
 def test_automation_dry_run_store_appends_and_reads_recent():
@@ -183,7 +183,7 @@ def test_automation_dry_run_store_appends_and_reads_recent():
         first = build_automation_snapshot("session-1", [], [])
         second = build_automation_snapshot(
             "session-2",
-            [{"Action": "cancel_candidate", "Ready": True, "Broker Write Required": True}],
+            [{"Action": "cancel_candidate", "Ready": True, "Would Need Approval": True}],
             [],
         )
 
@@ -199,23 +199,23 @@ def test_automation_dry_run_store_appends_and_reads_recent():
 def test_automation_supervisor_dry_run_halts_before_candidates():
     rows = automation_supervisor_dry_run_records(
         candidates=[{"Ready": True}],
-        readiness_rows=[{"Check": "Dry Run Only", "Passed": True}],
-        halt_rows=[{"Halt Reason": "Risk breach", "Active": True, "Detail": "Kill switch is enabled."}],
+        readiness_rows=[{"Check": "No orders sent", "Passed": True}],
+        halt_rows=[{"Block": "Risk limit hit", "Active": True, "Detail": "Stop trading switch is on."}],
     )
     values = {row["Field"]: row["Value"] for row in rows}
 
-    assert values["Supervisor Mode"] == "dry_run_only"
-    assert values["Decision"] == "halt"
-    assert values["Broker Writes Submitted"] == 0
+    assert values["Mode"] == "check only"
+    assert values["Decision"] == "blocked"
+    assert values["Orders sent"] == 0
 
 
 def test_automation_supervisor_dry_run_queues_manual_review_when_clear():
     rows = automation_supervisor_dry_run_records(
         candidates=[{"Ready": True}, {"Ready": False}],
-        readiness_rows=[{"Check": "Dry Run Only", "Passed": True}],
-        halt_rows=[{"Halt Reason": "None", "Active": False}],
+        readiness_rows=[{"Check": "No orders sent", "Passed": True}],
+        halt_rows=[{"Block": "None", "Active": False}],
     )
     values = {row["Field"]: row["Value"] for row in rows}
 
-    assert values["Decision"] == "would_queue_manual_review"
-    assert values["Ready Candidates"] == 1
+    assert values["Decision"] == "ask for review"
+    assert values["Actions ready for review"] == 1

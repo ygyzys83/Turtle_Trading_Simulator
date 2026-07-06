@@ -24,9 +24,9 @@ def test_production_readiness_checks_require_shadow_and_manual_live_before_unatt
     records = production_readiness_checks()
     names = [record["Check"] for record in records]
 
-    assert "Shadow mode reviewed" in names
-    assert "Paper automation dry-run reviewed" in names
-    assert "Paper exit path tested" in names
+    assert "Practice mode reviewed" in names
+    assert "Automation check reviewed" in names
+    assert "Paper exit tested" in names
     assert "Manual live approval tested" in names
 
 
@@ -60,11 +60,11 @@ def test_pre_live_readiness_report_is_evidence_based():
     )
 
     checks = {row["Check"]: row for row in rows}
-    assert checks["Paper order submitted"]["Passed"]
-    assert checks["Paper cancel submitted"]["Passed"]
-    assert checks["Paper exit tested"]["Status"] == "blocked"
-    assert checks["Automation dry-run recorded"]["Passed"]
-    assert checks["Live broker writes blocked"]["Passed"]
+    assert checks["Paper buy sent"]["Passed"]
+    assert checks["Paper cancel sent"]["Passed"]
+    assert checks["Paper exit sent"]["Status"] == "blocked"
+    assert checks["Automation check saved"]["Passed"]
+    assert checks["Live orders blocked"]["Passed"]
 
 
 def test_broker_state_simulation_records_include_disconnect_and_kill_switch():
@@ -72,7 +72,7 @@ def test_broker_state_simulation_records_include_disconnect_and_kill_switch():
     scenarios = {row["Scenario"] for row in rows}
 
     assert "Alpaca disconnected" in scenarios
-    assert "Kill switch enabled" in scenarios
+    assert "Stop trading is on" in scenarios
 
 
 def test_live_mode_lockfile_records_require_local_lockfile():
@@ -84,10 +84,10 @@ def test_live_mode_lockfile_records_require_local_lockfile():
         written_path = write_live_mode_lockfile(path)
         present = {row["Check"]: row for row in live_mode_lockfile_records(path)}
 
-    assert not missing["Live Mode Locked"]["Passed"]
+    assert not missing["Live trading locked"]["Passed"]
     assert written_path.name == "LIVE_TRADING_LOCKED.txt"
-    assert present["Live Mode Locked"]["Passed"]
-    assert present["Broker Writes Blocked"]["Passed"]
+    assert present["Live trading locked"]["Passed"]
+    assert present["Live orders blocked"]["Passed"]
 
 
 def test_deployment_readiness_records_block_missing_lockfile():
@@ -101,5 +101,5 @@ def test_deployment_readiness_records_block_missing_lockfile():
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert checks["Environment template present"]["Passed"]
-    assert checks["Live lockfile present"]["Status"] == "blocked"
+    assert checks["Example settings file exists"]["Passed"]
+    assert checks["Live trading lock exists"]["Status"] == "blocked"

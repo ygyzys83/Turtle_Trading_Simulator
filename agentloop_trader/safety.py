@@ -18,15 +18,15 @@ IMMUTABLE_AGENT_BOUNDARIES = (
 def production_readiness_checks() -> list[dict]:
     return [
         {"Check": "Paper trading tested", "Required Before Live": True},
-        {"Check": "Paper exit path tested", "Required Before Live": True},
-        {"Check": "Paper automation dry-run reviewed", "Required Before Live": True},
-        {"Check": "Paper performance dashboard reviewed", "Required Before Live": True},
-        {"Check": "Shadow mode reviewed", "Required Before Live": True},
+        {"Check": "Paper exit tested", "Required Before Live": True},
+        {"Check": "Automation check reviewed", "Required Before Live": True},
+        {"Check": "Paper performance reviewed", "Required Before Live": True},
+        {"Check": "Practice mode reviewed", "Required Before Live": True},
         {"Check": "Manual live approval tested", "Required Before Unattended": True},
-        {"Check": "Broker reconciliation implemented", "Required Before Unattended": True},
-        {"Check": "Persistent audit logs implemented", "Required Before Unattended": True},
-        {"Check": "Emergency disable tested", "Required Before Unattended": True},
-        {"Check": "Agent cannot modify risk/execution boundaries", "Required Before Live": True},
+        {"Check": "Alpaca records refresh correctly", "Required Before Unattended": True},
+        {"Check": "Activity logs are saved", "Required Before Unattended": True},
+        {"Check": "Stop trading button tested", "Required Before Unattended": True},
+        {"Check": "Agent cannot change risk or order code", "Required Before Live": True},
     ]
 
 
@@ -48,14 +48,14 @@ def pre_live_readiness_report(
     live_mode_blocked: bool = True,
 ) -> list[dict]:
     checks = [
-        ("Paper order submitted", paper_order_submitted, "Submit Alpaca Paper Order has reached Alpaca paper."),
-        ("Paper cancel submitted", paper_cancel_submitted, "Cancel Alpaca Paper Order has reached Alpaca paper."),
-        ("Paper exit tested", paper_exit_tested, "Submit Alpaca Paper Exit has been inspected and tested in paper."),
-        ("Paper fill reconciled", paper_fill_reconciled, "Filled paper order matched to Alpaca position lifecycle."),
-        ("Automation dry-run recorded", automation_dry_run_recorded, "Paper automation candidate queue has durable snapshots."),
-        ("Performance dashboard reviewed", performance_reviewed, "Paper performance dashboard has been reviewed."),
-        ("Emergency disable tested", emergency_disable_tested, "Emergency disable session behavior has been verified."),
-        ("Live broker writes blocked", live_mode_blocked, "Live broker writes remain unavailable."),
+        ("Paper buy sent", paper_order_submitted, "A paper buy order reached Alpaca paper."),
+        ("Paper cancel sent", paper_cancel_submitted, "A paper cancel request reached Alpaca paper."),
+        ("Paper exit sent", paper_exit_tested, "A paper exit order reached Alpaca paper."),
+        ("Paper fill matched", paper_fill_reconciled, "A filled paper order matched an Alpaca position."),
+        ("Automation check saved", automation_dry_run_recorded, "An automation check was saved locally."),
+        ("Paper performance reviewed", performance_reviewed, "Paper account performance was reviewed."),
+        ("Stop trading tested", emergency_disable_tested, "The stop trading button was tested."),
+        ("Live orders blocked", live_mode_blocked, "Live orders are still unavailable."),
     ]
     return [
         {
@@ -72,13 +72,13 @@ def live_mode_lockfile_records(path: str | Path | None = None) -> list[dict]:
     lock_path = Path(path) if path is not None else DEFAULT_LIVE_MODE_LOCKFILE_PATH
     exists = lock_path.exists()
     return [
-        {"Check": "Live Lockfile Path", "Passed": True, "Detail": str(lock_path)},
+        {"Check": "Live trading lock file", "Passed": True, "Detail": str(lock_path)},
         {
-            "Check": "Live Mode Locked",
+            "Check": "Live trading locked",
             "Passed": exists,
-            "Detail": "Lockfile exists; future live enablement remains administratively locked." if exists else "Lockfile is missing; live readiness remains blocked.",
+            "Detail": "Lock file exists; live trading stays locked." if exists else "Lock file is missing; live trading stays blocked.",
         },
-        {"Check": "Broker Writes Blocked", "Passed": True, "Detail": "Current code still blocks Alpaca live broker writes."},
+        {"Check": "Live orders blocked", "Passed": True, "Detail": "Current code still blocks Alpaca live orders."},
     ]
 
 
@@ -89,7 +89,7 @@ def write_live_mode_lockfile(path: str | Path | None = None) -> Path:
         "\n".join(
             [
                 "LIVE TRADING IS LOCKED",
-                "Do not enable Alpaca live broker writes without manual code review, paper evidence, and user approval.",
+                "Do not enable Alpaca live orders without reviewing the code, paper-trading results, and account settings.",
                 "This file is a local operational guardrail, not permission to trade live.",
             ]
         )
@@ -109,15 +109,15 @@ def deployment_readiness_records(
     tests_passing: bool | None = None,
 ) -> list[dict]:
     rows = [
-        ("Environment template present", env_example_present, ".env.example is available for non-secret configuration shape."),
+        ("Example settings file exists", env_example_present, ".env.example is available for non-secret setup shape."),
         ("Secrets ignored by git", dotenv_ignored, ".env is ignored and must not be committed."),
-        ("Audit path configured", audit_path_configured, "Durable audit JSONL path is configured."),
-        ("Broker state path configured", broker_state_path_configured, "Tracked Alpaca paper order state path is configured."),
-        ("Evidence export path configured", evidence_export_path_configured, "Evidence export path is configured."),
-        ("Live lockfile present", live_lockfile_present, "Local live-mode lockfile exists."),
+        ("Activity log file set", audit_path_configured, "Activity log file is set."),
+        ("Alpaca order file set", broker_state_path_configured, "Saved Alpaca paper order file is set."),
+        ("Records export file set", evidence_export_path_configured, "Records export file is set."),
+        ("Live trading lock exists", live_lockfile_present, "Local live trading lock file exists."),
     ]
     if tests_passing is not None:
-        rows.append(("Tests passing", tests_passing, "Latest local test checkpoint passed." if tests_passing else "Run tests before deployment."))
+        rows.append(("Tests passing", tests_passing, "Latest local test checkpoint passed." if tests_passing else "Run tests before using live trading."))
     return [
         {
             "Check": name,
@@ -133,26 +133,26 @@ def broker_state_simulation_records() -> list[dict]:
     return [
         {
             "Scenario": "Alpaca disconnected",
-            "Expected App Behavior": "Broker adapters show disconnected; Alpaca paper order/exit/cancel buttons remain disabled.",
+            "Expected App Behavior": "The app shows Alpaca disconnected; paper buy, exit, and cancel buttons stay disabled.",
         },
         {
-            "Scenario": "Stale positions",
-            "Expected App Behavior": "Previews warn that broker state is stale; submission remains blocked.",
+            "Scenario": "Old position data",
+            "Expected App Behavior": "The app asks you to refresh Alpaca before sending an order.",
         },
         {
-            "Scenario": "Stale orders",
-            "Expected App Behavior": "Duplicate-order and lifecycle checks require refresh before broker writes.",
+            "Scenario": "Old order data",
+            "Expected App Behavior": "The app asks you to refresh Alpaca before sending an order.",
         },
         {
-            "Scenario": "Missing tracked order",
-            "Expected App Behavior": "Lifecycle shows missing_from_alpaca_orders until per-order refresh resolves it.",
+            "Scenario": "Saved order not found at Alpaca",
+            "Expected App Behavior": "The app marks the saved order as missing until refresh finds it or you review it.",
         },
         {
             "Scenario": "Duplicate open order",
-            "Expected App Behavior": "Entry or exit submission is blocked by duplicate open order checks.",
+            "Expected App Behavior": "Buy or exit is blocked so you do not double-order the same symbol.",
         },
         {
-            "Scenario": "Kill switch enabled",
-            "Expected App Behavior": "Preflight and automation readiness show blocked state.",
+            "Scenario": "Stop trading is on",
+            "Expected App Behavior": "New orders are blocked.",
         },
     ]

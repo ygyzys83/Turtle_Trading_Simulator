@@ -78,5 +78,4 @@ def test_parameter_loop_recommendation_and_records_are_display_ready():
 
     assert recommended is not None
     assert records
-    assert "Recommended bounded parameters" in summary
-
+    assert "Try these settings next" in summary

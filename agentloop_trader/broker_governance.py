@@ -119,13 +119,13 @@ def cancelable_alpaca_order_records(alpaca_orders: list[dict]) -> list[dict]:
     rows = []
     for order in alpaca_orders:
         status = _enum_value(order.get("Status", ""))
-        broker_order_id = str(order.get("Broker Order ID") or "").strip()
+        broker_order_id = str(order.get("Alpaca Order ID") or order.get("Broker Order ID") or "").strip()
         if status not in OPEN_ORDER_STATUSES or not broker_order_id:
             continue
         rows.append(
             {
                 "Order ID": order.get("Order ID", ""),
-                "Broker Order ID": broker_order_id,
+                "Alpaca Order ID": broker_order_id,
                 "Symbol": str(order.get("Symbol", "")).strip().upper(),
                 "Side": _enum_value(order.get("Side", "")),
                 "Quantity": order.get("Quantity", ""),
@@ -139,14 +139,14 @@ def cancelable_alpaca_order_records(alpaca_orders: list[dict]) -> list[dict]:
 def refresh_tracked_alpaca_orders(tracked_orders: list[dict], alpaca_orders: list[dict]) -> list[dict]:
     now = datetime.now(PACIFIC_TIME).isoformat()
     alpaca_by_id = {
-        str(order.get("Broker Order ID") or "").strip(): order
+        str(order.get("Alpaca Order ID") or order.get("Broker Order ID") or "").strip(): order
         for order in alpaca_orders
-        if order.get("Broker Order ID")
+        if order.get("Alpaca Order ID") or order.get("Broker Order ID")
     }
     refreshed = []
     for tracked in tracked_orders:
         record = dict(tracked)
-        broker_order_id = str(record.get("broker_order_id") or record.get("Broker Order ID") or "").strip()
+        broker_order_id = str(record.get("broker_order_id") or record.get("Alpaca Order ID") or record.get("Broker Order ID") or "").strip()
         alpaca_order = alpaca_by_id.get(broker_order_id)
         if record.get("adopted") and record.get("source") == "adopted_alpaca_position":
             record["lifecycle_status"] = "adopted_alpaca_position"
@@ -181,15 +181,15 @@ def alpaca_order_lifecycle_records(tracked_orders: list[dict], alpaca_orders: li
     return [
         {
             "Order ID": str(order.get("broker_order_id", ""))[:8],
-            "Broker Order ID": order.get("broker_order_id", ""),
+            "Alpaca Order ID": order.get("broker_order_id", ""),
             "Symbol": order.get("symbol", ""),
             "Side": order.get("side", ""),
             "Quantity": order.get("quantity", ""),
-            "Tracked Status": _enum_value(order.get("status", "")),
-            "Lifecycle Status": order.get("lifecycle_status", ""),
+            "Alpaca Status": _enum_value(order.get("status", "")),
+            "App Status": _display_order_status(str(order.get("lifecycle_status", ""))),
             "Filled Qty": order.get("filled_quantity", ""),
             "Avg Fill": order.get("average_fill_price", ""),
-            "Last Synced": order.get("last_synced_at", ""),
+            "Last Updated": order.get("last_synced_at", ""),
         }
         for order in refreshed
     ]
@@ -199,13 +199,13 @@ def alpaca_order_lifecycle_summary_records(tracked_orders: list[dict]) -> list[d
     statuses = [_enum_value(order.get("status", "")) for order in tracked_orders]
     lifecycle_statuses = [str(order.get("lifecycle_status", "")) for order in tracked_orders]
     return [
-        {"Metric": "Tracked Alpaca Orders", "Value": len(tracked_orders)},
-        {"Metric": "Open Alpaca Orders", "Value": lifecycle_statuses.count("open_at_alpaca")},
-        {"Metric": "Filled Alpaca Orders", "Value": statuses.count("filled")},
-        {"Metric": "Adopted Alpaca Positions", "Value": lifecycle_statuses.count("adopted_alpaca_position")},
-        {"Metric": "Canceled Alpaca Orders", "Value": statuses.count("canceled") + statuses.count("cancelled")},
-        {"Metric": "Rejected Alpaca Orders", "Value": statuses.count("rejected")},
-        {"Metric": "Missing From Alpaca Orders", "Value": lifecycle_statuses.count("missing_from_alpaca_orders")},
+        {"Metric": "Saved Alpaca orders", "Value": len(tracked_orders)},
+        {"Metric": "Open orders at Alpaca", "Value": lifecycle_statuses.count("open_at_alpaca")},
+        {"Metric": "Filled orders at Alpaca", "Value": statuses.count("filled")},
+        {"Metric": "Positions manually added to app", "Value": lifecycle_statuses.count("adopted_alpaca_position")},
+        {"Metric": "Canceled orders at Alpaca", "Value": statuses.count("canceled") + statuses.count("cancelled")},
+        {"Metric": "Rejected orders at Alpaca", "Value": statuses.count("rejected")},
+        {"Metric": "Saved orders missing at Alpaca", "Value": lifecycle_statuses.count("missing_from_alpaca_orders")},
     ]
 
 
@@ -243,13 +243,13 @@ def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orde
             {
                 "Symbol": symbol,
                 "Position Qty": position.get("Quantity", ""),
-                "Position Market Value": position.get("Market Value", ""),
-                "Position Avg Entry": position.get("Average Entry", ""),
-                "Filled Order Qty": _format_number(filled_qty) if matched_orders else "",
-                "Filled Avg Price": latest_order.get("average_fill_price", ""),
-                "Matched Filled Orders": len(matched_orders),
-                "Exit Preview Ready": position_qty > 0,
-                "Lifecycle Status": lifecycle_status,
+                "Position Value": position.get("Market Value", ""),
+                "Avg Entry": position.get("Average Entry", ""),
+                "App Order Qty": _format_number(filled_qty) if matched_orders else "",
+                "App Avg Fill": latest_order.get("average_fill_price", ""),
+                "Matched App Orders": len(matched_orders),
+                "Exit Ready": position_qty > 0,
+                "App Status": _display_position_status(lifecycle_status),
             }
         )
 
@@ -262,27 +262,27 @@ def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orde
             {
                 "Symbol": symbol,
                 "Position Qty": "",
-                "Position Market Value": "",
-                "Position Avg Entry": "",
-                "Filled Order Qty": _format_number(filled_qty),
-                "Filled Avg Price": latest_order.get("average_fill_price", ""),
-                "Matched Filled Orders": len(orders),
-                "Exit Preview Ready": False,
-                "Lifecycle Status": "filled_order_without_open_position",
+                "Position Value": "",
+                "Avg Entry": "",
+                "App Order Qty": _format_number(filled_qty),
+                "App Avg Fill": latest_order.get("average_fill_price", ""),
+                "Matched App Orders": len(orders),
+                "Exit Ready": False,
+                "App Status": _display_position_status("filled_order_without_open_position"),
             }
         )
     return rows
 
 
 def alpaca_position_lifecycle_summary_records(position_lifecycle_rows: list[dict]) -> list[dict]:
-    statuses = [str(row.get("Lifecycle Status", "")) for row in position_lifecycle_rows]
+    statuses = [str(row.get("App Status", "")) for row in position_lifecycle_rows]
     return [
         {"Metric": "Alpaca Positions", "Value": sum(bool(row.get("Position Qty")) for row in position_lifecycle_rows)},
-        {"Metric": "Matched Filled Positions", "Value": statuses.count("position_matched_to_filled_order")},
-        {"Metric": "Adopted Alpaca Positions", "Value": statuses.count("adopted_alpaca_position")},
-        {"Metric": "Untracked Alpaca Positions", "Value": statuses.count("untracked_alpaca_position")},
-        {"Metric": "Filled Orders Without Position", "Value": statuses.count("filled_order_without_open_position")},
-        {"Metric": "Exit Previews Ready", "Value": sum(bool(row.get("Exit Preview Ready")) for row in position_lifecycle_rows)},
+        {"Metric": "Positions matched to app orders", "Value": statuses.count("Matched to app order")},
+        {"Metric": "Positions manually added to app", "Value": statuses.count("Tracked manually")},
+        {"Metric": "Positions needing app tracking", "Value": statuses.count("Needs app tracking")},
+        {"Metric": "Filled app orders without a position", "Value": statuses.count("No open Alpaca position")},
+        {"Metric": "Exit orders ready to review", "Value": sum(bool(row.get("Exit Ready")) for row in position_lifecycle_rows)},
     ]
 
 
@@ -296,6 +296,27 @@ def _lifecycle_status(status: str) -> str:
     if status in TERMINAL_ORDER_STATUSES:
         return "terminal_at_alpaca"
     return "unknown_at_alpaca"
+
+
+def _display_order_status(status: str) -> str:
+    return {
+        "open_at_alpaca": "Open at Alpaca",
+        "filled_at_alpaca": "Filled at Alpaca",
+        "canceled_at_alpaca": "Canceled at Alpaca",
+        "terminal_at_alpaca": "Closed at Alpaca",
+        "missing_from_alpaca_orders": "Saved in app, missing at Alpaca",
+        "adopted_alpaca_position": "Position added to app",
+        "unknown_at_alpaca": "Unknown at Alpaca",
+    }.get(status, status or "")
+
+
+def _display_position_status(status: str) -> str:
+    return {
+        "position_matched_to_filled_order": "Matched to app order",
+        "adopted_alpaca_position": "Tracked manually",
+        "untracked_alpaca_position": "Needs app tracking",
+        "filled_order_without_open_position": "No open Alpaca position",
+    }.get(status, status or "")
 
 
 def _is_adopted_position_order(order: dict) -> bool:
@@ -448,18 +469,18 @@ def simulated_exit_preview_readiness_records(
     config: AlpacaConfig,
 ) -> list[dict]:
     if not tracked_order:
-        return [{"Check": "Filled Order Available", "Passed": False, "Detail": "Select a tracked order before simulating exit readiness."}]
+        return [{"Check": "Filled order selected", "Passed": False, "Detail": "Select a saved order before practicing the exit check."}]
     filled_order = simulated_alpaca_fill_order(tracked_order)
     position = simulated_position_from_filled_order(filled_order)
     previews = build_exit_order_previews([position], config)
     preview = previews[0] if previews else None
     blockers = exit_position_reasons(preview, [position]) if preview else ["No simulated exit preview was generated."]
     return [
-        {"Check": "Filled Order Available", "Passed": True, "Detail": filled_order.get("broker_order_id", "")},
-        {"Check": "Simulated Position Created", "Passed": bool(position.get("Symbol")), "Detail": position.get("Symbol", "")},
-        {"Check": "Exit Preview Valid", "Passed": bool(preview and preview.valid), "Detail": "" if preview and preview.valid else "; ".join(preview.blocked_reasons if preview else blockers)},
-        {"Check": "Exit Position Check", "Passed": not blockers, "Detail": "Simulated position can be exited." if not blockers else "; ".join(blockers)},
-        {"Check": "Broker Writes Submitted", "Passed": True, "Detail": "0"},
+        {"Check": "Filled order selected", "Passed": True, "Detail": filled_order.get("broker_order_id", "")},
+        {"Check": "Practice position created", "Passed": bool(position.get("Symbol")), "Detail": position.get("Symbol", "")},
+        {"Check": "Exit order ready", "Passed": bool(preview and preview.valid), "Detail": "" if preview and preview.valid else "; ".join(preview.blocked_reasons if preview else blockers)},
+        {"Check": "Position can be exited", "Passed": not blockers, "Detail": "Practice position can be exited." if not blockers else "; ".join(blockers)},
+        {"Check": "Orders sent", "Passed": True, "Detail": "0"},
     ]
 
 
@@ -470,7 +491,7 @@ def exit_preview_records(previews: list[AlpacaOrderPreview]) -> list[dict]:
             "Side": preview.order.get("side", ""),
             "Quantity": preview.order.get("quantity", 0),
             "Mode": preview.order.get("mode", ""),
-            "Preview Hash": preview.preview_hash,
+            "Review ID": preview.preview_hash,
             "Valid": preview.valid,
             "Blocked Reasons": "; ".join(preview.blocked_reasons),
         }

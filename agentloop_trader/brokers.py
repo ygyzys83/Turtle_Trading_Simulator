@@ -127,11 +127,11 @@ def alpaca_config_validation_records(config: AlpacaConfig) -> list[dict]:
     paper_endpoint = "paper-api.alpaca.markets" in endpoint
     live_endpoint = "api.alpaca.markets" in endpoint and not paper_endpoint
     return [
-        {"Check": "Credentials Present", "Passed": config.has_credentials, "Detail": "API key and secret are configured." if config.has_credentials else "API key or secret is missing."},
-        {"Check": "Paper Mode Enabled", "Passed": config.paper, "Detail": "Adapter is configured for paper mode." if config.paper else "Live mode is configured; broker writes remain blocked."},
-        {"Check": "Paper Endpoint", "Passed": paper_endpoint, "Detail": endpoint or "No endpoint configured."},
-        {"Check": "Live Endpoint Blocked", "Passed": not live_endpoint, "Detail": "Live endpoint is not configured." if not live_endpoint else "Live endpoint detected; live broker writes are blocked by adapter."},
-        {"Check": "Default Endpoint Includes /v2", "Passed": endpoint.endswith("/v2"), "Detail": endpoint or "No endpoint configured."},
+        {"Check": "API keys found", "Passed": config.has_credentials, "Detail": "API key and secret are set." if config.has_credentials else "API key or secret is missing."},
+        {"Check": "Using paper account", "Passed": config.paper, "Detail": "Alpaca paper mode is on." if config.paper else "Live mode is configured, but live orders remain blocked."},
+        {"Check": "Paper account URL", "Passed": paper_endpoint, "Detail": endpoint or "No Alpaca URL is set."},
+        {"Check": "Live account URL blocked", "Passed": not live_endpoint, "Detail": "Live account URL is not configured." if not live_endpoint else "Live account URL detected; live orders are still blocked."},
+        {"Check": "Alpaca URL includes /v2", "Passed": endpoint.endswith("/v2"), "Detail": endpoint or "No Alpaca URL is set."},
     ]
 
 
@@ -224,9 +224,9 @@ class AlpacaBrokerAdapterStub:
         if not self.config.paper:
             raise RuntimeError("Alpaca live order submission is blocked. Use paper mode only.")
         if not self.allow_order_submission:
-            raise RuntimeError("Alpaca paper order submission is disabled by manual gate.")
+            raise RuntimeError("Paper orders are turned off in the sidebar.")
         if not decision.approved_for_execution:
-            raise RuntimeError(f"Execution decision blocked order: {decision.reason}")
+            raise RuntimeError(f"Order blocked: {decision.reason}")
         client = self._get_client()
         if client is None:
             raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
@@ -248,7 +248,7 @@ class AlpacaBrokerAdapterStub:
         if not self.config.paper:
             raise RuntimeError("Alpaca live order cancellation is blocked. Use paper mode only.")
         if not self.allow_order_submission:
-            raise RuntimeError("Alpaca paper cancel submission is disabled by manual gate.")
+            raise RuntimeError("Paper cancels are turned off in the sidebar.")
         client = self._get_client()
         if client is None:
             raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
@@ -320,7 +320,7 @@ class AlpacaBrokerAdapterStub:
     def tracked_order_record(self, broker_order_id: str, preview_hash: str) -> dict:
         order = self._get_order_by_id(broker_order_id)
         if order is None:
-            return {"Order ID": broker_order_id[:8], "Broker Order ID": broker_order_id, "Preview Hash": preview_hash, "Status": "unavailable"}
+            return {"Order ID": broker_order_id[:8], "Alpaca Order ID": broker_order_id, "Review ID": preview_hash, "Status": "unavailable"}
         return alpaca_tracked_order_records([
             alpaca_tracked_order_from_broker_order(order, preview_hash=preview_hash)
         ])[0]
@@ -448,16 +448,16 @@ def build_alpaca_order_preview(
 
 
 def alpaca_preview_records(preview: AlpacaOrderPreview) -> list[dict]:
-    rows = [{"Field": key.replace("_", " ").title(), "Value": value} for key, value in preview.order.items()]
-    rows.append({"Field": "Preview Hash", "Value": preview.preview_hash})
-    rows.append({"Field": "Valid For Submission", "Value": preview.valid})
+    rows = [{"Field": _display_order_field(key), "Value": value} for key, value in preview.order.items()]
+    rows.append({"Field": "Review ID", "Value": preview.preview_hash})
+    rows.append({"Field": "Ready To Send", "Value": preview.valid})
     return rows
 
 
 def build_alpaca_cancel_preview(order_record: dict | None, config: AlpacaConfig) -> AlpacaCancelPreview:
     blocked: list[str] = []
     order_record = order_record or {}
-    broker_order_id = str(order_record.get("Broker Order ID") or order_record.get("Order ID") or "").strip()
+    broker_order_id = str(order_record.get("Alpaca Order ID") or order_record.get("Broker Order ID") or order_record.get("Order ID") or "").strip()
     status = _enum_value(order_record.get("Status", ""))
     cancel = {
         "broker": "alpaca",
@@ -489,9 +489,9 @@ def build_alpaca_cancel_preview(order_record: dict | None, config: AlpacaConfig)
 
 
 def alpaca_cancel_preview_records(preview: AlpacaCancelPreview) -> list[dict]:
-    rows = [{"Field": key.replace("_", " ").title(), "Value": value} for key, value in preview.cancel.items()]
-    rows.append({"Field": "Cancel Preview Hash", "Value": preview.preview_hash})
-    rows.append({"Field": "Valid For Cancellation", "Value": preview.valid})
+    rows = [{"Field": _display_order_field(key), "Value": value} for key, value in preview.cancel.items()]
+    rows.append({"Field": "Review ID", "Value": preview.preview_hash})
+    rows.append({"Field": "Ready To Cancel", "Value": preview.valid})
     return rows
 
 
@@ -532,8 +532,8 @@ def alpaca_tracked_order_records(orders: list[AlpacaTrackedOrder]) -> list[dict]
     return [
         {
             "Order ID": order.broker_order_id[:8],
-            "Broker Order ID": order.broker_order_id,
-            "Preview Hash": order.preview_hash,
+            "Alpaca Order ID": order.broker_order_id,
+            "Review ID": order.preview_hash,
             "Symbol": order.symbol,
             "Side": order.side,
             "Quantity": order.quantity,
@@ -545,6 +545,22 @@ def alpaca_tracked_order_records(orders: list[AlpacaTrackedOrder]) -> list[dict]
         }
         for order in orders
     ]
+
+
+def _display_order_field(key: str) -> str:
+    return {
+        "broker": "Broker",
+        "mode": "Account",
+        "symbol": "Symbol",
+        "side": "Side",
+        "quantity": "Quantity",
+        "order_type": "Order Type",
+        "time_in_force": "Time In Force",
+        "source": "Source",
+        "action": "Action",
+        "broker_order_id": "Alpaca Order ID",
+        "status": "Alpaca Status",
+    }.get(key, key.replace("_", " ").title())
 
 
 def broker_status_records(statuses: list[BrokerStatus]) -> list[dict]:

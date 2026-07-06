@@ -29,11 +29,11 @@ def test_approval_ledger_extracts_preview_hashes_and_manual_gates():
     summary = {row["Metric"]: row["Value"] for row in approval_ledger_summary_records(rows)}
 
     assert len(rows) == 2
-    assert rows[0]["Action"] == "order armed"
-    assert rows[0]["Preview Hash"] == "abc"
-    assert rows[1]["Broker Write"]
-    assert rows[1]["Manual Gate Required"]
-    assert summary["Rows With Preview Hash"] == 2
+    assert rows[0]["Action"] == "buy reviewed"
+    assert rows[0]["Review ID"] == "abc"
+    assert rows[1]["Sent To Alpaca"]
+    assert rows[1]["Needs Review"]
+    assert summary["Rows with review ID"] == 2
 
 
 def test_evidence_package_can_be_written_locally():
@@ -54,7 +54,7 @@ def test_evidence_package_can_be_written_locally():
         text = path.read_text(encoding="utf-8")
 
     assert rows["Session"] == "session-1"
-    assert rows["Audit Records"] == 1
+    assert rows["Activity records"] == 1
     assert '"session_id": "session-1"' in text
     assert not package["exported_at"].endswith("+00:00")
     assert datetime.fromisoformat(package["exported_at"]).utcoffset().total_seconds() in {-7 * 3600, -8 * 3600}

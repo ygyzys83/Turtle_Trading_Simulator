@@ -19,25 +19,25 @@ def market_data_freshness_records(
     source_ok = synthetic or "yfinance" in source_caption.lower()
     return [
         {
-            "Check": "Data Source Identified",
+            "Check": "Price source found",
             "Passed": source_ok,
-            "Detail": source_caption or "No source caption is available.",
+            "Detail": source_caption or "No price source is available.",
         },
         {
-            "Check": "Enough Bars Loaded",
+            "Check": "Enough price bars loaded",
             "Passed": enough_rows,
             "Detail": f"{row_count} bar(s) loaded; minimum for current rules is {minimum_rows}.",
         },
         {
-            "Check": "Latest Bar Present",
+            "Check": "Latest price bar found",
             "Passed": has_latest,
-            "Detail": f"Latest bar: {latest_label}" if has_latest else "No latest bar label is available.",
+            "Detail": f"Latest bar: {latest_label}" if has_latest else "No latest price bar is available.",
         },
         {
-            "Check": "Freshness Policy",
+            "Check": "Data note",
             "Passed": True,
             "Detail": (
-                "Synthetic data is deterministic test data."
+                "Synthetic data is generated test data."
                 if synthetic
                 else "Yahoo Finance data is treated as research/paper data and may be delayed."
             ),
@@ -54,16 +54,16 @@ def strategy_state_snapshot_records(
 ) -> list[dict]:
     return [
         {"Field": "Strategy", "Value": config.name},
-        {"Field": "Entry Window", "Value": config.entry_window},
-        {"Field": "Exit Window", "Value": config.exit_window},
-        {"Field": "ATR Stop Multiple", "Value": config.atr_stop_multiplier},
-        {"Field": "MA Trend Filter", "Value": config.moving_average_window},
+        {"Field": "Entry rule bars", "Value": config.entry_window},
+        {"Field": "Exit rule bars", "Value": config.exit_window},
+        {"Field": "Stop size", "Value": config.atr_stop_multiplier},
+        {"Field": "Trend filter bars", "Value": config.moving_average_window},
         {"Field": "Signal", "Value": str(live.get("signal", "")).upper()},
-        {"Field": "Reference Price", "Value": _money(live.get("last_p"))},
-        {"Field": "Proposed Symbol", "Value": intent.symbol_clean if intent else ""},
-        {"Field": "Proposed Quantity", "Value": intent.quantity if intent else 0},
-        {"Field": "Risk Approved", "Value": risk_check.approved},
-        {"Field": "Preflight Ready", "Value": preflight.ready},
+        {"Field": "Current price", "Value": _money(live.get("last_p"))},
+        {"Field": "Symbol to trade", "Value": intent.symbol_clean if intent else ""},
+        {"Field": "Shares to trade", "Value": intent.quantity if intent else 0},
+        {"Field": "Risk check passed", "Value": risk_check.approved},
+        {"Field": "Ready to send", "Value": preflight.ready},
     ]
 
 
@@ -77,10 +77,10 @@ def restart_recovery_records(
     automation_snapshots_loaded: int,
 ) -> list[dict]:
     configured_paths = {
-        "Audit Log Path": audit_log_path,
-        "Broker State Path": broker_state_path,
-        "Automation Dry Run Path": automation_dry_run_path,
-        "Run Manifest Path": run_manifest_path,
+        "Activity log file": audit_log_path,
+        "Alpaca order file": broker_state_path,
+        "Automation check file": automation_dry_run_path,
+        "Run summary file": run_manifest_path,
     }
     rows = []
     for check, raw_path in configured_paths.items():
@@ -89,21 +89,21 @@ def restart_recovery_records(
             {
                 "Check": check,
                 "Passed": bool(str(raw_path).strip()),
-                "Detail": str(path) if str(raw_path).strip() else "Path is not configured.",
+                "Detail": str(path) if str(raw_path).strip() else "File is not set.",
             }
         )
         rows.append(
             {
-                "Check": f"{check} Parent Available",
+                "Check": f"{check} folder exists",
                 "Passed": bool(str(raw_path).strip()) and (path.parent == Path(".") or path.parent.exists()),
                 "Detail": str(path.parent),
             }
         )
     rows.extend(
         [
-            {"Check": "Audit Events Recoverable", "Passed": audit_records_loaded >= 0, "Detail": f"{audit_records_loaded} event(s) loaded."},
-            {"Check": "Tracked Orders Recoverable", "Passed": tracked_orders_loaded >= 0, "Detail": f"{tracked_orders_loaded} tracked order(s) loaded."},
-            {"Check": "Automation Snapshots Recoverable", "Passed": automation_snapshots_loaded >= 0, "Detail": f"{automation_snapshots_loaded} snapshot(s) loaded."},
+            {"Check": "Activity records loaded", "Passed": audit_records_loaded >= 0, "Detail": f"{audit_records_loaded} record(s) loaded."},
+            {"Check": "Saved orders loaded", "Passed": tracked_orders_loaded >= 0, "Detail": f"{tracked_orders_loaded} saved order(s) loaded."},
+            {"Check": "Automation checks loaded", "Passed": automation_snapshots_loaded >= 0, "Detail": f"{automation_snapshots_loaded} saved check(s) loaded."},
         ]
     )
     return rows
@@ -124,21 +124,21 @@ def paper_account_health_records(
         if _enum_value(order.get("status", "")) in {"accepted", "new", "pending_new", "partially_filled", "filled"}
     ]
     return [
-        {"Check": "Paper Cash Nonnegative", "Passed": paper_cash >= 0, "Detail": _money(paper_cash)},
-        {"Check": "Paper Equity Positive", "Passed": paper_equity > 0, "Detail": _money(paper_equity)},
-        {"Check": "Session P&L Available", "Passed": True, "Detail": _money(paper_equity - starting_cash)},
+        {"Check": "Paper cash is not negative", "Passed": paper_cash >= 0, "Detail": _money(paper_cash)},
+        {"Check": "Paper account value is positive", "Passed": paper_equity > 0, "Detail": _money(paper_equity)},
+        {"Check": "Session profit/loss is available", "Passed": True, "Detail": _money(paper_equity - starting_cash)},
         {
-            "Check": "Open Positions Within Limit",
+            "Check": "Open positions within limit",
             "Passed": local_open_positions <= limits.max_open_positions,
             "Detail": f"{local_open_positions} local open position(s); max {limits.max_open_positions}.",
         },
         {
-            "Check": "Tracked Alpaca Activity Visible",
+            "Check": "Saved Alpaca activity visible",
             "Passed": True,
             "Detail": f"{len(tracked_alpaca_orders)} tracked order(s); {len(active_tracked_orders)} active/filled.",
         },
         {
-            "Check": "Monitoring Status",
+            "Check": "Account status",
             "Passed": monitoring_result.status != "BREACH",
             "Detail": f"{monitoring_result.status}: {'; '.join(monitoring_result.alerts)}",
         },
@@ -155,18 +155,18 @@ def scheduler_preview_records(
     would_evaluate = not kill_switch_enabled and halt_count == 0
     would_queue_review = would_evaluate and ready_candidate_count > 0
     return [
-        {"Field": "Scheduler Mode", "Value": "preview_only"},
-        {"Field": "Interval Minutes", "Value": interval_minutes},
+        {"Field": "Timer mode", "Value": "check only"},
+        {"Field": "Minutes between checks", "Value": interval_minutes},
         {"Field": "Market Open", "Value": market_open},
-        {"Field": "Would Evaluate Strategy", "Value": would_evaluate},
-        {"Field": "Would Queue Manual Review", "Value": would_queue_review},
-        {"Field": "Broker Writes Submitted", "Value": 0},
+        {"Field": "Would check strategy", "Value": would_evaluate},
+        {"Field": "Would ask for your review", "Value": would_queue_review},
+        {"Field": "Orders sent", "Value": 0},
         {
             "Field": "Detail",
             "Value": (
-                "A future scheduler would only evaluate and queue review in this build."
+                "A future timer would only check the strategy and ask for your review."
                 if would_evaluate
-                else "Scheduler preview is halted by the current session state."
+                else "The timer check is stopped by the current app state."
             ),
         },
     ]
@@ -185,22 +185,20 @@ def paper_automation_gate_records(
     blockers: list[str] = []
     _collect_failed(blockers, market_data_rows, "Check")
     _collect_failed(blockers, account_health_rows, "Check")
-    _collect_failed(blockers, restart_rows, "Check", required_checks={"Audit Log Path", "Broker State Path", "Automation Dry Run Path", "Run Manifest Path"})
+    _collect_failed(blockers, restart_rows, "Check", required_checks={"Activity log file", "Alpaca order file", "Automation check file", "Run summary file"})
     _collect_failed(blockers, readiness_rows, "Check")
     active_halts = [row for row in halt_rows if row.get("Active")]
-    blockers.extend(str(row.get("Halt Reason", "")) for row in active_halts if row.get("Halt Reason"))
-    if dry_run_snapshots_loaded <= 0:
-        blockers.append("Record Paper Automation Dry Run before considering unattended paper automation.")
+    blockers.extend(str(row.get("Block", row.get("Halt Reason", ""))) for row in active_halts if row.get("Block", row.get("Halt Reason", "")))
     if not broker_connected:
         blockers.append("Alpaca account is not connected.")
     if broker_state_stale:
-        blockers.append("Alpaca broker state is stale.")
+        blockers.append("Refresh Alpaca positions and orders.")
     blockers = list(dict.fromkeys(reason for reason in blockers if reason))
     return [
-        {"Check": "Broker Connected", "Passed": broker_connected, "Detail": "Alpaca reads are connected." if broker_connected else "Connect Alpaca paper credentials."},
-        {"Check": "Broker State Fresh", "Passed": not broker_state_stale, "Detail": "Current read is fresh." if not broker_state_stale else "Refresh Alpaca positions/orders."},
-        {"Check": "Dry Run Evidence Present", "Passed": dry_run_snapshots_loaded > 0, "Detail": f"{dry_run_snapshots_loaded} dry-run snapshot(s) loaded."},
-        {"Check": "Ready For Paper Automation", "Passed": not blockers, "Detail": "All local gates passed." if not blockers else "; ".join(blockers)},
+        {"Check": "Alpaca connected", "Passed": broker_connected, "Detail": "Alpaca is connected." if broker_connected else "Connect Alpaca paper credentials."},
+        {"Check": "Alpaca data current", "Passed": not broker_state_stale, "Detail": "Alpaca data is current." if not broker_state_stale else "Refresh Alpaca positions and orders."},
+        {"Check": "Saved automation checks", "Passed": True, "Detail": f"{dry_run_snapshots_loaded} saved check(s) loaded."},
+        {"Check": "Paper automation allowed", "Passed": not blockers, "Detail": "No hard blocks found." if not blockers else "; ".join(blockers)},
     ]
 
 

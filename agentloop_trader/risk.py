@@ -91,7 +91,7 @@ def check_trade_intent(
 
     checks["kill_switch_off"] = not limits.kill_switch_enabled
     if limits.kill_switch_enabled:
-        rejected.append("Kill switch is enabled.")
+        rejected.append("Stop trading switch is on.")
 
     checks["symbol_allowed"] = not limits.allowed_symbols or symbol in limits.allowed_symbols
     if not checks["symbol_allowed"]:
@@ -214,7 +214,7 @@ def build_preflight_check(
 def preflight_records(preflight: PreflightCheckResult) -> list[dict]:
     return [
         {
-            "Check": name.replace("_", " ").title(),
+            "Check": _display_check_name(name),
             "Passed": passed,
         }
         for name, passed in preflight.checks.items()
@@ -231,15 +231,15 @@ def risk_policy_records(limits: RiskLimits) -> list[dict]:
         {"Policy": "Max session loss", "Value": f"{limits.max_session_loss_pct}%"},
         {"Policy": "Max open positions", "Value": limits.max_open_positions},
         {"Policy": "Stop loss required", "Value": limits.require_stop_loss},
-        {"Policy": "Kill switch enabled", "Value": limits.kill_switch_enabled},
-        {"Policy": "Broker target", "Value": "Alpaca adapter target; paper broker active"},
+        {"Policy": "Stop trading switch on", "Value": limits.kill_switch_enabled},
+        {"Policy": "Broker target", "Value": "Alpaca paper account"},
     ]
 
 
 def decide_execution(mode: ExecutionMode, risk_check: RiskCheckResult) -> ExecutionDecision:
     if not risk_check.approved:
         detail = "; ".join(dict.fromkeys(risk_check.rejected_reasons))
-        reason = f"Rejected by deterministic risk controls: {detail}" if detail else "Rejected by deterministic risk controls."
+        reason = f"Risk rules blocked this trade: {detail}" if detail else "Risk rules blocked this trade."
         return ExecutionDecision(
             mode=mode,
             approved_for_execution=False,
@@ -253,7 +253,7 @@ def decide_execution(mode: ExecutionMode, risk_check: RiskCheckResult) -> Execut
             mode=mode,
             approved_for_execution=False,
             requires_manual_approval=False,
-            reason="Backtest-only mode does not send orders.",
+            reason="Backtest only does not send orders.",
             risk_check=risk_check,
         )
 
@@ -262,7 +262,7 @@ def decide_execution(mode: ExecutionMode, risk_check: RiskCheckResult) -> Execut
             mode=mode,
             approved_for_execution=False,
             requires_manual_approval=True,
-            reason="Risk-approved, but this mode requires manual approval.",
+            reason="Risk rules passed, but this mode needs your approval.",
             risk_check=risk_check,
         )
 
@@ -270,6 +270,16 @@ def decide_execution(mode: ExecutionMode, risk_check: RiskCheckResult) -> Execut
         mode=mode,
         approved_for_execution=True,
         requires_manual_approval=False,
-        reason="Risk-approved for the selected execution mode.",
+        reason="Risk rules passed for the selected order mode.",
         risk_check=risk_check,
     )
+
+
+def _display_check_name(name: str) -> str:
+    return {
+        "risk_approved": "Risk rules passed",
+        "execution_approved": "Order mode allows sending",
+        "broker_connected": "Alpaca connected",
+        "audit_logging_enabled": "Activity log enabled",
+        "preflight": "Ready to send",
+    }.get(name, name.replace("_", " ").title())

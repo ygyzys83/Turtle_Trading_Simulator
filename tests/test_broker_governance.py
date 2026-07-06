@@ -130,7 +130,7 @@ def test_cancelable_alpaca_order_records_require_open_status_and_full_order_id()
     rows = cancelable_alpaca_order_records(orders)
 
     assert len(rows) == 1
-    assert rows[0]["Broker Order ID"] == "abcdef123456"
+    assert rows[0]["Alpaca Order ID"] == "abcdef123456"
     assert rows[0]["Status"] == "accepted"
 
 
@@ -203,10 +203,10 @@ def test_alpaca_order_lifecycle_records_and_summary_are_display_ready():
     rows = alpaca_order_lifecycle_records(tracked, alpaca_orders)
     summary = alpaca_order_lifecycle_summary_records(refresh_tracked_alpaca_orders(tracked, alpaca_orders))
 
-    assert rows[0]["Lifecycle Status"] == "filled_at_alpaca"
+    assert rows[0]["App Status"] == "Filled at Alpaca"
     assert rows[0]["Filled Qty"] == "40"
     metrics = {row["Metric"]: row["Value"] for row in summary}
-    assert metrics["Filled Alpaca Orders"] == 1
+    assert metrics["Filled orders at Alpaca"] == 1
 
 
 def test_alpaca_position_lifecycle_matches_filled_order_to_position():
@@ -233,12 +233,12 @@ def test_alpaca_position_lifecycle_matches_filled_order_to_position():
     rows = alpaca_position_lifecycle_records(positions, tracked)
     summary = alpaca_position_lifecycle_summary_records(rows)
 
-    assert rows[0]["Lifecycle Status"] == "position_matched_to_filled_order"
-    assert rows[0]["Exit Preview Ready"]
-    assert rows[0]["Filled Order Qty"] == "40"
+    assert rows[0]["App Status"] == "Matched to app order"
+    assert rows[0]["Exit Ready"]
+    assert rows[0]["App Order Qty"] == "40"
     metrics = {row["Metric"]: row["Value"] for row in summary}
-    assert metrics["Matched Filled Positions"] == 1
-    assert metrics["Exit Previews Ready"] == 1
+    assert metrics["Positions matched to app orders"] == 1
+    assert metrics["Exit orders ready to review"] == 1
 
 
 def test_alpaca_position_lifecycle_marks_untracked_position():
@@ -247,8 +247,8 @@ def test_alpaca_position_lifecycle_marks_untracked_position():
         [],
     )
 
-    assert rows[0]["Lifecycle Status"] == "untracked_alpaca_position"
-    assert rows[0]["Exit Preview Ready"]
+    assert rows[0]["App Status"] == "Needs app tracking"
+    assert rows[0]["Exit Ready"]
 
 
 def test_adopt_alpaca_position_creates_local_filled_tracking_record():
@@ -283,11 +283,11 @@ def test_adopted_alpaca_position_survives_order_refresh_and_matches_position():
     summary_values = {row["Metric"]: row["Value"] for row in summary}
 
     assert refreshed[0]["lifecycle_status"] == "adopted_alpaca_position"
-    assert lifecycle_rows[0]["Lifecycle Status"] == "adopted_alpaca_position"
-    assert lifecycle_rows[0]["Matched Filled Orders"] == 1
-    assert lifecycle_rows[0]["Exit Preview Ready"]
-    assert summary_values["Adopted Alpaca Positions"] == 1
-    assert summary_values["Untracked Alpaca Positions"] == 0
+    assert lifecycle_rows[0]["App Status"] == "Tracked manually"
+    assert lifecycle_rows[0]["Matched App Orders"] == 1
+    assert lifecycle_rows[0]["Exit Ready"]
+    assert summary_values["Positions manually added to app"] == 1
+    assert summary_values["Positions needing app tracking"] == 0
 
 
 def test_alpaca_position_lifecycle_marks_filled_order_without_position():
@@ -305,8 +305,8 @@ def test_alpaca_position_lifecycle_marks_filled_order_without_position():
         ],
     )
 
-    assert rows[0]["Lifecycle Status"] == "filled_order_without_open_position"
-    assert not rows[0]["Exit Preview Ready"]
+    assert rows[0]["App Status"] == "No open Alpaca position"
+    assert not rows[0]["Exit Ready"]
 
 
 def test_broker_state_health_flags_stale_refreshes():
@@ -392,6 +392,6 @@ def test_simulated_exit_preview_readiness_is_local_only():
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert checks["Filled Order Available"]["Passed"]
-    assert checks["Exit Position Check"]["Passed"]
-    assert checks["Broker Writes Submitted"]["Detail"] == "0"
+    assert checks["Filled order selected"]["Passed"]
+    assert checks["Position can be exited"]["Passed"]
+    assert checks["Orders sent"]["Detail"] == "0"

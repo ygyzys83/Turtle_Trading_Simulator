@@ -10,12 +10,12 @@ def compact_status_records(
     live_writes_blocked: bool = True,
 ) -> list[dict]:
     return [
-        {"Status": "Execution Mode", "Value": mode_label, "State": "info"},
-        {"Status": "Risk Gate", "Value": "approved" if risk_approved else "blocked", "State": "ok" if risk_approved else "block"},
+        {"Status": "Mode", "Value": mode_label, "State": "info"},
+        {"Status": "Trade Check", "Value": "passed" if risk_approved else "blocked", "State": "ok" if risk_approved else "block"},
         {"Status": "Alpaca", "Value": "connected" if broker_connected else "disconnected", "State": "ok" if broker_connected else "block"},
-        {"Status": "Broker State", "Value": "stale" if broker_state_stale else "fresh", "State": "block" if broker_state_stale else "ok"},
-        {"Status": "Kill Switch", "Value": "on" if kill_switch_enabled else "off", "State": "block" if kill_switch_enabled else "ok"},
-        {"Status": "Live Writes", "Value": "blocked" if live_writes_blocked else "available", "State": "ok" if live_writes_blocked else "block"},
+        {"Status": "Alpaca Data", "Value": "needs refresh" if broker_state_stale else "current", "State": "block" if broker_state_stale else "ok"},
+        {"Status": "Stop Trading", "Value": "on" if kill_switch_enabled else "off", "State": "block" if kill_switch_enabled else "ok"},
+        {"Status": "Live Orders", "Value": "blocked" if live_writes_blocked else "available", "State": "ok" if live_writes_blocked else "block"},
     ]
 
 
@@ -27,13 +27,13 @@ def agent_loop_stage_records(
     broker_connected: bool,
 ) -> list[dict]:
     stages = [
-        ("Observe", True, "Market data loaded and strategy rules evaluated."),
-        ("Propose", intent_present, "Trade intent exists." if intent_present else "No current trade intent."),
-        ("Risk Gate", risk_approved, "Deterministic risk policy approved." if risk_approved else "Risk policy blocked or no intent."),
-        ("Preflight", preflight_ready, "Execution preflight is ready." if preflight_ready else "Execution preflight is blocked."),
-        ("Human Gate", human_gate_required, "Manual approval required before broker write." if human_gate_required else "No manual broker-write approval is currently armed."),
-        ("Broker State", broker_connected, "Broker read path is connected." if broker_connected else "Broker read path is unavailable."),
-        ("Review", True, "Audit, reconciliation, and post-trade review close the loop."),
+        ("Read Prices", True, "Market data loaded and strategy rules checked."),
+        ("Find Trade", intent_present, "There is a trade to review." if intent_present else "No trade to review right now."),
+        ("Check Risk", risk_approved, "Risk checks passed." if risk_approved else "Risk checks blocked the trade or there is no trade."),
+        ("Ready To Send", preflight_ready, "The trade can be reviewed for sending." if preflight_ready else "The trade cannot be sent yet."),
+        ("Your Review", human_gate_required, "You must review before any broker action." if human_gate_required else "No broker action is ready."),
+        ("Alpaca", broker_connected, "Alpaca is connected." if broker_connected else "Alpaca is not connected."),
+        ("Learn", True, "The app records actions and reviews closed trades."),
     ]
     return [
         {
@@ -47,11 +47,11 @@ def agent_loop_stage_records(
 
 def portfolio_story_records() -> list[dict]:
     return [
-        {"Step": "1. Observe", "Portfolio Signal": "Market data and strategy rules produce a current state."},
-        {"Step": "2. Propose", "Portfolio Signal": "The agent creates a structured trade thesis and intent."},
-        {"Step": "3. Gate", "Portfolio Signal": "Deterministic risk policy can block the agent."},
-        {"Step": "4. Approve", "Portfolio Signal": "Human-in-the-loop controls arm one exact preview hash."},
-        {"Step": "5. Execute", "Portfolio Signal": "Only gated paper broker actions can reach Alpaca paper."},
-        {"Step": "6. Reconcile", "Portfolio Signal": "Broker state refresh confirms what actually happened."},
-        {"Step": "7. Learn", "Portfolio Signal": "Post-trade review and audit evidence close the loop."},
+        {"Step": "1. Read", "Portfolio Signal": "The app reads prices and checks the strategy rules."},
+        {"Step": "2. Suggest", "Portfolio Signal": "The agent explains a trade idea and a proposed order."},
+        {"Step": "3. Check", "Portfolio Signal": "Risk rules can block the trade."},
+        {"Step": "4. Review", "Portfolio Signal": "The operator reviews one exact paper order before sending."},
+        {"Step": "5. Send", "Portfolio Signal": "Only reviewed paper orders can reach Alpaca paper."},
+        {"Step": "6. Refresh", "Portfolio Signal": "The app refreshes Alpaca to see what happened."},
+        {"Step": "7. Learn", "Portfolio Signal": "Closed trades are reviewed so the system can improve."},
     ]

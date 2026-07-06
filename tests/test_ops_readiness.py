@@ -20,10 +20,10 @@ def test_market_data_freshness_records_accept_synthetic_data():
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert checks["Data Source Identified"]["Passed"]
-    assert checks["Enough Bars Loaded"]["Passed"]
-    assert checks["Latest Bar Present"]["Passed"]
-    assert "Synthetic data" in checks["Freshness Policy"]["Detail"]
+    assert checks["Price source found"]["Passed"]
+    assert checks["Enough price bars loaded"]["Passed"]
+    assert checks["Latest price bar found"]["Passed"]
+    assert "Synthetic data" in checks["Data note"]["Detail"]
 
 
 def test_strategy_state_snapshot_records_current_signal_and_gate_state():
@@ -37,10 +37,10 @@ def test_strategy_state_snapshot_records_current_signal_and_gate_state():
     values = {row["Field"]: row["Value"] for row in rows}
 
     assert values["Signal"] == "LONG"
-    assert values["Reference Price"] == "$150.25"
-    assert values["Proposed Symbol"] == "AAPL"
-    assert values["Risk Approved"]
-    assert values["Preflight Ready"]
+    assert values["Current price"] == "$150.25"
+    assert values["Symbol to trade"] == "AAPL"
+    assert values["Risk check passed"]
+    assert values["Ready to send"]
 
 
 def test_restart_recovery_records_require_configured_paths():
@@ -55,9 +55,9 @@ def test_restart_recovery_records_require_configured_paths():
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert not checks["Audit Log Path"]["Passed"]
-    assert checks["Broker State Path"]["Passed"]
-    assert checks["Automation Snapshots Recoverable"]["Detail"] == "3 snapshot(s) loaded."
+    assert not checks["Activity log file"]["Passed"]
+    assert checks["Alpaca order file"]["Passed"]
+    assert checks["Automation checks loaded"]["Detail"] == "3 saved check(s) loaded."
 
 
 def test_paper_account_health_records_surface_monitoring_breach():
@@ -67,14 +67,14 @@ def test_paper_account_health_records_surface_monitoring_breach():
         starting_cash=50_000,
         local_open_positions=1,
         tracked_alpaca_orders=[{"status": "accepted"}, {"status": "canceled"}],
-        monitoring_result=MonitoringResult("BREACH", ["Kill switch is enabled."], {}),
+        monitoring_result=MonitoringResult("BREACH", ["Stop trading switch is on."], {}),
         limits=RiskLimits(max_open_positions=5),
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert checks["Paper Cash Nonnegative"]["Passed"]
-    assert checks["Open Positions Within Limit"]["Passed"]
-    assert not checks["Monitoring Status"]["Passed"]
+    assert checks["Paper cash is not negative"]["Passed"]
+    assert checks["Open positions within limit"]["Passed"]
+    assert not checks["Account status"]["Passed"]
 
 
 def test_scheduler_preview_never_submits_broker_writes():
@@ -87,30 +87,31 @@ def test_scheduler_preview_never_submits_broker_writes():
     )
     values = {row["Field"]: row["Value"] for row in rows}
 
-    assert values["Scheduler Mode"] == "preview_only"
-    assert values["Would Evaluate Strategy"]
-    assert values["Would Queue Manual Review"]
-    assert values["Broker Writes Submitted"] == 0
+    assert values["Timer mode"] == "check only"
+    assert values["Would check strategy"]
+    assert values["Would ask for your review"]
+    assert values["Orders sent"] == 0
 
 
-def test_paper_automation_gate_blocks_without_dry_run_evidence():
+def test_paper_automation_gate_treats_dry_run_evidence_as_information():
     rows = paper_automation_gate_records(
         broker_connected=True,
         broker_state_stale=False,
-        market_data_rows=[{"Check": "Enough Bars Loaded", "Passed": True}],
-        account_health_rows=[{"Check": "Monitoring Status", "Passed": True}],
+        market_data_rows=[{"Check": "Enough price bars loaded", "Passed": True}],
+        account_health_rows=[{"Check": "Account status", "Passed": True}],
         restart_rows=[
-            {"Check": "Audit Log Path", "Passed": True},
-            {"Check": "Broker State Path", "Passed": True},
-            {"Check": "Automation Dry Run Path", "Passed": True},
-            {"Check": "Run Manifest Path", "Passed": True},
+            {"Check": "Activity log file", "Passed": True},
+            {"Check": "Alpaca order file", "Passed": True},
+            {"Check": "Automation check file", "Passed": True},
+            {"Check": "Run summary file", "Passed": True},
         ],
-        readiness_rows=[{"Check": "Kill Switch Off", "Passed": True}],
-        halt_rows=[{"Halt Reason": "None", "Active": False}],
+        readiness_rows=[{"Check": "Stop trading off", "Passed": True}],
+        halt_rows=[{"Block": "None", "Active": False}],
         dry_run_snapshots_loaded=0,
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert checks["Broker Connected"]["Passed"]
-    assert not checks["Ready For Paper Automation"]["Passed"]
-    assert "Record Paper Automation Dry Run" in checks["Ready For Paper Automation"]["Detail"]
+    assert checks["Alpaca connected"]["Passed"]
+    assert checks["Saved automation checks"]["Passed"]
+    assert checks["Saved automation checks"]["Detail"] == "0 saved check(s) loaded."
+    assert checks["Paper automation allowed"]["Passed"]

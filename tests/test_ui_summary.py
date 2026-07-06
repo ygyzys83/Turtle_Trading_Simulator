@@ -15,11 +15,11 @@ def test_compact_status_records_surface_daily_operator_state():
     )
     statuses = {row["Status"]: row for row in rows}
 
-    assert statuses["Execution Mode"]["Value"] == "Paper trading"
-    assert statuses["Risk Gate"]["State"] == "ok"
+    assert statuses["Mode"]["Value"] == "Paper trading"
+    assert statuses["Trade Check"]["State"] == "ok"
     assert statuses["Alpaca"]["State"] == "block"
-    assert statuses["Broker State"]["Value"] == "stale"
-    assert statuses["Live Writes"]["Value"] == "blocked"
+    assert statuses["Alpaca Data"]["Value"] == "needs refresh"
+    assert statuses["Live Orders"]["Value"] == "blocked"
 
 
 def test_agent_loop_stage_records_show_human_gate():
@@ -32,9 +32,9 @@ def test_agent_loop_stage_records_show_human_gate():
     )
     stages = {row["Stage"]: row for row in rows}
 
-    assert stages["Propose"]["Ready"]
-    assert stages["Human Gate"]["Ready"]
-    assert "Manual approval" in stages["Human Gate"]["Detail"]
+    assert stages["Find Trade"]["Ready"]
+    assert stages["Your Review"]["Ready"]
+    assert "review" in stages["Your Review"]["Detail"].lower()
 
 
 def test_portfolio_story_records_explain_agentic_loop():
@@ -42,5 +42,5 @@ def test_portfolio_story_records_explain_agentic_loop():
     text = " ".join(row["Portfolio Signal"] for row in rows)
 
     assert "agent" in text
-    assert "Human-in-the-loop" in text
-    assert "Post-trade review" in text
+    assert "operator reviews" in text
+    assert "Closed trades are reviewed" in text

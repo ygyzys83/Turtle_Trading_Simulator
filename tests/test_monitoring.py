@@ -25,12 +25,12 @@ def test_daily_risk_records_summarize_local_and_tracked_alpaca_state():
     )
     metrics = {row["Metric"]: row["Value"] for row in rows}
 
-    assert metrics["Local Filled Orders"] == 1
-    assert metrics["Tracked Alpaca Active/Filled Orders"] == 2
-    assert metrics["Local Filled Notional"] == 1200
-    assert metrics["Tracked Alpaca Quantity"] == "50"
-    assert metrics["Portfolio Exposure %"] == 20
-    assert metrics["Session Loss %"] == 0.5
+    assert metrics["Filled app paper orders"] == 1
+    assert metrics["Saved Alpaca active/filled orders"] == 2
+    assert metrics["Filled app order value"] == 1200
+    assert metrics["Saved Alpaca shares"] == "50"
+    assert metrics["Portfolio exposure %"] == 20
+    assert metrics["Session loss %"] == 0.5
 
 
 def test_broker_heartbeat_records_enforce_fresh_state_policy():
@@ -42,22 +42,22 @@ def test_broker_heartbeat_records_enforce_fresh_state_policy():
     )
     checks = {row["Check"]: row for row in rows}
 
-    assert checks["Alpaca Connected"]["Passed"]
-    assert not checks["Broker State Fresh"]["Passed"]
-    assert not checks["Market Session"]["Passed"]
-    assert "refreshed" in checks["Broker State Fresh"]["Policy"]
+    assert checks["Alpaca connected"]["Passed"]
+    assert not checks["Alpaca data current"]["Passed"]
+    assert not checks["Market open"]["Passed"]
+    assert "refreshed" in checks["Alpaca data current"]["Policy"]
 
 
 def test_risk_halt_records_surface_breaches_and_stale_state():
     rows = risk_halt_records(
-        monitoring_result=MonitoringResult("BREACH", ["Kill switch is enabled."], {}),
+        monitoring_result=MonitoringResult("BREACH", ["Stop trading switch is on."], {}),
         broker_connected=False,
         broker_state_stale=True,
-        automation_ready_rows=[{"Check": "Kill Switch Off", "Passed": False, "Detail": "Kill switch is active."}],
+        automation_ready_rows=[{"Check": "Stop trading off", "Passed": False, "Detail": "Stop trading is active."}],
     )
-    reasons = {row["Halt Reason"] for row in rows}
+    reasons = {row["Block"] for row in rows}
 
-    assert "Risk breach" in reasons
-    assert "Broker disconnected" in reasons
-    assert "Broker state stale" in reasons
-    assert "Kill Switch Off" in reasons
+    assert "Risk limit hit" in reasons
+    assert "Alpaca disconnected" in reasons
+    assert "Refresh Alpaca" in reasons
+    assert "Stop trading off" in reasons

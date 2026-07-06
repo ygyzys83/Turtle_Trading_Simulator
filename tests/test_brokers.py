@@ -139,7 +139,7 @@ def test_alpaca_adapter_blocks_submission_when_manual_gate_disabled():
     try:
         adapter.submit_order(intent, decision)
     except RuntimeError as exc:
-        assert "manual gate" in str(exc)
+        assert "turned off in the sidebar" in str(exc)
         return
     raise AssertionError("Expected Alpaca paper adapter to block order submission.")
 
@@ -227,8 +227,8 @@ def test_alpaca_tracked_order_records_include_lifecycle_fields():
     record = alpaca_tracked_order_records([tracked])[0]
 
     assert record["Order ID"] == "order-12"
-    assert record["Broker Order ID"] == "order-123456"
-    assert record["Preview Hash"] == "hash123"
+    assert record["Alpaca Order ID"] == "order-123456"
+    assert record["Review ID"] == "hash123"
     assert record["Status"] == "filled"
     assert record["Filled Qty"] == "40"
     assert record["Avg Fill"] == "212.34"
@@ -243,8 +243,8 @@ def test_alpaca_adapter_refreshes_tracked_order_by_id():
     record = adapter.tracked_order_record("order-123456", preview_hash="hash123")
 
     assert record["Order ID"] == "order-12"
-    assert record["Broker Order ID"] == "order-123456"
-    assert record["Preview Hash"] == "hash123"
+    assert record["Alpaca Order ID"] == "order-123456"
+    assert record["Review ID"] == "hash123"
     assert record["Status"] == "filled"
 
 
@@ -258,8 +258,8 @@ def test_alpaca_adapter_refreshes_tracked_order_records_by_id():
         {"broker_order_id": "order-123456", "preview_hash": "hash123"}
     ])
 
-    assert records[0]["Broker Order ID"] == "order-123456"
-    assert records[0]["Preview Hash"] == "hash123"
+    assert records[0]["Alpaca Order ID"] == "order-123456"
+    assert records[0]["Review ID"] == "hash123"
     assert records[0]["Status"] == "canceled"
 
 
@@ -284,7 +284,7 @@ def test_alpaca_order_records_request_all_statuses_when_supported():
     records = adapter.order_records()
 
     assert client.received_filter is request
-    assert records[0]["Broker Order ID"] == "abcdef123456"
+    assert records[0]["Alpaca Order ID"] == "abcdef123456"
 
 
 def test_alpaca_cancel_preview_blocks_closed_orders():
@@ -301,7 +301,7 @@ def test_alpaca_cancel_preview_blocks_closed_orders():
 
     assert not preview.valid
     assert "Only open Alpaca paper orders can be cancelled" in preview.blocked_reasons[0]
-    assert rows[-1]["Field"] == "Valid For Cancellation"
+    assert rows[-1]["Field"] == "Ready To Cancel"
 
 
 def test_alpaca_cancel_preview_blocks_live_mode():
@@ -509,11 +509,11 @@ def test_alpaca_config_validation_records_accept_paper_v2_config():
     )
     checks = {row["Check"]: row for row in records}
 
-    assert checks["Credentials Present"]["Passed"]
-    assert checks["Paper Mode Enabled"]["Passed"]
-    assert checks["Paper Endpoint"]["Passed"]
-    assert checks["Live Endpoint Blocked"]["Passed"]
-    assert checks["Default Endpoint Includes /v2"]["Passed"]
+    assert checks["API keys found"]["Passed"]
+    assert checks["Using paper account"]["Passed"]
+    assert checks["Paper account URL"]["Passed"]
+    assert checks["Live account URL blocked"]["Passed"]
+    assert checks["Alpaca URL includes /v2"]["Passed"]
 
 
 def test_alpaca_config_validation_records_reject_live_endpoint():
@@ -527,6 +527,6 @@ def test_alpaca_config_validation_records_reject_live_endpoint():
     )
     checks = {row["Check"]: row for row in records}
 
-    assert not checks["Paper Mode Enabled"]["Passed"]
-    assert not checks["Paper Endpoint"]["Passed"]
-    assert not checks["Live Endpoint Blocked"]["Passed"]
+    assert not checks["Using paper account"]["Passed"]
+    assert not checks["Paper account URL"]["Passed"]
+    assert not checks["Live account URL blocked"]["Passed"]

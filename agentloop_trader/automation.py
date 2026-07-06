@@ -86,7 +86,7 @@ def paper_automation_dry_run(
     deduped = list(dict.fromkeys(reasons))
     if deduped:
         return AutomationDecision(action="hold", ready=False, reasons=deduped)
-    return AutomationDecision(action="paper_order_candidate", ready=True, reasons=["Dry-run only; no order submitted."])
+    return AutomationDecision(action="paper_order_candidate", ready=True, reasons=["Check only; no order submitted."])
 
 
 def automation_decision_records(decision: AutomationDecision) -> list[dict]:
@@ -117,10 +117,10 @@ def paper_automation_candidate_records(
     )
     return [
         {
-            "Action": candidate.action,
+            "Action": _display_candidate_action(candidate.action),
             "Ready": candidate.ready,
-            "Dry Run Only": candidate.dry_run_only,
-            "Broker Write Required": candidate.broker_write_required,
+            "No Orders Sent": candidate.dry_run_only,
+            "Would Need Approval": candidate.broker_write_required,
             "Symbol": candidate.symbol,
             "Side": candidate.side,
             "Quantity": candidate.quantity,
@@ -154,7 +154,7 @@ def build_paper_automation_candidates(
         )
     ]
     for preview in exit_previews or []:
-        preview_hash = str(preview.get("Preview Hash", ""))
+        preview_hash = str(preview.get("Review ID", preview.get("Preview Hash", "")))
         blockers = (exit_blockers or {}).get(preview_hash, [])
         valid = bool(preview.get("Valid", False))
         ready = valid and not blockers
@@ -169,7 +169,7 @@ def build_paper_automation_candidates(
                 side=str(preview.get("Side", "")),
                 quantity=str(preview.get("Quantity", "")),
                 source="alpaca_position_exit_preview",
-                reasons=(["Dry-run only; no exit order submitted."] if ready else list(dict.fromkeys(blockers or [hold_reason])))
+                reasons=(["Check only; no exit order submitted."] if ready else list(dict.fromkeys(blockers or [hold_reason])))
             )
         )
     for order in cancelable_orders or []:
@@ -183,7 +183,7 @@ def build_paper_automation_candidates(
                 side=str(order.get("Side", "")),
                 quantity=str(order.get("Quantity", "")),
                 source="alpaca_open_order_cancel_preview",
-                reasons=["Dry-run only; no cancel request submitted."],
+                reasons=["Check only; no cancel request submitted."],
             )
         )
     return candidates
@@ -197,14 +197,14 @@ def automation_readiness_records(
     candidates: list[dict],
 ) -> list[dict]:
     ready_candidates = sum(bool(row.get("Ready")) for row in candidates)
-    broker_write_candidates = sum(bool(row.get("Broker Write Required")) for row in candidates)
+    broker_write_candidates = sum(bool(row.get("Would Need Approval", row.get("Broker Write Required"))) for row in candidates)
     return [
-        {"Check": "Dry Run Only", "Passed": True, "Detail": "Automation queue never submits broker orders."},
-        {"Check": "Alpaca Connected", "Passed": broker_connected, "Detail": "Broker reads are available." if broker_connected else "Alpaca account is not connected."},
-        {"Check": "Broker State Fresh", "Passed": not broker_state_stale, "Detail": "Positions/orders refreshed." if not broker_state_stale else "Refresh broker state before automation."},
-        {"Check": "Manual Order Gate", "Passed": manual_order_gate_enabled, "Detail": "Manual gate is enabled." if manual_order_gate_enabled else "Manual gate is off; broker writes remain disabled."},
-        {"Check": "Kill Switch Off", "Passed": not kill_switch_enabled, "Detail": "Session kill switch is off." if not kill_switch_enabled else "Kill switch is active."},
-        {"Check": "Ready Candidates", "Passed": ready_candidates > 0, "Detail": f"{ready_candidates} ready candidate(s); {broker_write_candidates} would require broker write approval."},
+        {"Check": "No orders sent", "Passed": True, "Detail": "Automation check never submits broker orders."},
+        {"Check": "Alpaca connected", "Passed": broker_connected, "Detail": "Alpaca is connected." if broker_connected else "Alpaca account is not connected."},
+        {"Check": "Alpaca data current", "Passed": not broker_state_stale, "Detail": "Positions and orders are refreshed." if not broker_state_stale else "Refresh Alpaca before automation checks."},
+        {"Check": "Paper orders allowed", "Passed": manual_order_gate_enabled, "Detail": "Paper orders are allowed." if manual_order_gate_enabled else "Paper orders are not allowed right now."},
+        {"Check": "Stop trading off", "Passed": not kill_switch_enabled, "Detail": "Stop trading is off." if not kill_switch_enabled else "Stop trading is on."},
+        {"Check": "Actions to review", "Passed": ready_candidates > 0, "Detail": f"{ready_candidates} action(s) ready for review; {broker_write_candidates} would need your approval."},
     ]
 
 
@@ -223,8 +223,8 @@ def automation_snapshot_record(snapshot: AutomationDryRunSnapshot) -> dict:
         "session_id": snapshot.session_id,
         "candidate_count": len(snapshot.candidates),
         "ready_candidate_count": sum(bool(row.get("Ready")) for row in snapshot.candidates),
-        "broker_write_candidate_count": sum(bool(row.get("Broker Write Required")) for row in snapshot.candidates),
-        "hold_count": sum(str(row.get("Action", "")).endswith("_hold") for row in snapshot.candidates),
+        "broker_write_candidate_count": sum(bool(row.get("Would Need Approval", row.get("Broker Write Required"))) for row in snapshot.candidates),
+        "hold_count": sum(_is_blocked_action(str(row.get("Action", ""))) for row in snapshot.candidates),
         "candidates": snapshot.candidates,
         "readiness": snapshot.readiness,
     }
@@ -248,16 +248,16 @@ def automation_evidence_records(snapshot_records: list[dict]) -> list[dict]:
                     if reason:
                         reason_counts[reason] = reason_counts.get(reason, 0) + 1
     rows = [
-        {"Metric": "Dry Run Snapshots", "Value": len(snapshot_records)},
-        {"Metric": "Dry Run Candidates", "Value": candidate_count},
-        {"Metric": "Ready Candidates", "Value": ready_count},
-        {"Metric": "Broker Write Candidates", "Value": write_count},
-        {"Metric": "Hold Candidates", "Value": hold_count},
+        {"Metric": "Saved checks", "Value": len(snapshot_records)},
+        {"Metric": "Actions checked", "Value": candidate_count},
+        {"Metric": "Actions ready for review", "Value": ready_count},
+        {"Metric": "Actions that would need approval", "Value": write_count},
+        {"Metric": "Actions blocked", "Value": hold_count},
     ]
     for action, count in sorted(action_counts.items()):
-        rows.append({"Metric": f"Action: {action}", "Value": count})
+        rows.append({"Metric": f"Action type: {action}", "Value": count})
     for reason, count in sorted(reason_counts.items(), key=lambda item: (-item[1], item[0]))[:8]:
-        rows.append({"Metric": f"Hold Reason: {reason}", "Value": count})
+        rows.append({"Metric": f"Blocked reason: {reason}", "Value": count})
     return rows
 
 
@@ -270,23 +270,23 @@ def automation_supervisor_dry_run_records(
     active_halts = [row for row in halt_rows if row.get("Active")]
     readiness_blockers = [row for row in readiness_rows if not row.get("Passed")]
     if active_halts:
-        decision = "halt"
+        decision = "blocked"
         detail = "; ".join(row.get("Detail", "") for row in active_halts if row.get("Detail"))
     elif readiness_blockers:
-        decision = "hold"
+        decision = "blocked"
         detail = "; ".join(row.get("Detail", "") for row in readiness_blockers if row.get("Detail"))
     elif ready_candidates:
-        decision = "would_queue_manual_review"
-        detail = f"{len(ready_candidates)} candidate(s) would be queued for manual approval."
+        decision = "ask for review"
+        detail = f"{len(ready_candidates)} action(s) would be shown for your review."
     else:
-        decision = "hold"
-        detail = "No ready automation candidates."
+        decision = "blocked"
+        detail = "No automation actions are ready."
     return [
-        {"Field": "Supervisor Mode", "Value": "dry_run_only"},
+        {"Field": "Mode", "Value": "check only"},
         {"Field": "Decision", "Value": decision},
-        {"Field": "Ready Candidates", "Value": len(ready_candidates)},
-        {"Field": "Active Halt Reasons", "Value": len(active_halts)},
-        {"Field": "Broker Writes Submitted", "Value": 0},
+        {"Field": "Actions ready for review", "Value": len(ready_candidates)},
+        {"Field": "Active blocks", "Value": len(active_halts)},
+        {"Field": "Orders sent", "Value": 0},
         {"Field": "Detail", "Value": detail},
     ]
 
@@ -301,25 +301,39 @@ def evidence_dashboard_records(audit_records: list[dict], tracked_orders: list[d
         if _enum_value(order.get("status", "")) == "filled"
     )
     return [
-        {"Metric": "Audit Events Loaded", "Value": len(audit_records)},
-        {"Metric": "Alpaca Paper Orders Submitted", "Value": event_types.count("alpaca_paper_order_submitted")},
-        {"Metric": "Alpaca Paper Orders Armed", "Value": event_types.count("alpaca_paper_order_armed")},
-        {"Metric": "Alpaca Paper Orders Blocked", "Value": event_types.count("alpaca_paper_order_blocked")},
-        {"Metric": "Alpaca Paper Cancels Submitted", "Value": event_types.count("alpaca_paper_cancel_submitted")},
-        {"Metric": "Alpaca Paper Cancels Armed", "Value": event_types.count("alpaca_paper_cancel_armed")},
-        {"Metric": "Alpaca Paper Cancels Blocked", "Value": event_types.count("alpaca_paper_cancel_blocked")},
-        {"Metric": "Alpaca Paper Exits Submitted", "Value": event_types.count("alpaca_paper_exit_submitted")},
-        {"Metric": "Alpaca Paper Exits Armed", "Value": event_types.count("alpaca_paper_exit_armed")},
-        {"Metric": "Alpaca Paper Exits Blocked", "Value": event_types.count("alpaca_paper_exit_blocked")},
-        {"Metric": "Tracked Alpaca Orders", "Value": len(tracked_orders)},
-        {"Metric": "Tracked Alpaca Open Orders", "Value": lifecycle_statuses.count("open_at_alpaca")},
-        {"Metric": "Tracked Alpaca Filled Orders", "Value": tracked_statuses.count("filled")},
-        {"Metric": "Tracked Alpaca Filled Quantity", "Value": _format_number(filled_quantity)},
-        {"Metric": "Tracked Alpaca Canceled Orders", "Value": tracked_statuses.count("canceled") + tracked_statuses.count("cancelled")},
-        {"Metric": "Tracked Alpaca Missing Orders", "Value": lifecycle_statuses.count("missing_from_alpaca_orders")},
-        {"Metric": "Shadow Decisions", "Value": event_types.count("shadow_decision_recorded")},
-        {"Metric": "Local Paper Orders", "Value": len([event for event in event_types if event.startswith("paper_order_")])},
+        {"Metric": "Activity records loaded", "Value": len(audit_records)},
+        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted")},
+        {"Metric": "Paper buys reviewed", "Value": event_types.count("alpaca_paper_order_armed")},
+        {"Metric": "Paper buys blocked", "Value": event_types.count("alpaca_paper_order_blocked")},
+        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
+        {"Metric": "Paper cancels reviewed", "Value": event_types.count("alpaca_paper_cancel_armed")},
+        {"Metric": "Paper cancels blocked", "Value": event_types.count("alpaca_paper_cancel_blocked")},
+        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted")},
+        {"Metric": "Paper exits reviewed", "Value": event_types.count("alpaca_paper_exit_armed")},
+        {"Metric": "Paper exits blocked", "Value": event_types.count("alpaca_paper_exit_blocked")},
+        {"Metric": "Saved Alpaca orders", "Value": len(tracked_orders)},
+        {"Metric": "Open Alpaca orders", "Value": lifecycle_statuses.count("open_at_alpaca")},
+        {"Metric": "Filled Alpaca orders", "Value": tracked_statuses.count("filled")},
+        {"Metric": "Filled Alpaca shares", "Value": _format_number(filled_quantity)},
+        {"Metric": "Canceled Alpaca orders", "Value": tracked_statuses.count("canceled") + tracked_statuses.count("cancelled")},
+        {"Metric": "Saved orders missing at Alpaca", "Value": lifecycle_statuses.count("missing_from_alpaca_orders")},
+        {"Metric": "Practice decisions", "Value": event_types.count("shadow_decision_recorded")},
+        {"Metric": "App paper orders", "Value": len([event for event in event_types if event.startswith("paper_order_")])},
     ]
+
+
+def _display_candidate_action(action: str) -> str:
+    return {
+        "entry_candidate": "Buy ready for review",
+        "entry_hold": "Buy blocked",
+        "exit_candidate": "Exit ready for review",
+        "exit_hold": "Exit blocked",
+        "cancel_candidate": "Cancel ready for review",
+    }.get(action, action)
+
+
+def _is_blocked_action(action: str) -> bool:
+    return action.endswith("_hold") or "blocked" in action.lower()
 
 
 def _enum_value(value) -> str:

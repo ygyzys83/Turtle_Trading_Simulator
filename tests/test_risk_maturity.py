@@ -97,11 +97,10 @@ def test_preflight_reports_blocked_when_execution_mode_blocks_order():
     )
 
     assert not preflight.ready
-    assert any("Backtest-only" in reason for reason in preflight.blocked_reasons)
+    assert any("Backtest only" in reason for reason in preflight.blocked_reasons)
 
 
 def test_risk_policy_records_name_alpaca_target():
     records = risk_policy_records(RiskLimits(allowed_symbols=("AAPL",)))
 
     assert any(row["Policy"] == "Broker target" and "Alpaca" in row["Value"] for row in records)
-

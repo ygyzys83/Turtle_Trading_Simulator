@@ -130,18 +130,18 @@ def evaluate_walk_forward(
 def _walk_forward_verdict(train_stats: dict, oos_stats: dict) -> tuple[str, list[str]]:
     reasons = []
     if oos_stats["total_trades"] == 0:
-        reasons.append("No out-of-sample trades were generated.")
+        reasons.append("No trades happened in the newer test data.")
     if oos_stats["return_pct"] < 0:
-        reasons.append("Out-of-sample return is negative.")
+        reasons.append("The newer test data lost money.")
     if train_stats["total_trades"] > 0 and oos_stats["total_trades"] > 0:
         if oos_stats["profit_factor"] and train_stats["profit_factor"]:
             if oos_stats["profit_factor"] < train_stats["profit_factor"] * 0.5:
-                reasons.append("Out-of-sample profit factor is materially weaker than training.")
+                reasons.append("The newer test data made much less per dollar lost than the older data.")
     if oos_stats["max_drawdown_pct"] > max(5.0, train_stats["max_drawdown_pct"] * 1.5):
-        reasons.append("Out-of-sample drawdown is elevated versus training.")
+        reasons.append("The newer test data had a larger account drop than the older data.")
 
     if not reasons:
-        return "Pass", ["Out-of-sample behavior is broadly consistent with the training segment."]
+        return "Pass", ["The newer test data looks broadly similar to the older data."]
     if oos_stats["total_trades"] == 0:
         return "Inconclusive", reasons
     return "Needs review", reasons
@@ -149,13 +149,12 @@ def _walk_forward_verdict(train_stats: dict, oos_stats: dict) -> tuple[str, list
 
 def walk_forward_records(result: WalkForwardResult) -> list[dict]:
     return [
-        {"Metric": "Verdict", "Training": "", "Out-of-sample": result.verdict},
-        {"Metric": "Bars", "Training": result.train_bars, "Out-of-sample": result.oos_bars},
-        {"Metric": "Trades", "Training": result.train_stats["total_trades"], "Out-of-sample": result.oos_stats["total_trades"]},
-        {"Metric": "Return %", "Training": result.train_stats["return_pct"], "Out-of-sample": result.oos_stats["return_pct"]},
-        {"Metric": "Win rate %", "Training": result.train_stats["win_rate"], "Out-of-sample": result.oos_stats["win_rate"]},
-        {"Metric": "Profit factor", "Training": result.train_stats["profit_factor"], "Out-of-sample": result.oos_stats["profit_factor"]},
-        {"Metric": "Max drawdown %", "Training": result.train_stats["max_drawdown_pct"], "Out-of-sample": result.oos_stats["max_drawdown_pct"]},
-        {"Metric": "Exposure %", "Training": result.train_stats["exposure_pct"], "Out-of-sample": result.oos_stats["exposure_pct"]},
+        {"Metric": "Result", "Older Data": "", "Newer Data": result.verdict},
+        {"Metric": "Bars", "Older Data": result.train_bars, "Newer Data": result.oos_bars},
+        {"Metric": "Trades", "Older Data": result.train_stats["total_trades"], "Newer Data": result.oos_stats["total_trades"]},
+        {"Metric": "Return %", "Older Data": result.train_stats["return_pct"], "Newer Data": result.oos_stats["return_pct"]},
+        {"Metric": "Win rate %", "Older Data": result.train_stats["win_rate"], "Newer Data": result.oos_stats["win_rate"]},
+        {"Metric": "Profit factor", "Older Data": result.train_stats["profit_factor"], "Newer Data": result.oos_stats["profit_factor"]},
+        {"Metric": "Worst drop %", "Older Data": result.train_stats["max_drawdown_pct"], "Newer Data": result.oos_stats["max_drawdown_pct"]},
+        {"Metric": "Time in trade %", "Older Data": result.train_stats["exposure_pct"], "Newer Data": result.oos_stats["exposure_pct"]},
     ]
-

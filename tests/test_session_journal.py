@@ -70,20 +70,20 @@ def test_session_summary_records_count_local_and_alpaca_activity():
     metrics = {row["Metric"]: row["Value"] for row in session_summary_records(_snapshot())}
 
     assert metrics["Session ID"] == "paper-test"
-    assert metrics["Local Filled Orders"] == 1
-    assert metrics["Tracked Alpaca Filled Orders"] == 1
-    assert metrics["Tracked Alpaca Canceled Orders"] == 1
-    assert metrics["Alpaca Submit Events"] == 1
-    assert metrics["Alpaca Cancel Events"] == 1
-    assert metrics["Alpaca Exit Events"] == 1
+    assert metrics["Filled app paper orders"] == 1
+    assert metrics["Filled Alpaca orders"] == 1
+    assert metrics["Canceled Alpaca orders"] == 1
+    assert metrics["Paper buys sent"] == 1
+    assert metrics["Paper cancels sent"] == 1
+    assert metrics["Paper exits sent"] == 1
 
 
 def test_session_timeline_records_extract_key_payload_fields():
     rows = session_timeline_records(_snapshot().audit_records)
 
-    assert rows[0]["Event Type"] == "alpaca_paper_order_submitted"
+    assert rows[0]["Record Type"] == "alpaca_paper_order_submitted"
     assert rows[0]["Symbol"] == "AAPL"
-    assert rows[0]["Preview Hash"] == "abc"
+    assert rows[0]["Review ID"] == "abc"
     assert rows[1]["Status"] == "canceled"
 
 
@@ -92,6 +92,6 @@ def test_paper_performance_records_report_local_and_alpaca_metrics():
 
     assert metrics["Paper Cash"] == "$49,000.00"
     assert metrics["Session P&L"] == "$500.00"
-    assert metrics["Local Filled Notional"] == "$1,000.00"
-    assert metrics["Tracked Alpaca Filled Quantity"] == "40"
-    assert metrics["Tracked Alpaca Open Orders"] == 1
+    assert metrics["Filled app order value"] == "$1,000.00"
+    assert metrics["Filled Alpaca shares"] == "40"
+    assert metrics["Open Alpaca orders"] == 1

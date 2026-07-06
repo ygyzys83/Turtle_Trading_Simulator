@@ -33,7 +33,7 @@ def monitor_paper_session(
     status = "OK"
     if limits.kill_switch_enabled:
         status = "BREACH"
-        alerts.append("Kill switch is enabled.")
+        alerts.append("Stop trading switch is on.")
     if session_loss_pct > limits.max_session_loss_pct:
         status = "BREACH"
         alerts.append(
@@ -95,18 +95,18 @@ def daily_risk_records(
     session_loss_pct = abs(session_pnl) / account_equity * 100 if account_equity and session_pnl < 0 else 0.0
     exposure_pct = portfolio_exposure / account_equity * 100 if account_equity else 0.0
     return [
-        {"Metric": "Local Filled Orders", "Value": len(local_filled)},
-        {"Metric": "Tracked Alpaca Active/Filled Orders", "Value": len(alpaca_submitted)},
-        {"Metric": "Local Filled Notional", "Value": round(local_notional, 2)},
-        {"Metric": "Tracked Alpaca Quantity", "Value": _format_number(alpaca_quantity)},
-        {"Metric": "Portfolio Exposure", "Value": round(portfolio_exposure, 2)},
-        {"Metric": "Portfolio Exposure %", "Value": round(exposure_pct, 2)},
-        {"Metric": "Max Portfolio Exposure %", "Value": limits.max_portfolio_exposure_pct},
+        {"Metric": "Filled app paper orders", "Value": len(local_filled)},
+        {"Metric": "Saved Alpaca active/filled orders", "Value": len(alpaca_submitted)},
+        {"Metric": "Filled app order value", "Value": round(local_notional, 2)},
+        {"Metric": "Saved Alpaca shares", "Value": _format_number(alpaca_quantity)},
+        {"Metric": "Portfolio exposure", "Value": round(portfolio_exposure, 2)},
+        {"Metric": "Portfolio exposure %", "Value": round(exposure_pct, 2)},
+        {"Metric": "Max portfolio exposure %", "Value": limits.max_portfolio_exposure_pct},
         {"Metric": "Session P&L", "Value": round(session_pnl, 2)},
-        {"Metric": "Session Loss %", "Value": round(session_loss_pct, 2)},
-        {"Metric": "Max Session Loss %", "Value": limits.max_session_loss_pct},
-        {"Metric": "Kill Switch Enabled", "Value": limits.kill_switch_enabled},
-        {"Metric": "Open Position Limit", "Value": limits.max_open_positions},
+        {"Metric": "Session loss %", "Value": round(session_loss_pct, 2)},
+        {"Metric": "Max session loss %", "Value": limits.max_session_loss_pct},
+        {"Metric": "Stop trading switch on", "Value": limits.kill_switch_enabled},
+        {"Metric": "Max open positions", "Value": limits.max_open_positions},
     ]
 
 
@@ -118,21 +118,21 @@ def broker_heartbeat_records(
 ) -> list[dict]:
     return [
         {
-            "Check": "Alpaca Connected",
+            "Check": "Alpaca connected",
             "Passed": broker_connected,
-            "Policy": "Broker reads must be connected before paper broker writes are enabled.",
+            "Policy": "Alpaca must be connected before paper orders can be sent.",
             "Detail": "Connected." if broker_connected else "Alpaca account is disconnected.",
         },
         {
-            "Check": "Broker State Fresh",
+            "Check": "Alpaca data current",
             "Passed": not broker_state_stale,
-            "Policy": "Positions and orders must be refreshed before order, cancel, exit, or automation decisions.",
+            "Policy": "Positions and orders must be refreshed before buy, cancel, exit, or automation checks.",
             "Detail": "; ".join(broker_reasons) if broker_reasons else "Positions and orders are available.",
         },
         {
-            "Check": "Market Session",
+            "Check": "Market open",
             "Passed": bool(market_advisory.get("Open", False)),
-            "Policy": "Closed-market submissions may be accepted but not fill until the next session.",
+            "Policy": "Closed-market paper orders may be accepted but may not fill until the market opens.",
             "Detail": market_advisory.get("Message", ""),
         },
     ]
@@ -147,16 +147,16 @@ def risk_halt_records(
     rows = []
     if monitoring_result.status == "BREACH":
         for alert in monitoring_result.alerts:
-            rows.append({"Halt Reason": "Risk breach", "Active": True, "Detail": alert})
+            rows.append({"Block": "Risk limit hit", "Active": True, "Detail": alert})
     if not broker_connected:
-        rows.append({"Halt Reason": "Broker disconnected", "Active": True, "Detail": "Alpaca account reads are unavailable."})
+        rows.append({"Block": "Alpaca disconnected", "Active": True, "Detail": "Alpaca account data is unavailable."})
     if broker_state_stale:
-        rows.append({"Halt Reason": "Broker state stale", "Active": True, "Detail": "Refresh Alpaca positions and orders."})
+        rows.append({"Block": "Refresh Alpaca", "Active": True, "Detail": "Refresh Alpaca positions and orders."})
     for row in automation_ready_rows:
-        if row.get("Check") in {"Broker State Fresh", "Kill Switch Off"} and not row.get("Passed"):
-            rows.append({"Halt Reason": row.get("Check", ""), "Active": True, "Detail": row.get("Detail", "")})
+        if row.get("Check") in {"Alpaca data current", "Kill Switch Off", "Stop trading off"} and not row.get("Passed"):
+            rows.append({"Block": row.get("Check", ""), "Active": True, "Detail": row.get("Detail", "")})
     if not rows:
-        rows.append({"Halt Reason": "None", "Active": False, "Detail": "No halt reasons are active."})
+        rows.append({"Block": "None", "Active": False, "Detail": "No active blocks."})
     return rows
 
 

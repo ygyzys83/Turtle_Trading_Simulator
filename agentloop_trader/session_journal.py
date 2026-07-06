@@ -32,18 +32,18 @@ def session_summary_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     alpaca_statuses = [_enum_value(order.get("status", "")) for order in snapshot.tracked_alpaca_orders]
     return [
         {"Metric": "Session ID", "Value": snapshot.session_id},
-        {"Metric": "Started At", "Value": snapshot.started_at},
+        {"Metric": "Started", "Value": snapshot.started_at},
         {"Metric": "Mode", "Value": snapshot.mode},
-        {"Metric": "Audit Events", "Value": len(snapshot.audit_records)},
-        {"Metric": "Local Paper Orders", "Value": len(snapshot.local_orders)},
-        {"Metric": "Local Filled Orders", "Value": len(local_filled)},
-        {"Metric": "Local Open Positions", "Value": len(snapshot.local_positions)},
-        {"Metric": "Tracked Alpaca Orders", "Value": len(snapshot.tracked_alpaca_orders)},
-        {"Metric": "Tracked Alpaca Filled Orders", "Value": alpaca_statuses.count("filled")},
-        {"Metric": "Tracked Alpaca Canceled Orders", "Value": alpaca_statuses.count("canceled") + alpaca_statuses.count("cancelled")},
-        {"Metric": "Alpaca Submit Events", "Value": event_types.count("alpaca_paper_order_submitted")},
-        {"Metric": "Alpaca Cancel Events", "Value": event_types.count("alpaca_paper_cancel_submitted")},
-        {"Metric": "Alpaca Exit Events", "Value": event_types.count("alpaca_paper_exit_submitted")},
+        {"Metric": "Activity records", "Value": len(snapshot.audit_records)},
+        {"Metric": "App paper orders", "Value": len(snapshot.local_orders)},
+        {"Metric": "Filled app paper orders", "Value": len(local_filled)},
+        {"Metric": "Open app paper positions", "Value": len(snapshot.local_positions)},
+        {"Metric": "Saved Alpaca orders", "Value": len(snapshot.tracked_alpaca_orders)},
+        {"Metric": "Filled Alpaca orders", "Value": alpaca_statuses.count("filled")},
+        {"Metric": "Canceled Alpaca orders", "Value": alpaca_statuses.count("canceled") + alpaca_statuses.count("cancelled")},
+        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted")},
+        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
+        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted")},
     ]
 
 
@@ -53,13 +53,13 @@ def session_timeline_records(audit_records: list[dict], limit: int = 100) -> lis
         payload = record.get("payload", {}) if isinstance(record.get("payload", {}), dict) else {}
         rows.append(
             {
-                "Created At": record.get("created_at", ""),
-                "Event Type": record.get("event_type", ""),
+                "Time": record.get("created_at", ""),
+                "Record Type": record.get("event_type", ""),
                 "Symbol": payload.get("symbol", payload.get("Symbol", "")),
                 "Side": payload.get("side", payload.get("Side", "")),
                 "Quantity": payload.get("quantity", payload.get("Quantity", "")),
                 "Status": payload.get("status", payload.get("cancel_status", "")),
-                "Preview Hash": payload.get("preview_hash", payload.get("cancel_preview_hash", "")),
+                "Review ID": payload.get("preview_hash", payload.get("cancel_preview_hash", "")),
                 "Message": record.get("message", ""),
             }
         )
@@ -80,12 +80,12 @@ def paper_performance_records(snapshot: PaperSessionSnapshot) -> list[dict]:
         {"Metric": "Paper Cash", "Value": _money(snapshot.paper_cash)},
         {"Metric": "Paper Equity", "Value": _money(snapshot.paper_equity)},
         {"Metric": "Session P&L", "Value": _money(snapshot.session_pnl)},
-        {"Metric": "Local Filled Notional", "Value": _money(local_notional)},
-        {"Metric": "Local Open Position Notional", "Value": _money(open_local_notional)},
-        {"Metric": "Tracked Alpaca Filled Quantity", "Value": _format_number(alpaca_filled_qty)},
-        {"Metric": "Tracked Alpaca Filled Orders", "Value": len(alpaca_filled)},
-        {"Metric": "Tracked Alpaca Canceled Orders", "Value": len(alpaca_canceled)},
-        {"Metric": "Tracked Alpaca Open Orders", "Value": sum(_enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"} for order in snapshot.tracked_alpaca_orders)},
+        {"Metric": "Filled app order value", "Value": _money(local_notional)},
+        {"Metric": "Open app position value", "Value": _money(open_local_notional)},
+        {"Metric": "Filled Alpaca shares", "Value": _format_number(alpaca_filled_qty)},
+        {"Metric": "Filled Alpaca orders", "Value": len(alpaca_filled)},
+        {"Metric": "Canceled Alpaca orders", "Value": len(alpaca_canceled)},
+        {"Metric": "Open Alpaca orders", "Value": sum(_enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"} for order in snapshot.tracked_alpaca_orders)},
     ]
 
 

@@ -12,14 +12,14 @@ DEFAULT_EVIDENCE_EXPORT_PATH = Path("audit_logs") / "latest_evidence_package.jso
 
 def approval_ledger_records(audit_records: list[dict]) -> list[dict]:
     action_names = {
-        "alpaca_paper_order_armed": "order armed",
-        "alpaca_paper_order_submitted": "order submitted",
+        "alpaca_paper_order_armed": "buy reviewed",
+        "alpaca_paper_order_submitted": "buy sent",
         "alpaca_paper_order_blocked": "order blocked",
-        "alpaca_paper_cancel_armed": "cancel armed",
-        "alpaca_paper_cancel_submitted": "cancel submitted",
+        "alpaca_paper_cancel_armed": "cancel reviewed",
+        "alpaca_paper_cancel_submitted": "cancel sent",
         "alpaca_paper_cancel_blocked": "cancel blocked",
-        "alpaca_paper_exit_armed": "exit armed",
-        "alpaca_paper_exit_submitted": "exit submitted",
+        "alpaca_paper_exit_armed": "exit reviewed",
+        "alpaca_paper_exit_submitted": "exit sent",
         "alpaca_paper_exit_blocked": "exit blocked",
     }
     rows = []
@@ -36,10 +36,10 @@ def approval_ledger_records(audit_records: list[dict]) -> list[dict]:
                 "Symbol": payload.get("symbol", ""),
                 "Side": payload.get("side", ""),
                 "Quantity": payload.get("quantity", ""),
-                "Preview Hash": preview_hash,
-                "Broker Order ID": payload.get("broker_order_id", ""),
-                "Manual Gate Required": _manual_gate_required(event_type),
-                "Broker Write": event_type.endswith("_submitted"),
+                "Review ID": preview_hash,
+                "Alpaca Order ID": payload.get("broker_order_id", ""),
+                "Needs Review": _manual_gate_required(event_type),
+                "Sent To Alpaca": event_type.endswith("_submitted"),
             }
         )
     return rows
@@ -47,12 +47,12 @@ def approval_ledger_records(audit_records: list[dict]) -> list[dict]:
 
 def approval_ledger_summary_records(ledger_rows: list[dict]) -> list[dict]:
     return [
-        {"Metric": "Approval Ledger Rows", "Value": len(ledger_rows)},
-        {"Metric": "Armed Actions", "Value": sum("armed" in row.get("Action", "") for row in ledger_rows)},
-        {"Metric": "Submitted Actions", "Value": sum(bool(row.get("Broker Write")) for row in ledger_rows)},
+        {"Metric": "Review rows", "Value": len(ledger_rows)},
+        {"Metric": "Reviewed actions", "Value": sum("reviewed" in row.get("Action", "") for row in ledger_rows)},
+        {"Metric": "Actions sent to Alpaca", "Value": sum(bool(row.get("Sent To Alpaca")) for row in ledger_rows)},
         {
-            "Metric": "Rows With Preview Hash",
-            "Value": sum(bool(row.get("Preview Hash")) for row in ledger_rows),
+            "Metric": "Rows with review ID",
+            "Value": sum(bool(row.get("Review ID")) for row in ledger_rows),
         },
     ]
 
@@ -89,13 +89,13 @@ def write_evidence_package(package: dict, path: str | Path | None = None) -> Pat
 
 def evidence_package_records(package: dict) -> list[dict]:
     return [
-        {"Field": "Exported At", "Value": package.get("exported_at", "")},
+        {"Field": "Exported at", "Value": package.get("exported_at", "")},
         {"Field": "Session", "Value": package.get("session_id", "")},
-        {"Field": "Audit Records", "Value": len(package.get("audit_records", []))},
-        {"Field": "Approval Ledger Rows", "Value": len(package.get("approval_ledger", []))},
-        {"Field": "Tracked Alpaca Orders", "Value": len(package.get("tracked_alpaca_orders", []))},
-        {"Field": "Automation Snapshots", "Value": len(package.get("automation_snapshots", []))},
-        {"Field": "Risk Halt Rows", "Value": len(package.get("risk_halts", []))},
+        {"Field": "Activity records", "Value": len(package.get("audit_records", []))},
+        {"Field": "Review rows", "Value": len(package.get("approval_ledger", []))},
+        {"Field": "Saved Alpaca orders", "Value": len(package.get("tracked_alpaca_orders", []))},
+        {"Field": "Saved automation checks", "Value": len(package.get("automation_snapshots", []))},
+        {"Field": "Blocked-action rows", "Value": len(package.get("risk_halts", []))},
     ]
 
 

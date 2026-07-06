@@ -152,10 +152,10 @@ def candidate_records(candidates: list[ParameterCandidate]) -> list[dict]:
             "Exit": config.exit_window,
             "ATR": config.atr_stop_multiplier,
             "SMA": config.moving_average_window,
-            "OOS Return %": "" if evaluation is None else evaluation.oos_stats["return_pct"],
-            "OOS Trades": "" if evaluation is None else evaluation.oos_stats["total_trades"],
-            "OOS PF": "" if evaluation is None else evaluation.oos_stats["profit_factor"],
-            "OOS DD %": "" if evaluation is None else evaluation.oos_stats["max_drawdown_pct"],
+            "Newer Data Return %": "" if evaluation is None else evaluation.oos_stats["return_pct"],
+            "Newer Data Trades": "" if evaluation is None else evaluation.oos_stats["total_trades"],
+            "Profit Factor": "" if evaluation is None else evaluation.oos_stats["profit_factor"],
+            "Worst Drop %": "" if evaluation is None else evaluation.oos_stats["max_drawdown_pct"],
             "Reason": candidate.reason,
         })
     return records
@@ -163,16 +163,15 @@ def candidate_records(candidates: list[ParameterCandidate]) -> list[dict]:
 
 def recommendation_summary(candidate: ParameterCandidate | None) -> str:
     if candidate is None:
-        return "No bounded parameter candidate passed the evaluation gates."
+        return "No nearby setting looked good enough to suggest."
     c = candidate.config
     return (
-        f"Recommended bounded parameters: entry {c.entry_window}, exit {c.exit_window}, "
+        f"Try these settings next: entry {c.entry_window}, exit {c.exit_window}, "
         f"ATR {c.atr_stop_multiplier}, SMA {c.moving_average_window}. "
-        "This recommendation changes only strategy parameters, not risk limits or execution code."
+        "This changes strategy settings only, not risk limits or order code."
     )
 
 
 def _nearby(current_value, allowed_values):
     values = sorted(allowed_values, key=lambda value: (abs(value - current_value), value))
     return values[:3]
-

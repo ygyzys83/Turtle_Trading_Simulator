@@ -45,14 +45,14 @@ def shadow_records(decisions: list[ShadowDecision]) -> list[dict]:
     return [
         {
             "Time": decision.created_at.astimezone(PACIFIC_TIME).strftime("%Y-%m-%d %H:%M:%S %Z"),
-            "Shadow ID": decision.shadow_id[:8],
+            "Practice ID": decision.shadow_id[:8],
             "Symbol": decision.symbol,
             "Action": decision.intended_action.upper(),
             "Quantity": decision.quantity,
             "Reference Price": decision.reference_price,
-            "Risk Approved": decision.risk_approved,
-            "Preflight Ready": decision.preflight_ready,
-            "Execution Reason": decision.execution_reason,
+            "Trade Allowed": decision.risk_approved,
+            "Ready To Send": decision.preflight_ready,
+            "Reason": decision.execution_reason,
             "Blocked Reasons": "; ".join(dict.fromkeys(decision.blocked_reasons)),
         }
         for decision in decisions

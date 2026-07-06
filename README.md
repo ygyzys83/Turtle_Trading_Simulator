@@ -50,6 +50,15 @@ The default Streamlit workspace is a daily operator view for running a small per
 
 The product intent is not to maximize automation authority. It is to show how an AI system can propose actions while deterministic software and human approval retain control over capital.
 
+## UI Product Rule
+
+The daily workflow should stay simple enough for an expert operator to use quickly:
+
+- Daily Operator shows the research, current signal, trade plan, risk decision, and broker actions.
+- Portfolio Evidence holds the detailed audit trail, lifecycle tables, readiness reports, and deployment proof.
+- Hard blockers prevent obvious mechanical mistakes. Warnings inform the operator without adding ceremony.
+- Button labels should describe the actual action in plain language, such as review, send, refresh, track, exit, or cancel.
+
 ## Architecture Roadmap
 
 1. Refactor the simulator into reusable modules for data, indicators, strategy, backtesting, risk, execution, agents, and UI.
