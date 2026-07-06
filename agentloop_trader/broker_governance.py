@@ -353,6 +353,62 @@ def build_exit_order_previews(position_records: list[dict], config: AlpacaConfig
     return previews
 
 
+def simulated_alpaca_fill_order(
+    tracked_order: dict | None,
+    fill_price: float | None = None,
+    filled_at: datetime | None = None,
+) -> dict:
+    record = dict(tracked_order or {})
+    quantity = _as_float(record.get("filled_quantity") or record.get("quantity"))
+    price = fill_price if fill_price is not None else _as_float(record.get("average_fill_price") or record.get("entry_price"))
+    now = (filled_at or datetime.now(UTC)).isoformat()
+    record.update(
+        {
+            "status": "filled",
+            "alpaca_status_raw": "simulated_fill",
+            "filled_at": now,
+            "filled_quantity": _format_number(quantity),
+            "average_fill_price": _format_number(price),
+            "lifecycle_status": "filled_at_alpaca",
+            "last_synced_at": now,
+            "simulated": True,
+        }
+    )
+    return record
+
+
+def simulated_position_from_filled_order(filled_order: dict) -> dict:
+    quantity = _as_float(filled_order.get("filled_quantity") or filled_order.get("quantity"))
+    price = _as_float(filled_order.get("average_fill_price"))
+    return {
+        "Symbol": str(filled_order.get("symbol", "")).strip().upper(),
+        "Quantity": _format_number(quantity),
+        "Market Value": round(quantity * price, 2),
+        "Average Entry": _format_number(price),
+        "Source": "simulated_fill",
+    }
+
+
+def simulated_exit_preview_readiness_records(
+    tracked_order: dict | None,
+    config: AlpacaConfig,
+) -> list[dict]:
+    if not tracked_order:
+        return [{"Check": "Filled Order Available", "Passed": False, "Detail": "Select a tracked order before simulating exit readiness."}]
+    filled_order = simulated_alpaca_fill_order(tracked_order)
+    position = simulated_position_from_filled_order(filled_order)
+    previews = build_exit_order_previews([position], config)
+    preview = previews[0] if previews else None
+    blockers = exit_position_reasons(preview, [position]) if preview else ["No simulated exit preview was generated."]
+    return [
+        {"Check": "Filled Order Available", "Passed": True, "Detail": filled_order.get("broker_order_id", "")},
+        {"Check": "Simulated Position Created", "Passed": bool(position.get("Symbol")), "Detail": position.get("Symbol", "")},
+        {"Check": "Exit Preview Valid", "Passed": bool(preview and preview.valid), "Detail": "" if preview and preview.valid else "; ".join(preview.blocked_reasons if preview else blockers)},
+        {"Check": "Exit Position Check", "Passed": not blockers, "Detail": "Simulated position can be exited." if not blockers else "; ".join(blockers)},
+        {"Check": "Broker Writes Submitted", "Passed": True, "Detail": "0"},
+    ]
+
+
 def exit_preview_records(previews: list[AlpacaOrderPreview]) -> list[dict]:
     return [
         {

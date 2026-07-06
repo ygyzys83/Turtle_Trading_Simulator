@@ -19,6 +19,9 @@ from agentloop_trader.broker_governance import (
     preview_already_tracked,
     reconcile_alpaca_positions,
     refresh_tracked_alpaca_orders,
+    simulated_alpaca_fill_order,
+    simulated_exit_preview_readiness_records,
+    simulated_position_from_filled_order,
 )
 from agentloop_trader.brokers import AlpacaConfig, build_alpaca_order_preview
 from agentloop_trader.models import ExecutionDecision, RiskCheckResult
@@ -321,3 +324,34 @@ def test_market_session_advisory_identifies_weekend_closed():
     advisory = market_session_advisory(datetime(2026, 7, 5, 16, 0, tzinfo=UTC))
 
     assert advisory["Market Session"] == "closed_or_extended"
+
+
+def test_simulated_alpaca_fill_order_marks_local_lifecycle_without_broker_write():
+    tracked = {
+        "broker_order_id": "order-1",
+        "symbol": "AAPL",
+        "side": "buy",
+        "quantity": "40",
+        "status": "accepted",
+    }
+
+    filled = simulated_alpaca_fill_order(tracked, fill_price=200)
+    position = simulated_position_from_filled_order(filled)
+
+    assert filled["status"] == "filled"
+    assert filled["lifecycle_status"] == "filled_at_alpaca"
+    assert filled["simulated"]
+    assert position["Symbol"] == "AAPL"
+    assert position["Market Value"] == 8000
+
+
+def test_simulated_exit_preview_readiness_is_local_only():
+    rows = simulated_exit_preview_readiness_records(
+        {"broker_order_id": "order-1", "symbol": "AAPL", "quantity": "10"},
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+    )
+    checks = {row["Check"]: row for row in rows}
+
+    assert checks["Filled Order Available"]["Passed"]
+    assert checks["Exit Position Check"]["Passed"]
+    assert checks["Broker Writes Submitted"]["Detail"] == "0"

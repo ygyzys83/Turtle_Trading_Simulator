@@ -24,12 +24,26 @@ Use this checklist before enabling any real-money order path.
 - Execution mode confirmed.
 - Manual approval requirement confirmed.
 - Kill switch visible and tested.
+- `Emergency disable session` tested and visible in the audit log.
 - Max session loss configured.
 - Max position size configured.
 - Max portfolio exposure configured.
 - Allowed symbols configured.
 - Stop loss required.
 - Audit logging active.
+- `Create Live Mode Lockfile` completed.
+- `Live mode lockfile` shows `Live Mode Locked`.
+
+## Deployment Environment
+
+- `.env.example` exists and contains no secrets.
+- `.env` is present only on the deployment host and ignored by git.
+- `Audit log path` points to durable storage.
+- `Broker state path` points to durable storage.
+- `Automation dry-run path` points to durable storage.
+- `Evidence export path` points to durable storage.
+- Restart procedure preserves audit logs, broker state, and automation snapshots.
+- Evidence export has been generated after the latest paper test.
 
 ## First Live Session
 
@@ -49,4 +63,3 @@ Use this checklist before enabling any real-money order path.
 - No unreconciled account state.
 - Tested emergency disable path.
 - Tested restart/recovery path.
-

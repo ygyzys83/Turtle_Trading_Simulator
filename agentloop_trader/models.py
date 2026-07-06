@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Literal
+from zoneinfo import ZoneInfo
 
 
 Side = Literal["buy", "sell"]
@@ -15,6 +16,8 @@ ExecutionMode = Literal[
     "live_with_approval",
     "automated_live",
 ]
+
+PACIFIC_TIME = ZoneInfo("America/Los_Angeles")
 
 
 @dataclass(frozen=True)
@@ -153,4 +156,4 @@ class AuditEvent:
     event_type: str
     message: str
     payload: dict[str, Any] = field(default_factory=dict)
-    created_at: datetime = field(default_factory=lambda: datetime.now(UTC))
+    created_at: datetime = field(default_factory=lambda: datetime.now(PACIFIC_TIME))

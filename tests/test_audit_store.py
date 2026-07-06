@@ -31,3 +31,10 @@ def test_jsonl_audit_store_serializes_dataclass_payload():
 
         records = store.read_recent()
     assert records[0]["payload"]["event"]["event_type"] == "inner"
+
+
+def test_audit_event_defaults_to_pacific_time():
+    event = AuditEvent(event_type="timezone", message="Pacific timestamp")
+
+    assert event.created_at.tzinfo is not None
+    assert event.created_at.tzinfo.key == "America/Los_Angeles"

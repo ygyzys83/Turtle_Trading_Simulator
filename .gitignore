@@ -23,6 +23,7 @@ ENV/
 audit_logs/
 automation_logs/
 broker_state/
+live_mode/
 
 # Build/package output
 build/

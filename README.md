@@ -33,6 +33,21 @@ The app should not be framed as an autonomous trading bot. It is a research, bac
 
 This repository is now being developed toward eventual real-money Alpaca use, but live unattended trading is not considered safe until the controls in `docs/PRODUCTION_SAFETY.md` and `docs/LIVE_DEPLOYMENT_CHECKLIST.md` are satisfied.
 
+## Portfolio Narrative
+
+AgentLoop Trader is designed to demonstrate a practical agentic workflow with human-in-the-loop guardrails:
+
+1. Observe market state and strategy signals.
+2. Propose a structured trade thesis and intent.
+3. Gate the proposal through deterministic risk policy.
+4. Require a human to arm one exact broker preview before paper execution.
+5. Reconcile broker state after the action.
+6. Review outcomes and preserve audit evidence.
+
+The default Streamlit workspace is a daily operator view for running a small personal account. The `Portfolio Evidence` workspace exposes the deeper artifacts that make the AI TPM story visible: run manifests, approval ledgers, dry-run automation evidence, readiness reports, and deployment guardrails.
+
+The product intent is not to maximize automation authority. It is to show how an AI system can propose actions while deterministic software and human approval retain control over capital.
+
 ## Architecture Roadmap
 
 1. Refactor the simulator into reusable modules for data, indicators, strategy, backtesting, risk, execution, agents, and UI.

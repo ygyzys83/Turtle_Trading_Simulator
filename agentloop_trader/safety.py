@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+
+DEFAULT_LIVE_MODE_LOCKFILE_PATH = Path("live_mode") / "LIVE_TRADING_LOCKED.txt"
+
 
 IMMUTABLE_AGENT_BOUNDARIES = (
     "risk_limits",
@@ -60,6 +65,67 @@ def pre_live_readiness_report(
             "Detail": detail,
         }
         for name, passed, detail in checks
+    ]
+
+
+def live_mode_lockfile_records(path: str | Path | None = None) -> list[dict]:
+    lock_path = Path(path) if path is not None else DEFAULT_LIVE_MODE_LOCKFILE_PATH
+    exists = lock_path.exists()
+    return [
+        {"Check": "Live Lockfile Path", "Passed": True, "Detail": str(lock_path)},
+        {
+            "Check": "Live Mode Locked",
+            "Passed": exists,
+            "Detail": "Lockfile exists; future live enablement remains administratively locked." if exists else "Lockfile is missing; live readiness remains blocked.",
+        },
+        {"Check": "Broker Writes Blocked", "Passed": True, "Detail": "Current code still blocks Alpaca live broker writes."},
+    ]
+
+
+def write_live_mode_lockfile(path: str | Path | None = None) -> Path:
+    lock_path = Path(path) if path is not None else DEFAULT_LIVE_MODE_LOCKFILE_PATH
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_path.write_text(
+        "\n".join(
+            [
+                "LIVE TRADING IS LOCKED",
+                "Do not enable Alpaca live broker writes without manual code review, paper evidence, and user approval.",
+                "This file is a local operational guardrail, not permission to trade live.",
+            ]
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return lock_path
+
+
+def deployment_readiness_records(
+    env_example_present: bool,
+    dotenv_ignored: bool,
+    audit_path_configured: bool,
+    broker_state_path_configured: bool,
+    evidence_export_path_configured: bool,
+    live_lockfile_present: bool,
+    tests_passing: bool | None = None,
+) -> list[dict]:
+    rows = [
+        ("Environment template present", env_example_present, ".env.example is available for non-secret configuration shape."),
+        ("Secrets ignored by git", dotenv_ignored, ".env is ignored and must not be committed."),
+        ("Audit path configured", audit_path_configured, "Durable audit JSONL path is configured."),
+        ("Broker state path configured", broker_state_path_configured, "Tracked Alpaca paper order state path is configured."),
+        ("Evidence export path configured", evidence_export_path_configured, "Evidence export path is configured."),
+        ("Live lockfile present", live_lockfile_present, "Local live-mode lockfile exists."),
+    ]
+    if tests_passing is not None:
+        rows.append(("Tests passing", tests_passing, "Latest local test checkpoint passed." if tests_passing else "Run tests before deployment."))
+    return [
+        {
+            "Check": name,
+            "Passed": passed,
+            "Status": "ready" if passed else "blocked",
+            "Detail": detail,
+        }
+        for name, passed, detail in rows
     ]
 
 

@@ -4,9 +4,12 @@ from agentloop_trader.risk import check_trade_intent, decide_execution
 from agentloop_trader.safety import (
     IMMUTABLE_AGENT_BOUNDARIES,
     broker_state_simulation_records,
+    deployment_readiness_records,
     immutable_boundary_records,
+    live_mode_lockfile_records,
     pre_live_readiness_report,
     production_readiness_checks,
+    write_live_mode_lockfile,
 )
 from tests.test_brokers import FakeAlpacaClient
 
@@ -70,3 +73,33 @@ def test_broker_state_simulation_records_include_disconnect_and_kill_switch():
 
     assert "Alpaca disconnected" in scenarios
     assert "Kill switch enabled" in scenarios
+
+
+def test_live_mode_lockfile_records_require_local_lockfile():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        path = f"{tmp_dir}/LIVE_TRADING_LOCKED.txt"
+        missing = {row["Check"]: row for row in live_mode_lockfile_records(path)}
+        written_path = write_live_mode_lockfile(path)
+        present = {row["Check"]: row for row in live_mode_lockfile_records(path)}
+
+    assert not missing["Live Mode Locked"]["Passed"]
+    assert written_path.name == "LIVE_TRADING_LOCKED.txt"
+    assert present["Live Mode Locked"]["Passed"]
+    assert present["Broker Writes Blocked"]["Passed"]
+
+
+def test_deployment_readiness_records_block_missing_lockfile():
+    rows = deployment_readiness_records(
+        env_example_present=True,
+        dotenv_ignored=True,
+        audit_path_configured=True,
+        broker_state_path_configured=True,
+        evidence_export_path_configured=True,
+        live_lockfile_present=False,
+    )
+    checks = {row["Check"]: row for row in rows}
+
+    assert checks["Environment template present"]["Passed"]
+    assert checks["Live lockfile present"]["Status"] == "blocked"
