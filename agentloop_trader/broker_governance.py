@@ -148,7 +148,9 @@ def refresh_tracked_alpaca_orders(tracked_orders: list[dict], alpaca_orders: lis
         record = dict(tracked)
         broker_order_id = str(record.get("broker_order_id") or record.get("Broker Order ID") or "").strip()
         alpaca_order = alpaca_by_id.get(broker_order_id)
-        if not broker_order_id:
+        if record.get("adopted") and record.get("source") == "adopted_alpaca_position":
+            record["lifecycle_status"] = "adopted_alpaca_position"
+        elif not broker_order_id:
             record["lifecycle_status"] = "missing_broker_order_id"
         elif alpaca_order is None:
             record["lifecycle_status"] = "missing_from_alpaca_orders"
@@ -200,6 +202,7 @@ def alpaca_order_lifecycle_summary_records(tracked_orders: list[dict]) -> list[d
         {"Metric": "Tracked Alpaca Orders", "Value": len(tracked_orders)},
         {"Metric": "Open Alpaca Orders", "Value": lifecycle_statuses.count("open_at_alpaca")},
         {"Metric": "Filled Alpaca Orders", "Value": statuses.count("filled")},
+        {"Metric": "Adopted Alpaca Positions", "Value": lifecycle_statuses.count("adopted_alpaca_position")},
         {"Metric": "Canceled Alpaca Orders", "Value": statuses.count("canceled") + statuses.count("cancelled")},
         {"Metric": "Rejected Alpaca Orders", "Value": statuses.count("rejected")},
         {"Metric": "Missing From Alpaca Orders", "Value": lifecycle_statuses.count("missing_from_alpaca_orders")},
@@ -228,7 +231,14 @@ def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orde
         filled_qty = sum(_as_float(order.get("filled_quantity") or order.get("quantity")) for order in matched_orders)
         latest_order = matched_orders[-1] if matched_orders else {}
         position_qty = _as_float(position.get("Quantity"))
-        lifecycle_status = "position_matched_to_filled_order" if matched_orders else "untracked_alpaca_position"
+        adopted_match = bool(matched_orders) and all(_is_adopted_position_order(order) for order in matched_orders)
+        lifecycle_status = (
+            "adopted_alpaca_position"
+            if adopted_match
+            else "position_matched_to_filled_order"
+            if matched_orders
+            else "untracked_alpaca_position"
+        )
         rows.append(
             {
                 "Symbol": symbol,
@@ -269,6 +279,7 @@ def alpaca_position_lifecycle_summary_records(position_lifecycle_rows: list[dict
     return [
         {"Metric": "Alpaca Positions", "Value": sum(bool(row.get("Position Qty")) for row in position_lifecycle_rows)},
         {"Metric": "Matched Filled Positions", "Value": statuses.count("position_matched_to_filled_order")},
+        {"Metric": "Adopted Alpaca Positions", "Value": statuses.count("adopted_alpaca_position")},
         {"Metric": "Untracked Alpaca Positions", "Value": statuses.count("untracked_alpaca_position")},
         {"Metric": "Filled Orders Without Position", "Value": statuses.count("filled_order_without_open_position")},
         {"Metric": "Exit Previews Ready", "Value": sum(bool(row.get("Exit Preview Ready")) for row in position_lifecycle_rows)},
@@ -285,6 +296,10 @@ def _lifecycle_status(status: str) -> str:
     if status in TERMINAL_ORDER_STATUSES:
         return "terminal_at_alpaca"
     return "unknown_at_alpaca"
+
+
+def _is_adopted_position_order(order: dict) -> bool:
+    return bool(order.get("adopted")) and str(order.get("source", "")) == "adopted_alpaca_position"
 
 
 def _format_number(value: float) -> str:
@@ -318,6 +333,42 @@ def reconcile_alpaca_positions(position_records: list[dict], tracked_orders: lis
             }
         )
     return rows
+
+
+def adopt_alpaca_position(position: dict, adopted_at: datetime | None = None) -> dict:
+    symbol = str(position.get("Symbol", "")).strip().upper()
+    quantity = _as_float(position.get("Quantity"))
+    average_entry = _as_float(position.get("Average Entry"))
+    if not symbol:
+        raise ValueError("Cannot adopt an Alpaca position without a symbol.")
+    if quantity <= 0:
+        raise ValueError("Cannot adopt an Alpaca position without positive quantity.")
+    if adopted_at is None:
+        now_dt = datetime.now(PACIFIC_TIME)
+    elif adopted_at.tzinfo:
+        now_dt = adopted_at.astimezone(PACIFIC_TIME)
+    else:
+        now_dt = adopted_at.replace(tzinfo=PACIFIC_TIME)
+    now = now_dt.isoformat()
+    compact_time = now_dt.strftime("%Y%m%d%H%M%S")
+    return {
+        "broker_order_id": f"adopted-{symbol}-{compact_time}",
+        "preview_hash": "",
+        "symbol": symbol,
+        "side": "buy",
+        "quantity": _format_number(quantity),
+        "status": "filled",
+        "alpaca_status_raw": "adopted_position",
+        "submitted_at": "",
+        "filled_at": now,
+        "filled_quantity": _format_number(quantity),
+        "average_fill_price": _format_number(average_entry),
+        "lifecycle_status": "adopted_alpaca_position",
+        "last_synced_at": now,
+        "source": "adopted_alpaca_position",
+        "adopted": True,
+        "broker_writes_submitted": 0,
+    }
 
 
 def build_exit_intent_from_position(position: dict) -> TradeIntent | None:

@@ -3,6 +3,7 @@ from datetime import UTC, datetime
 
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
+    adopt_alpaca_position,
     alpaca_order_lifecycle_records,
     alpaca_order_lifecycle_summary_records,
     alpaca_position_lifecycle_records,
@@ -248,6 +249,45 @@ def test_alpaca_position_lifecycle_marks_untracked_position():
 
     assert rows[0]["Lifecycle Status"] == "untracked_alpaca_position"
     assert rows[0]["Exit Preview Ready"]
+
+
+def test_adopt_alpaca_position_creates_local_filled_tracking_record():
+    adopted = adopt_alpaca_position(
+        {"Symbol": "AAPL", "Quantity": "40", "Average Entry": "309.139"},
+        adopted_at=datetime(2026, 7, 6, 9, 45, tzinfo=UTC),
+    )
+
+    assert adopted["broker_order_id"].startswith("adopted-AAPL-")
+    assert adopted["symbol"] == "AAPL"
+    assert adopted["side"] == "buy"
+    assert adopted["status"] == "filled"
+    assert adopted["filled_quantity"] == "40"
+    assert adopted["average_fill_price"] == "309.139"
+    assert adopted["lifecycle_status"] == "adopted_alpaca_position"
+    assert adopted["source"] == "adopted_alpaca_position"
+    assert adopted["broker_writes_submitted"] == 0
+
+
+def test_adopted_alpaca_position_survives_order_refresh_and_matches_position():
+    adopted = adopt_alpaca_position(
+        {"Symbol": "AAPL", "Quantity": "40", "Average Entry": "309.139"},
+        adopted_at=datetime(2026, 7, 6, 9, 45, tzinfo=UTC),
+    )
+
+    refreshed = refresh_tracked_alpaca_orders([adopted], [])
+    lifecycle_rows = alpaca_position_lifecycle_records(
+        [{"Symbol": "AAPL", "Quantity": "40", "Market Value": "12535.6", "Average Entry": "309.139"}],
+        refreshed,
+    )
+    summary = alpaca_position_lifecycle_summary_records(lifecycle_rows)
+    summary_values = {row["Metric"]: row["Value"] for row in summary}
+
+    assert refreshed[0]["lifecycle_status"] == "adopted_alpaca_position"
+    assert lifecycle_rows[0]["Lifecycle Status"] == "adopted_alpaca_position"
+    assert lifecycle_rows[0]["Matched Filled Orders"] == 1
+    assert lifecycle_rows[0]["Exit Preview Ready"]
+    assert summary_values["Adopted Alpaca Positions"] == 1
+    assert summary_values["Untracked Alpaca Positions"] == 0
 
 
 def test_alpaca_position_lifecycle_marks_filled_order_without_position():

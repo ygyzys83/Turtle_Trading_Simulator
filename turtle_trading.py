@@ -31,6 +31,7 @@ from agentloop_trader.brokers import (
 )
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
+    adopt_alpaca_position,
     alpaca_order_lifecycle_records,
     alpaca_order_lifecycle_summary_records,
     alpaca_position_lifecycle_records,
@@ -1197,6 +1198,48 @@ if st.session_state.get("tracked_alpaca_orders"):
         )
         st.dataframe(pd.DataFrame(position_lifecycle_rows), use_container_width=True, hide_index=True)
         st.caption("Alpaca paper position lifecycle is read-only. It connects filled tracked orders to current Alpaca Positions and exit-preview readiness.")
+        untracked_position_rows = [
+            row for row in position_lifecycle_rows
+            if row.get("Lifecycle Status") == "untracked_alpaca_position"
+        ]
+        if untracked_position_rows:
+            st.markdown("##### Adopt untracked Alpaca paper position")
+            adopt_options = [
+                f"{row.get('Symbol', '')} qty {row.get('Position Qty', '')}"
+                for row in untracked_position_rows
+            ]
+            selected_adopt_idx = st.selectbox(
+                "Position to adopt locally",
+                range(len(adopt_options)),
+                format_func=lambda idx: adopt_options[idx],
+            )
+            selected_adopt_symbol = str(untracked_position_rows[selected_adopt_idx].get("Symbol", "")).strip().upper()
+            selected_adopt_position = next(
+                (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == selected_adopt_symbol),
+                None,
+            )
+            adopt_disabled = selected_adopt_position is None or not alpaca_status.connected or alpaca_state_health.stale
+            if st.button("Adopt Alpaca Paper Position Locally", disabled=adopt_disabled):
+                adopted_record = adopt_alpaca_position(selected_adopt_position)
+                broker_state_store.upsert(adopted_record)
+                st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
+                adoption_event = AuditEvent(
+                    event_type="alpaca_paper_position_adopted",
+                    message="Untracked Alpaca paper position adopted into local lifecycle evidence.",
+                    payload={
+                        "broker_order_id": adopted_record.get("broker_order_id", ""),
+                        "symbol": adopted_record.get("symbol", ""),
+                        "quantity": adopted_record.get("filled_quantity", ""),
+                        "average_fill_price": adopted_record.get("average_fill_price", ""),
+                        "source": adopted_record.get("source", ""),
+                        "broker_writes_submitted": 0,
+                    },
+                )
+                st.session_state["session_audit_events"].append(adoption_event)
+                if persist_audit_log:
+                    audit_store.append(adoption_event)
+                st.rerun()
+            st.caption("Adoption is local evidence only. It does not submit, cancel, or modify any Alpaca order.")
 
     refresh_state_disabled = not alpaca_status.connected or alpaca_state_health.stale
     if st.button("Refresh Alpaca Paper Order State", disabled=refresh_state_disabled):
