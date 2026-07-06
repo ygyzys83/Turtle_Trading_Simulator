@@ -18,6 +18,7 @@ A governed trading simulator and research lab built from a classic turtle-style 
 - Adds portfolio-aware risk policy and execution preflight checks.
 - Adds a broker adapter interface with a local paper adapter and non-trading Alpaca stub.
 - Adds durable JSONL audit logs and shadow-mode decision recording.
+- Adds local-only automation readiness checks for market data freshness, restart recovery, scheduler preview, and paper account health.
 - Supports synthetic data runs and optional stock data through `yfinance`.
 - Includes a selectable trade log that highlights entries and exits on the chart.
 
@@ -43,6 +44,7 @@ AgentLoop Trader is designed to demonstrate a practical agentic workflow with hu
 4. Require a human to arm one exact broker preview before paper execution.
 5. Reconcile broker state after the action.
 6. Review outcomes and preserve audit evidence.
+7. Rehearse paper automation with local dry-run queues before any unattended behavior exists.
 
 The default Streamlit workspace is a daily operator view for running a small personal account. The `Portfolio Evidence` workspace exposes the deeper artifacts that make the AI TPM story visible: run manifests, approval ledgers, dry-run automation evidence, readiness reports, and deployment guardrails.
 
@@ -72,6 +74,7 @@ agentloop_trader/
   parameter_loop.py # bounded parameter evaluation and recommendations
   indicators.py   # ATR and SMA calculations
   models.py       # structured trading, risk, and audit contracts
+  ops_readiness.py # local-only paper automation readiness checks
   risk.py         # deterministic risk checks and execution preflight policy
 ```
 

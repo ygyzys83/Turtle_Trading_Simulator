@@ -68,6 +68,14 @@ from agentloop_trader.monitoring import (
     monitoring_records,
     risk_halt_records,
 )
+from agentloop_trader.ops_readiness import (
+    market_data_freshness_records,
+    paper_account_health_records,
+    paper_automation_gate_records,
+    restart_recovery_records,
+    scheduler_preview_records,
+    strategy_state_snapshot_records,
+)
 from agentloop_trader.parameter_loop import (
     candidate_records,
     evaluate_parameter_candidates,
@@ -393,6 +401,7 @@ automation_dry_run_path = st.sidebar.text_input("Automation dry-run path", value
 run_manifest_path = st.sidebar.text_input("Run manifest path", value="audit_logs/run_manifests.jsonl")
 evidence_export_path = st.sidebar.text_input("Evidence export path", value="audit_logs/latest_evidence_package.json")
 live_lockfile_path = st.sidebar.text_input("Live lockfile path", value="live_mode/LIVE_TRADING_LOCKED.txt")
+automation_preview_interval = st.sidebar.slider("Automation preview interval (min)", 5, 60, 15, step=5)
 
 if data_source == "Synthetic" and st.sidebar.button("Simulate new run", type="primary"):
     st.session_state["seed"] = np.random.randint(0, 100_000)
@@ -1593,6 +1602,75 @@ with st.expander("Automation Dry Run", expanded=False):
         broker_state_stale=alpaca_state_health.stale,
         automation_ready_rows=readiness_rows,
     )
+    recent_automation_snapshots = automation_store.read_recent(limit=100)
+    market_row_count = len(market_data) if market_data is not None else len(prices)
+    latest_market_label = str(market_data.index[-1]) if market_data is not None else str(labels[-1] if labels else "")
+    market_freshness_rows = market_data_freshness_records(
+        data_source=data_source,
+        source_caption=source_caption,
+        row_count=market_row_count,
+        latest_label=latest_market_label,
+        minimum_rows=max(entry_w, exit_w, ma_w, 30),
+    )
+    account_health_rows = paper_account_health_records(
+        paper_cash=paper_broker.cash,
+        paper_equity=paper_equity,
+        starting_cash=st.session_state["paper_starting_cash"],
+        local_open_positions=len(paper_broker.positions),
+        tracked_alpaca_orders=st.session_state["tracked_alpaca_orders"],
+        monitoring_result=monitoring_result,
+        limits=risk_limits,
+    )
+    restart_rows = restart_recovery_records(
+        audit_log_path=audit_log_path,
+        broker_state_path=broker_state_path,
+        automation_dry_run_path=automation_dry_run_path,
+        run_manifest_path=run_manifest_path,
+        audit_records_loaded=len(audit_store.read_recent(limit=500)) if persist_audit_log else len(st.session_state["session_audit_events"]),
+        tracked_orders_loaded=len(st.session_state["tracked_alpaca_orders"]),
+        automation_snapshots_loaded=len(recent_automation_snapshots),
+    )
+    scheduler_rows = scheduler_preview_records(
+        interval_minutes=automation_preview_interval,
+        market_open=bool(market_session_advisory().get("Open", False)),
+        kill_switch_enabled=effective_kill_switch,
+        ready_candidate_count=sum(bool(row.get("Ready")) for row in automation_candidates),
+        halt_count=sum(bool(row.get("Active")) for row in automation_halt_rows),
+    )
+    paper_automation_gate_rows = paper_automation_gate_records(
+        broker_connected=alpaca_status.connected,
+        broker_state_stale=alpaca_state_health.stale,
+        market_data_rows=market_freshness_rows,
+        account_health_rows=account_health_rows,
+        restart_rows=restart_rows,
+        readiness_rows=readiness_rows,
+        halt_rows=automation_halt_rows,
+        dry_run_snapshots_loaded=len(recent_automation_snapshots),
+    )
+    st.markdown("##### Market data freshness")
+    st.dataframe(pd.DataFrame(market_freshness_rows), use_container_width=True, hide_index=True)
+    st.markdown("##### Strategy state snapshot")
+    st.dataframe(
+        pd.DataFrame(
+            strategy_state_snapshot_records(
+                config=current_strategy_config,
+                live=live,
+                intent=intent,
+                risk_check=risk_check,
+                preflight=preflight_check,
+            )
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.markdown("##### Paper account health")
+    st.dataframe(pd.DataFrame(account_health_rows), use_container_width=True, hide_index=True)
+    st.markdown("##### Restart recovery")
+    st.dataframe(pd.DataFrame(restart_rows), use_container_width=True, hide_index=True)
+    st.markdown("##### Scheduler preview")
+    st.dataframe(pd.DataFrame(scheduler_rows), use_container_width=True, hide_index=True)
+    st.markdown("##### Ready for paper automation")
+    st.dataframe(pd.DataFrame(paper_automation_gate_rows), use_container_width=True, hide_index=True)
     st.markdown("##### Paper automation supervisor dry-run")
     st.dataframe(
         pd.DataFrame(
@@ -1626,7 +1704,6 @@ with st.expander("Automation Dry Run", expanded=False):
         if persist_audit_log:
             audit_store.append(automation_event)
         st.rerun()
-    recent_automation_snapshots = automation_store.read_recent(limit=100)
     st.markdown("##### Automation evidence dashboard")
     st.dataframe(pd.DataFrame(automation_evidence_records(recent_automation_snapshots)), use_container_width=True, hide_index=True)
     st.caption("Dry-run only. This queue never submits, exits, or cancels broker orders.")

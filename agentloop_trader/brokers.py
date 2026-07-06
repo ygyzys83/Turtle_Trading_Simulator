@@ -136,12 +136,15 @@ def alpaca_config_validation_records(config: AlpacaConfig) -> list[dict]:
 
 
 def _load_dotenv_if_available() -> None:
+    env_path = Path.cwd() / ".env"
+    if not env_path.exists():
+        return
     try:
         from dotenv import load_dotenv
     except Exception:
         _load_local_dotenv_fallback()
         return
-    load_dotenv(override=False)
+    load_dotenv(dotenv_path=env_path, override=False)
 
 
 def _load_local_dotenv_fallback() -> None:
