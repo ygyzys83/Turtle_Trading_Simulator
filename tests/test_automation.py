@@ -50,7 +50,6 @@ def test_auto_exit_decision_is_ready_when_all_conditions_pass():
     decision = auto_exit_decision(
         automation_level="Auto exits only",
         execution_mode="paper",
-        automatic_exits_started=True,
         broker_connected=True,
         broker_can_submit=True,
         paper_orders_enabled=True,
@@ -72,7 +71,6 @@ def test_auto_exit_decision_blocks_manual_mode_and_closed_market():
     decision = auto_exit_decision(
         automation_level="Manual review only",
         execution_mode="paper",
-        automatic_exits_started=False,
         broker_connected=True,
         broker_can_submit=True,
         paper_orders_enabled=True,
@@ -88,12 +86,10 @@ def test_auto_exit_decision_blocks_manual_mode_and_closed_market():
     assert decision.status == "Off"
     assert "Manual review only" in decision.reasons[0]
 
-
-def test_auto_exit_decision_waits_for_start_switch():
+def test_auto_exit_decision_blocks_backtest_mode():
     decision = auto_exit_decision(
         automation_level="Auto exits only",
-        execution_mode="paper",
-        automatic_exits_started=False,
+        execution_mode="backtest_only",
         broker_connected=True,
         broker_can_submit=True,
         paper_orders_enabled=True,
@@ -107,7 +103,7 @@ def test_auto_exit_decision_waits_for_start_switch():
 
     assert not decision.ready
     assert decision.status == "Exit blocked"
-    assert "Start automatic paper exits is off." in decision.reasons
+    assert "How orders are handled must be Paper trading." in decision.reasons
 
 
 def test_paper_automation_candidates_include_entry_exit_and_cancel_dry_runs():
@@ -131,7 +127,7 @@ def test_paper_automation_candidates_include_entry_exit_and_cancel_dry_runs():
     )
 
     actions = [row["Action"] for row in rows]
-    assert actions == ["Buy ready for review", "Exit ready for review", "Cancel ready for review"]
+    assert actions == ["Buy ready to send", "Exit ready to send", "Cancel ready to send"]
     assert all(row["No Orders Sent"] for row in rows)
     assert all(row["Would Need Approval"] for row in rows)
 
@@ -172,8 +168,8 @@ def test_automation_readiness_records_are_display_ready():
     records = {row["Check"]: row for row in rows}
     assert records["No orders sent"]["Passed"]
     assert not records["Paper orders allowed"]["Passed"]
-    assert records["Actions to review"]["Passed"]
-    assert "1 action" in records["Actions to review"]["Detail"]
+    assert records["Paper actions ready"]["Passed"]
+    assert "1 paper action" in records["Paper actions ready"]["Detail"]
 
 
 def test_evidence_dashboard_records_count_key_events():
@@ -198,7 +194,7 @@ def test_evidence_dashboard_records_count_key_events():
     metrics = {record["Metric"]: record["Value"] for record in records}
     assert metrics["Paper buys sent"] == 1
     assert metrics["Paper exits sent"] == 1
-    assert metrics["Paper exits reviewed"] == 1
+    assert metrics["Paper exits sent"] == 1
     assert metrics["Paper exits blocked"] == 1
     assert metrics["Saved Alpaca orders"] == 4
     assert metrics["Open Alpaca orders"] == 1
@@ -214,7 +210,7 @@ def test_automation_snapshot_records_candidate_evidence():
         session_id="session-1",
         candidates=[
             {
-                "Action": "Buy ready for review",
+                "Action": "Buy ready to send",
                 "Ready": True,
                 "Would Need Approval": True,
                 "Reasons": "Check only.",
@@ -275,7 +271,7 @@ def test_automation_supervisor_dry_run_halts_before_candidates():
     assert values["Orders sent"] == 0
 
 
-def test_automation_supervisor_dry_run_queues_manual_review_when_clear():
+def test_automation_supervisor_dry_run_is_ready_when_clear():
     rows = automation_supervisor_dry_run_records(
         candidates=[{"Ready": True}, {"Ready": False}],
         readiness_rows=[{"Check": "No orders sent", "Passed": True}],
@@ -283,5 +279,5 @@ def test_automation_supervisor_dry_run_queues_manual_review_when_clear():
     )
     values = {row["Field"]: row["Value"] for row in rows}
 
-    assert values["Decision"] == "ask for review"
-    assert values["Actions ready for review"] == 1
+    assert values["Decision"] == "ready"
+    assert values["Paper actions ready"] == 1

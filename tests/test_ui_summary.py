@@ -37,8 +37,8 @@ def test_agent_loop_stage_records_show_human_gate():
     stages = {row["Stage"]: row for row in rows}
 
     assert stages["Find Trade"]["Ready"]
-    assert stages["Your Review"]["Ready"]
-    assert "review" in stages["Your Review"]["Detail"].lower()
+    assert stages["Your Action"]["Ready"]
+    assert "click" in stages["Your Action"]["Detail"].lower()
 
 
 def test_portfolio_story_records_explain_agentic_loop():
@@ -46,7 +46,7 @@ def test_portfolio_story_records_explain_agentic_loop():
     text = " ".join(row["Portfolio Signal"] for row in rows)
 
     assert "agent" in text
-    assert "operator reviews" in text
+    assert "operator chooses" in text
     assert "Closed trades are reviewed" in text
 
 
@@ -86,8 +86,8 @@ def test_operator_state_record_surfaces_ready_buy_review():
         open_position_count=0,
     )
 
-    assert row["State"] == "Ready to review"
-    assert "Review" in row["Next Action"]
+    assert row["State"] == "Ready to send"
+    assert "Send" in row["Next Action"]
 
 
 def test_strategy_context_records_explain_signal_and_price_levels():

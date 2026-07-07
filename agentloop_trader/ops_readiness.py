@@ -153,18 +153,18 @@ def scheduler_preview_records(
     halt_count: int,
 ) -> list[dict]:
     would_evaluate = not kill_switch_enabled and halt_count == 0
-    would_queue_review = would_evaluate and ready_candidate_count > 0
+    would_find_action = would_evaluate and ready_candidate_count > 0
     return [
         {"Field": "Timer mode", "Value": "check only"},
         {"Field": "Minutes between checks", "Value": interval_minutes},
         {"Field": "Market Open", "Value": market_open},
         {"Field": "Would check strategy", "Value": would_evaluate},
-        {"Field": "Would ask for your review", "Value": would_queue_review},
+        {"Field": "Would find paper action", "Value": would_find_action},
         {"Field": "Orders sent", "Value": 0},
         {
             "Field": "Detail",
             "Value": (
-                "A future timer would only check the strategy and ask for your review."
+                "A future timer would check the strategy and look for paper actions."
                 if would_evaluate
                 else "The timer check is stopped by the current app state."
             ),
@@ -198,7 +198,7 @@ def paper_automation_gate_records(
         {"Check": "Alpaca connected", "Passed": broker_connected, "Detail": "Alpaca is connected." if broker_connected else "Connect Alpaca paper credentials."},
         {"Check": "Alpaca data current", "Passed": not broker_state_stale, "Detail": "Alpaca data is current." if not broker_state_stale else "Refresh Alpaca positions and orders."},
         {"Check": "Saved automation checks", "Passed": True, "Detail": f"{dry_run_snapshots_loaded} saved check(s) loaded."},
-        {"Check": "Can ask for paper review", "Passed": not blockers, "Detail": "No hard blocks found." if not blockers else "; ".join(blockers)},
+        {"Check": "Paper automation can run", "Passed": not blockers, "Detail": "No hard blocks found." if not blockers else "; ".join(blockers)},
     ]
 
 

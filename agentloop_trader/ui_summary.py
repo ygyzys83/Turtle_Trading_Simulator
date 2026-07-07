@@ -24,13 +24,13 @@ def operator_state_record(
     if exit_preview_count > 0 and open_position_count > 0:
         return {
             "State": "Exit ready",
-            "Next Action": "Review the paper exit order.",
-            "Detail": f"{exit_preview_count} Alpaca paper position(s) can be reviewed for exit.",
+            "Next Action": "Send the paper exit or let Auto exits handle it.",
+            "Detail": f"{exit_preview_count} Alpaca paper position(s) can be sold by the app.",
         }
     if cancelable_order_count > 0:
         return {
             "State": "Cancel available",
-            "Next Action": "Review the waiting paper order if you want to cancel it.",
+            "Next Action": "Cancel the waiting paper order if you want to.",
             "Detail": f"{cancelable_order_count} Alpaca paper order(s) are waiting to fill.",
         }
     if not intent_present:
@@ -42,7 +42,7 @@ def operator_state_record(
     if not risk_approved or not preflight_ready:
         return {
             "State": "Trade blocked",
-            "Next Action": "Review the blocked reasons before doing anything.",
+            "Next Action": "Fix the blocked reasons before sending anything.",
             "Detail": "The strategy found a trade idea, but risk or execution checks blocked it.",
         }
     if execution_mode != "paper":
@@ -66,18 +66,18 @@ def operator_state_record(
     if buy_preview_ready and buy_preview_armed:
         return {
             "State": "Ready to send",
-            "Next Action": "Confirm and send the reviewed paper buy order.",
-            "Detail": "The exact paper order has been reviewed and still matches.",
+            "Next Action": "Send the paper buy order to Alpaca.",
+            "Detail": "The strategy, risk checks, and Alpaca paper order check all passed.",
         }
     if buy_preview_ready:
         return {
-            "State": "Ready to review",
-            "Next Action": "Review the paper buy order.",
-            "Detail": "The trade passed checks and can be reviewed before sending.",
+            "State": "Ready to send",
+            "Next Action": "Send the paper buy order to Alpaca.",
+            "Detail": "The strategy, risk checks, and Alpaca paper order check all passed.",
         }
     return {
         "State": "Trade blocked",
-        "Next Action": "Review the order blockers.",
+        "Next Action": "Fix the order blockers.",
         "Detail": "The trade passed core checks, but the Alpaca paper order preview is blocked.",
     }
 
@@ -289,10 +289,10 @@ def agent_loop_stage_records(
 ) -> list[dict]:
     stages = [
         ("Read Prices", True, "Market data loaded and strategy rules checked."),
-        ("Find Trade", intent_present, "There is a trade to review." if intent_present else "No trade to review right now."),
+        ("Find Trade", intent_present, "There is a trade idea." if intent_present else "No trade right now."),
         ("Check Risk", risk_approved, "Risk checks passed." if risk_approved else "Risk checks blocked the trade or there is no trade."),
-        ("Ready To Send", preflight_ready, "The trade can be reviewed for sending." if preflight_ready else "The trade cannot be sent yet."),
-        ("Your Review", human_gate_required, "You must review before any broker action." if human_gate_required else "No broker action is ready."),
+        ("Ready To Send", preflight_ready, "The trade can be sent in paper mode." if preflight_ready else "The trade cannot be sent yet."),
+        ("Your Action", human_gate_required, "Manual mode means you click the paper order button." if human_gate_required else "No paper action is waiting."),
         ("Alpaca", broker_connected, "Alpaca is connected." if broker_connected else "Alpaca is not connected."),
         ("Learn", True, "The app records actions and reviews closed trades."),
     ]
@@ -311,8 +311,8 @@ def portfolio_story_records() -> list[dict]:
         {"Step": "1. Read", "Portfolio Signal": "The app reads prices and checks the strategy rules."},
         {"Step": "2. Suggest", "Portfolio Signal": "The agent explains a trade idea and a proposed order."},
         {"Step": "3. Check", "Portfolio Signal": "Risk rules can block the trade."},
-        {"Step": "4. Review", "Portfolio Signal": "The operator reviews one exact paper order before sending."},
-        {"Step": "5. Send", "Portfolio Signal": "Only reviewed paper orders can reach Alpaca paper."},
+        {"Step": "4. Choose", "Portfolio Signal": "The operator chooses manual paper trading or automation."},
+        {"Step": "5. Send", "Portfolio Signal": "Valid paper orders can reach Alpaca paper."},
         {"Step": "6. Refresh", "Portfolio Signal": "The app refreshes Alpaca to see what happened."},
         {"Step": "7. Learn", "Portfolio Signal": "Closed trades are reviewed so the system can improve."},
     ]

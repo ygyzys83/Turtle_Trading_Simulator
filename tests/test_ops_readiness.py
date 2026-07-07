@@ -89,7 +89,7 @@ def test_scheduler_preview_never_submits_broker_writes():
 
     assert values["Timer mode"] == "check only"
     assert values["Would check strategy"]
-    assert values["Would ask for your review"]
+    assert values["Would find paper action"]
     assert values["Orders sent"] == 0
 
 
@@ -114,4 +114,4 @@ def test_paper_automation_gate_treats_dry_run_evidence_as_information():
     assert checks["Alpaca connected"]["Passed"]
     assert checks["Saved automation checks"]["Passed"]
     assert checks["Saved automation checks"]["Detail"] == "0 saved check(s) loaded."
-    assert checks["Can ask for paper review"]["Passed"]
+    assert checks["Paper automation can run"]["Passed"]

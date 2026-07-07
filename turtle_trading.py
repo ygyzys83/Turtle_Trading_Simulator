@@ -371,7 +371,7 @@ def build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, se
 
 
 st.sidebar.title("Trading Simulator")
-st.sidebar.markdown("### 1. Workspace")
+st.sidebar.markdown("### Workspace")
 workspace_mode = st.sidebar.radio(
     "What do you want to do?",
     ["Daily Operator", "Portfolio Evidence"],
@@ -380,7 +380,7 @@ workspace_mode = st.sidebar.radio(
 )
 show_portfolio_evidence = workspace_mode == "Portfolio Evidence"
 
-st.sidebar.markdown("### 2. Price Data")
+st.sidebar.markdown("### 1. Ticker and Price Data")
 data_source = st.sidebar.radio("Prices to use", ["Synthetic", "Stock via yfinance"], horizontal=True)
 market_data = None
 source_caption = "synthetic price data"
@@ -409,7 +409,7 @@ if data_source == "Stock via yfinance":
         st.error(f"Could not load yfinance data: {exc}")
         st.stop()
 
-st.sidebar.markdown("### 3. Strategy Rules")
+st.sidebar.markdown("### 2. Strategy and Backtest")
 account = st.sidebar.number_input(
     "Simulator account size ($)",
     min_value=1000,
@@ -432,7 +432,7 @@ ma_w = st.sidebar.slider("Trend filter length (bars)", 50, 300, 200, step=50)
 pullback_w = st.sidebar.slider("Pullback average length (bars)", 10, 50, 20, step=5)
 momentum_w = st.sidebar.slider("Momentum turn length (bars)", 3, 20, 10, step=1)
 
-st.sidebar.markdown("### 4. Order Mode")
+st.sidebar.markdown("### 3. Paper Trading Mode")
 mode_options = {
     "Backtest only": "backtest_only",
     "Paper trading": "paper",
@@ -444,7 +444,7 @@ mode_label = st.sidebar.selectbox("How orders are handled", list(mode_options.ke
 execution_mode = mode_options[mode_label]
 allowed_symbols_text = st.sidebar.text_input("Allowed symbols", value=ticker)
 
-st.sidebar.markdown("### 5. Risk Limits")
+st.sidebar.markdown("### 4. Risk Limits")
 max_risk_limit = st.sidebar.slider("Max risk per trade (%)", 0.25, 5.0, 1.0, step=0.25)
 max_notional_limit = st.sidebar.slider("Max position notional (%)", 5.0, 100.0, 25.0, step=5.0)
 max_portfolio_exposure = st.sidebar.slider("Max portfolio exposure (%)", 10.0, 100.0, 75.0, step=5.0)
@@ -454,39 +454,32 @@ max_open_positions = st.sidebar.slider("Max open positions", 1, 20, 5, step=1)
 kill_switch = st.sidebar.checkbox("Stop trading switch", value=False)
 allowed_symbols = tuple(s.strip().upper() for s in allowed_symbols_text.split(",") if s.strip())
 
-st.sidebar.markdown("### 6. Paper Order Controls")
+st.sidebar.markdown("### 5. Paper Account")
 reset_paper_broker = st.sidebar.button("Reset paper account")
 emergency_disable_session = st.sidebar.button("Stop trading now")
-enable_alpaca_paper_orders = st.sidebar.checkbox("Allow Alpaca paper orders", value=False)
-confirm_alpaca_paper_order = st.sidebar.checkbox("Confirm next paper buy", value=False)
-confirm_alpaca_paper_cancel = st.sidebar.checkbox("Confirm next paper cancel", value=False)
-confirm_alpaca_paper_exit = st.sidebar.checkbox("Confirm next paper exit", value=False)
+enable_alpaca_paper_orders = st.sidebar.checkbox("Use Alpaca paper account", value=False)
 
-st.sidebar.markdown("### 7. Automation")
-automation_level_options = [
-    "Manual review only",
-    "Auto exits only",
-    "Auto entries and exits",
-]
-automation_level = st.sidebar.selectbox("Automation level", automation_level_options, index=0)
+st.sidebar.markdown("### 6. Automation")
+automation_level_options = {
+    "Manual - I click paper orders": "Manual review only",
+    "Auto exits - app sells paper positions": "Auto exits only",
+    "Auto entries and exits - preview only": "Auto entries and exits",
+}
+automation_level_label = st.sidebar.selectbox("Automation level", list(automation_level_options.keys()), index=0)
+automation_level = automation_level_options[automation_level_label]
 st.sidebar.caption(
-    "Manual review only sends nothing automatically. Auto exits only can send paper sell orders for open Alpaca paper positions."
-)
-automatic_exits_started = st.sidebar.checkbox(
-    "Start automatic paper exits",
-    value=False,
-    disabled=automation_level != "Auto exits only",
+    "Paper trading is the sandbox. Auto exits can sell open Alpaca paper positions when the exit rule triggers."
 )
 if automation_level == "Auto entries and exits":
     st.sidebar.caption("Auto entries and exits is preview-only in this version. It will not send paper buy orders yet.")
 
-st.sidebar.markdown("### 8. Research Tools")
+st.sidebar.markdown("### Research Loops")
 run_walk_forward = st.sidebar.checkbox("Test on newer price data", value=True)
 train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step=5) / 100
 run_parameter_loop = st.sidebar.checkbox("Compare nearby strategy settings", value=False)
 max_parameter_candidates = st.sidebar.slider("Settings to compare", 4, 16, 8, step=4)
 
-st.sidebar.markdown("### 9. Setup Quality Inputs")
+st.sidebar.markdown("### Research Inputs")
 st.sidebar.caption("Trend and risk approval are always included. The selected strategy adds either breakout or pullback inputs.")
 setup_inputs = {
     "breakout_strength": st.sidebar.checkbox("Breakout strength", value=True),
@@ -528,11 +521,6 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["session_audit_events"] = []
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
-    st.session_state["armed_alpaca_preview_hash"] = None
-    st.session_state["armed_alpaca_cancel_hash"] = None
-    st.session_state["armed_alpaca_cancel_order_id"] = None
-    st.session_state["armed_alpaca_exit_hash"] = None
-    st.session_state["armed_alpaca_exit_symbol"] = None
     st.session_state["auto_exit_sent_hashes"] = []
     st.session_state["last_auto_exit_decision_key"] = None
     st.session_state["tracked_alpaca_orders"] = []
@@ -545,11 +533,6 @@ if reset_paper_broker:
     st.session_state["session_audit_events"] = []
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
-    st.session_state["armed_alpaca_preview_hash"] = None
-    st.session_state["armed_alpaca_cancel_hash"] = None
-    st.session_state["armed_alpaca_cancel_order_id"] = None
-    st.session_state["armed_alpaca_exit_hash"] = None
-    st.session_state["armed_alpaca_exit_symbol"] = None
     st.session_state["auto_exit_sent_hashes"] = []
     st.session_state["last_auto_exit_decision_key"] = None
     st.session_state["tracked_alpaca_orders"] = []
@@ -558,11 +541,6 @@ if reset_paper_broker:
 st.session_state.setdefault("shadow_decisions", [])
 st.session_state.setdefault("paper_session_id", new_session_id())
 st.session_state.setdefault("paper_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
-st.session_state.setdefault("armed_alpaca_preview_hash", None)
-st.session_state.setdefault("armed_alpaca_cancel_hash", None)
-st.session_state.setdefault("armed_alpaca_cancel_order_id", None)
-st.session_state.setdefault("armed_alpaca_exit_hash", None)
-st.session_state.setdefault("armed_alpaca_exit_symbol", None)
 st.session_state.setdefault("auto_exit_sent_hashes", [])
 st.session_state.setdefault("last_auto_exit_decision_key", None)
 st.session_state.setdefault("tracked_alpaca_orders", [])
@@ -849,8 +827,6 @@ alpaca_preview = build_alpaca_order_preview(intent, execution_decision, alpaca_a
 duplicate_alpaca_reasons = duplicate_exposure_reasons(intent, alpaca_positions)
 open_order_reasons = open_order_exposure_reasons(intent, alpaca_orders)
 duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_hash, tracked_alpaca_orders)
-armed_alpaca_hash = st.session_state.get("armed_alpaca_preview_hash")
-alpaca_preview_armed = armed_alpaca_hash == alpaca_preview.preview_hash
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
 cancelable_alpaca_orders = cancelable_alpaca_order_records(alpaca_orders)
 buy_preview_ready = (
@@ -870,7 +846,7 @@ operator_state = operator_state_record(
     broker_state_stale=alpaca_state_health.stale,
     alpaca_enabled=enable_alpaca_paper_orders,
     buy_preview_ready=buy_preview_ready,
-    buy_preview_armed=alpaca_preview_armed,
+    buy_preview_armed=buy_preview_ready,
     exit_preview_count=len(exit_previews),
     cancelable_order_count=len(cancelable_alpaca_orders),
     open_position_count=len(alpaca_positions),
@@ -895,7 +871,7 @@ with trade_desk_tab:
     st.info(f"Next action: {operator_state['Next Action']}")
     st.dataframe(pd.DataFrame(setup_scorecard_rows), use_container_width=True, hide_index=True)
     if intent is None:
-        st.info("No trade to review right now. The strategy is waiting.")
+        st.info("No trade right now. The strategy is waiting.")
     else:
         proposal_cols = st.columns(4)
         metric_card(proposal_cols[0], "Symbol", intent.symbol_clean, intent.side.upper())
@@ -970,9 +946,9 @@ with readiness_tab:
 if show_portfolio_evidence:
     with st.expander("Safety summary", expanded=False):
         st.markdown("- Alpaca is the target broker, but live orders are still disabled.")
-        st.markdown("- Paper orders require paper mode, passed risk checks, a connected account, review, and confirmation.")
+        st.markdown("- Paper orders require paper mode, passed risk checks, a connected paper account, and the paper account switch.")
         st.markdown("- The app cannot let the agent change risk rules, credentials, order code, or the stop-trading switch.")
-        st.markdown("- Live automation should stay off until paper trading has been reviewed carefully.")
+        st.markdown("- Live automation stays blocked while paper trading is being tested.")
         st.dataframe(pd.DataFrame(production_readiness_checks()), use_container_width=True, hide_index=True)
         st.dataframe(pd.DataFrame(immutable_boundary_records()), use_container_width=True, hide_index=True)
         st.markdown("#### Broker failure examples")
@@ -1168,7 +1144,7 @@ st.markdown(
 if preflight_check.blocked_reasons:
     show_blockers("Why not", preflight_check.blocked_reasons)
 elif execution_decision.requires_manual_approval:
-    st.info("The trade passed risk checks. You still need to review it before sending anything.")
+    st.info("The trade passed risk checks. Use the paper trading section to send it.")
 if show_portfolio_evidence:
     policy_tabs = st.tabs(["Risk limits", "Rule-by-rule checks"])
     with policy_tabs[0]:
@@ -1190,7 +1166,7 @@ if show_portfolio_evidence and not checks_df.empty:
     st.markdown("#### Risk check details")
     st.dataframe(checks_df, use_container_width=True, hide_index=True)
 
-page_section("4. Paper trading controls", "Review Alpaca paper orders here. Nothing is sent unless paper mode, review, and confirmation all pass.")
+page_section("4. Paper trading", "Send, exit, or cancel Alpaca paper orders from one place. Detailed records stay in Portfolio Evidence.")
 st.info(f"{operator_state['State']}: {operator_state['Next Action']}")
 with st.expander("Alpaca connection and account", expanded=False):
     broker_summary_rows = [
@@ -1324,11 +1300,11 @@ alpaca_base_disabled = (
     or duplicate_preview_submitted
 )
 if intent is not None:
-    sub_section("4.2 Review paper buy order")
+    sub_section("4.2 Send paper buy order")
     if show_portfolio_evidence:
         st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_preview)), use_container_width=True, hide_index=True)
     elif alpaca_preview.valid:
-        st.info(f"Ready to review: buy {alpaca_preview.order.get('quantity', '')} {alpaca_preview.order.get('symbol', '')}.")
+        st.info(f"Ready: buy {alpaca_preview.order.get('quantity', '')} {alpaca_preview.order.get('symbol', '')} in Alpaca paper.")
     if alpaca_preview.blocked_reasons:
         show_blockers("Order blocked", alpaca_preview.blocked_reasons)
     if duplicate_alpaca_reasons:
@@ -1339,36 +1315,19 @@ if intent is not None:
         st.warning("This paper order is already tracked in the app.")
     if alpaca_state_health.stale:
         st.warning("Refresh Alpaca positions and orders before sending this.")
-    elif not duplicate_alpaca_reasons and not open_order_reasons and not duplicate_preview_submitted and alpaca_preview_armed:
-        st.success("Reviewed. This exact order is ready to send after confirmation.")
-    elif armed_alpaca_hash:
-        st.warning("The order changed. Review it again before sending.")
-
-arm_disabled = alpaca_base_disabled
-if st.button("Review Paper Buy Order", disabled=arm_disabled):
-    st.session_state["armed_alpaca_preview_hash"] = alpaca_preview.preview_hash
-    arm_event = AuditEvent(
-        event_type="alpaca_paper_order_armed",
-        message="Alpaca paper order preview armed for one matching submission.",
-        payload={"preview_hash": alpaca_preview.preview_hash, **alpaca_preview.order},
-    )
-    st.session_state["session_audit_events"].append(arm_event)
-    if persist_audit_log:
-        audit_store.append(arm_event)
-    st.rerun()
+    elif not duplicate_alpaca_reasons and not open_order_reasons and not duplicate_preview_submitted:
+        st.success("Paper buy is ready to send.")
 
 alpaca_submit_disabled = (
     alpaca_base_disabled
     or not alpaca_status.can_submit_orders
-    or not alpaca_preview_armed
-    or not confirm_alpaca_paper_order
 )
-if st.button("Send Paper Buy Order to Alpaca", disabled=alpaca_submit_disabled):
+if st.button("Send Paper Buy to Alpaca", disabled=alpaca_submit_disabled):
     try:
         alpaca_order = alpaca_adapter.submit_order(
             intent,
             execution_decision,
-            expected_preview_hash=armed_alpaca_hash,
+            expected_preview_hash=alpaca_preview.preview_hash,
         )
         alpaca_event = AuditEvent(
             event_type="alpaca_paper_order_submitted",
@@ -1394,13 +1353,11 @@ if st.button("Send Paper Buy Order to Alpaca", disabled=alpaca_submit_disabled):
             }
             st.session_state["tracked_alpaca_orders"].append(tracked_record)
             broker_state_store.upsert(tracked_record)
-        st.session_state["armed_alpaca_preview_hash"] = None
         st.session_state["session_audit_events"].append(alpaca_event)
         if persist_audit_log:
             audit_store.append(alpaca_event)
         st.success("Paper buy order sent to Alpaca.")
     except Exception as exc:
-        st.session_state["armed_alpaca_preview_hash"] = None
         alpaca_event = AuditEvent(
             event_type="alpaca_paper_order_blocked",
             message=str(exc),
@@ -1605,7 +1562,6 @@ exit_blockers_by_hash_for_auto = {
 auto_exit_status = auto_exit_decision(
     automation_level=automation_level,
     execution_mode=execution_mode,
-    automatic_exits_started=automatic_exits_started,
     broker_connected=alpaca_status.connected,
     broker_can_submit=alpaca_status.can_submit_orders,
     paper_orders_enabled=enable_alpaca_paper_orders,
@@ -1616,8 +1572,16 @@ auto_exit_status = auto_exit_decision(
     exit_blockers=exit_blockers_by_hash_for_auto,
     already_sent_hashes=set(st.session_state.get("auto_exit_sent_hashes", [])),
 )
-sub_section("4.7 Auto exit status")
-st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), use_container_width=True, hide_index=True)
+sub_section("4.7 Automation status")
+auto_exit_reason_text = "; ".join(auto_exit_status.reasons)
+if automation_level == "Manual review only":
+    st.info("Automation is off. You click paper order buttons manually.")
+elif auto_exit_status.ready:
+    st.success(f"Auto exits can sell {auto_exit_status.quantity} {auto_exit_status.symbol} in Alpaca paper.")
+else:
+    st.warning(f"{auto_exit_status.status}: {auto_exit_reason_text}")
+if show_portfolio_evidence:
+    st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), use_container_width=True, hide_index=True)
 if automation_level == "Auto entries and exits":
     st.info("Auto entries and exits is preview-only in this version. The app will not auto-submit buy orders yet.")
 auto_exit_key = (
@@ -1732,7 +1696,7 @@ if auto_exit_status.ready:
         st.error(f"Automatic paper exit blocked: {exc}")
 
 if exit_previews:
-    sub_section("4.8 Exit paper position")
+    sub_section("4.8 Sell paper position")
     exit_options = [
         f"{preview.order.get('symbol', '')} {preview.order.get('side', '')} {preview.order.get('quantity', 0)} ({preview.preview_hash})"
         for preview in exit_previews
@@ -1746,7 +1710,7 @@ if exit_previews:
     if show_portfolio_evidence:
         st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_exit_preview)), use_container_width=True, hide_index=True)
     elif alpaca_exit_preview.valid:
-        st.info(f"Ready to review: sell {alpaca_exit_preview.order.get('quantity', '')} {alpaca_exit_preview.order.get('symbol', '')}.")
+        st.info(f"Ready: sell {alpaca_exit_preview.order.get('quantity', '')} {alpaca_exit_preview.order.get('symbol', '')} in Alpaca paper.")
 
     exit_symbol = str(alpaca_exit_preview.order.get("symbol", "")).strip().upper()
     selected_exit_position = next(
@@ -1770,15 +1734,11 @@ if exit_previews:
         mode="paper",
         approved_for_execution=True,
         requires_manual_approval=False,
-        reason="Exit preview approved; paper submission remains manually gated.",
+        reason="Paper exit passed the exit checks.",
         risk_check=RiskCheckResult(approved=True, rejected_reasons=[], checks={"exit_position": True}),
     )
     exit_position_blockers = exit_position_reasons(alpaca_exit_preview, alpaca_positions)
     duplicate_exit_reasons = open_exit_order_reasons(alpaca_exit_preview, alpaca_orders)
-    armed_exit_hash = st.session_state.get("armed_alpaca_exit_hash")
-    armed_exit_symbol = st.session_state.get("armed_alpaca_exit_symbol")
-    alpaca_exit_armed = armed_exit_hash == alpaca_exit_preview.preview_hash and armed_exit_symbol == exit_symbol
-
     if alpaca_exit_preview.blocked_reasons:
         show_blockers("Exit blocked", alpaca_exit_preview.blocked_reasons)
     if exit_position_blockers:
@@ -1787,10 +1747,8 @@ if exit_previews:
         show_blockers("Exit blocked", duplicate_exit_reasons)
     if alpaca_state_health.stale:
         st.warning("Refresh Alpaca positions and orders before sending this exit.")
-    elif alpaca_exit_armed:
-        st.success("Reviewed. This exact exit order is ready to send after confirmation.")
-    elif armed_exit_hash:
-        st.warning("The exit order changed. Review it again before sending.")
+    elif not exit_position_blockers and not duplicate_exit_reasons and alpaca_exit_preview.valid:
+        st.success("Paper exit is ready to send.")
 
     exit_base_disabled = (
         selected_exit_intent is None
@@ -1802,31 +1760,16 @@ if exit_previews:
         or bool(exit_position_blockers)
         or bool(duplicate_exit_reasons)
     )
-    if st.button("Review Paper Exit Order", disabled=exit_base_disabled):
-        st.session_state["armed_alpaca_exit_hash"] = alpaca_exit_preview.preview_hash
-        st.session_state["armed_alpaca_exit_symbol"] = exit_symbol
-        exit_arm_event = AuditEvent(
-            event_type="alpaca_paper_exit_armed",
-            message="Alpaca paper exit preview armed for one matching submission.",
-            payload={"preview_hash": alpaca_exit_preview.preview_hash, **alpaca_exit_preview.order},
-        )
-        st.session_state["session_audit_events"].append(exit_arm_event)
-        if persist_audit_log:
-            audit_store.append(exit_arm_event)
-        st.rerun()
-
     alpaca_exit_submit_disabled = (
         exit_base_disabled
         or not alpaca_status.can_submit_orders
-        or not alpaca_exit_armed
-        or not confirm_alpaca_paper_exit
     )
     if st.button("Send Paper Exit to Alpaca", disabled=alpaca_exit_submit_disabled):
         try:
             alpaca_exit_order = alpaca_adapter.submit_order(
                 selected_exit_intent,
                 exit_decision,
-                expected_preview_hash=armed_exit_hash,
+                expected_preview_hash=alpaca_exit_preview.preview_hash,
             )
             exit_event = AuditEvent(
                 event_type="alpaca_paper_exit_submitted",
@@ -1852,15 +1795,11 @@ if exit_previews:
                 }
                 st.session_state["tracked_alpaca_orders"].append(tracked_record)
                 broker_state_store.upsert(tracked_record)
-            st.session_state["armed_alpaca_exit_hash"] = None
-            st.session_state["armed_alpaca_exit_symbol"] = None
             st.session_state["session_audit_events"].append(exit_event)
             if persist_audit_log:
                 audit_store.append(exit_event)
             st.success("Paper exit sent to Alpaca.")
         except Exception as exc:
-            st.session_state["armed_alpaca_exit_hash"] = None
-            st.session_state["armed_alpaca_exit_symbol"] = None
             exit_event = AuditEvent(
                 event_type="alpaca_paper_exit_blocked",
                 message=str(exc),
@@ -1870,7 +1809,7 @@ if exit_previews:
             if persist_audit_log:
                 audit_store.append(exit_event)
             st.error(f"Paper exit blocked: {exc}")
-    st.caption("This contacts Alpaca paper only after review and confirmation.")
+    st.caption("This contacts Alpaca paper only.")
 
 if cancelable_alpaca_orders:
     sub_section("4.9 Cancel paper order")
@@ -1893,16 +1832,8 @@ if cancelable_alpaca_orders:
         st.warning("Refresh Alpaca positions and orders before canceling.")
 
     selected_cancel_order_id = selected_cancel_order.get("Alpaca Order ID") or selected_cancel_order.get("Broker Order ID", "")
-    armed_cancel_hash = st.session_state.get("armed_alpaca_cancel_hash")
-    armed_cancel_order_id = st.session_state.get("armed_alpaca_cancel_order_id")
-    alpaca_cancel_armed = (
-        armed_cancel_hash == alpaca_cancel_preview.preview_hash
-        and armed_cancel_order_id == selected_cancel_order_id
-    )
-    if alpaca_cancel_armed:
-        st.success("Reviewed. This exact cancel request is ready to send after confirmation.")
-    elif armed_cancel_hash:
-        st.warning("The cancel request changed. Review it again before sending.")
+    if alpaca_cancel_preview.valid and not alpaca_state_health.stale:
+        st.success("Paper cancel is ready to send.")
 
     cancel_base_disabled = (
         execution_mode != "paper"
@@ -1911,30 +1842,15 @@ if cancelable_alpaca_orders:
         or alpaca_state_health.stale
         or not alpaca_cancel_preview.valid
     )
-    if st.button("Review Paper Cancel", disabled=cancel_base_disabled):
-        st.session_state["armed_alpaca_cancel_hash"] = alpaca_cancel_preview.preview_hash
-        st.session_state["armed_alpaca_cancel_order_id"] = selected_cancel_order_id
-        cancel_arm_event = AuditEvent(
-            event_type="alpaca_paper_cancel_armed",
-            message="Alpaca paper cancel preview armed for one matching cancellation.",
-            payload={"cancel_preview_hash": alpaca_cancel_preview.preview_hash, **alpaca_cancel_preview.cancel},
-        )
-        st.session_state["session_audit_events"].append(cancel_arm_event)
-        if persist_audit_log:
-            audit_store.append(cancel_arm_event)
-        st.rerun()
-
     alpaca_cancel_submit_disabled = (
         cancel_base_disabled
         or not alpaca_status.can_submit_orders
-        or not alpaca_cancel_armed
-        or not confirm_alpaca_paper_cancel
     )
     if st.button("Send Paper Cancel to Alpaca", disabled=alpaca_cancel_submit_disabled):
         try:
             cancel_result = alpaca_adapter.cancel_order(
                 selected_cancel_order_id,
-                expected_cancel_hash=armed_cancel_hash,
+                expected_cancel_hash=alpaca_cancel_preview.preview_hash,
             )
             cancel_event = AuditEvent(
                 event_type="alpaca_paper_cancel_submitted",
@@ -1956,15 +1872,11 @@ if cancelable_alpaca_orders:
                 "submitted_at": selected_cancel_order.get("Submitted", ""),
             })
             st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
-            st.session_state["armed_alpaca_cancel_hash"] = None
-            st.session_state["armed_alpaca_cancel_order_id"] = None
             st.session_state["session_audit_events"].append(cancel_event)
             if persist_audit_log:
                 audit_store.append(cancel_event)
             st.success("Paper cancel sent to Alpaca.")
         except Exception as exc:
-            st.session_state["armed_alpaca_cancel_hash"] = None
-            st.session_state["armed_alpaca_cancel_order_id"] = None
             cancel_event = AuditEvent(
                 event_type="alpaca_paper_cancel_blocked",
                 message=str(exc),
@@ -1977,7 +1889,7 @@ if cancelable_alpaca_orders:
             if persist_audit_log:
                 audit_store.append(cancel_event)
             st.error(f"Paper cancel blocked: {exc}")
-    st.caption("This contacts Alpaca paper only after review and confirmation.")
+    st.caption("This contacts Alpaca paper only.")
 
 if intent is not None and execution_mode != "paper":
     st.caption("Switch execution mode to Paper trading to enable paper order submission.")
@@ -1986,9 +1898,9 @@ elif intent is not None and not preflight_check.ready:
 elif can_submit:
     st.caption("Paper orders use the strategy reference price and never contact a live broker.")
 if intent is not None:
-    st.caption("Alpaca paper orders require paper mode, a real ticker, connected Alpaca paper credentials, review, and confirmation.")
+    st.caption("Alpaca paper orders require paper mode, a real ticker, connected Alpaca paper credentials, and the paper account switch.")
 
-with st.expander("Check what automation would do - no orders sent", expanded=False):
+with st.expander("Automation check", expanded=False):
     automation_decision = paper_automation_dry_run(
         intent=intent,
         risk_check=risk_check,
@@ -1998,7 +1910,7 @@ with st.expander("Check what automation would do - no orders sent", expanded=Fal
         idempotency_blocked=duplicate_preview_submitted,
     )
     if automation_decision.ready:
-        st.success("The app found an action it would queue for your review. No order was sent.")
+        st.success("The app found a paper action that is ready.")
     else:
         st.info("No automation action is ready right now.")
         show_blockers("Reason", automation_decision.reasons)
@@ -2037,7 +1949,7 @@ with st.expander("Check what automation would do - no orders sent", expanded=Fal
             use_container_width=True,
             hide_index=True,
         )
-        st.markdown("#### Orders the app would ask you to review")
+        st.markdown("#### Paper actions ready")
         st.dataframe(pd.DataFrame(automation_candidates), use_container_width=True, hide_index=True)
     automation_halt_rows = risk_halt_records(
         monitoring_result=monitoring_result,
@@ -2091,9 +2003,9 @@ with st.expander("Check what automation would do - no orders sent", expanded=Fal
         dry_run_snapshots_loaded=len(recent_automation_snapshots),
     )
     gate_summary = {row["Check"]: row for row in paper_automation_gate_rows}
-    final_gate = gate_summary.get("Can ask for paper review", {})
+    final_gate = gate_summary.get("Paper automation can run", {})
     if final_gate.get("Passed"):
-        st.success("No hard automation blocks found. Any order would still require your review.")
+        st.success("No hard automation blocks found.")
     elif final_gate.get("Detail"):
         st.warning(str(final_gate.get("Detail")))
     if show_portfolio_evidence:
@@ -2157,7 +2069,7 @@ with st.expander("Check what automation would do - no orders sent", expanded=Fal
     if show_portfolio_evidence:
         st.markdown("#### Saved automation checks")
         st.dataframe(pd.DataFrame(automation_evidence_records(recent_automation_snapshots)), use_container_width=True, hide_index=True)
-    st.caption("This check never submits, exits, or cancels broker orders.")
+    st.caption("This check records what automation sees. It does not submit, exit, or cancel broker orders.")
 
 position_records = paper_broker.position_records()
 order_records = paper_broker.order_records()
