@@ -69,6 +69,35 @@ class AutomationRuntimeState:
     blocked_reason: str
 
 
+def strategy_settings_match(current: dict | None, entry: dict | None) -> bool:
+    if not current or not entry:
+        return False
+    keys = [
+        "symbol",
+        "interval",
+        "history",
+        "strategy_type",
+        "entry_window",
+        "exit_window",
+        "atr_stop_multiplier",
+        "risk_per_trade_pct",
+        "moving_average_window",
+        "pullback_average_length",
+        "momentum_turn_length",
+    ]
+    return all(str(current.get(key, "")).strip().lower() == str(entry.get(key, "")).strip().lower() for key in keys)
+
+
+def strategy_settings_match_reason(current: dict | None, entry: dict | None) -> str:
+    if strategy_settings_match(current, entry):
+        return "Exit settings match the buy settings."
+    if not entry:
+        return "No saved buy settings for this position; auto exit is paused."
+    if not current:
+        return "Current settings are unavailable; auto exit is paused."
+    return "Settings changed since entry; auto exit is paused."
+
+
 class AutomationDryRunStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else DEFAULT_AUTOMATION_DRY_RUN_PATH
@@ -135,8 +164,12 @@ def auto_exit_decision(
     kill_switch_enabled: bool,
     broker_state_stale: bool,
     market_open: bool,
+    strategy_exit_ready: bool,
+    strategy_exit_reason: str,
     exit_preview_records: list[dict],
     exit_blockers: dict[str, list[str]],
+    entry_settings_match: bool = True,
+    entry_settings_reason: str = "",
     already_sent_hashes: set[str] | None = None,
 ) -> AutoExitDecision:
     reasons: list[str] = []
@@ -157,6 +190,10 @@ def auto_exit_decision(
         reasons.append("Refresh Alpaca positions and orders.")
     if not market_open:
         reasons.append("Market is closed; automatic exits wait for market hours.")
+    if not strategy_exit_ready:
+        reasons.append(strategy_exit_reason or "Strategy exit rule is not triggered.")
+    if not entry_settings_match:
+        reasons.append(entry_settings_reason or "Settings changed since entry; auto exit is paused.")
     if not exit_preview_records:
         reasons.append("No paper exit is available.")
 
@@ -178,7 +215,14 @@ def auto_exit_decision(
     reasons = list(dict.fromkeys(reason for reason in reasons if reason))
     if reasons:
         status = "Off" if automation_level == "Manual review only" else "Blocked"
-        if exit_preview_records and not reasons[:1] == ["Automation level is Manual review only."]:
+        strategy_wait_reason = strategy_exit_reason or "Strategy exit rule is not triggered."
+        if (
+            automation_level != "Manual review only"
+            and exit_preview_records
+            and reasons == [strategy_wait_reason]
+        ):
+            status = "Waiting for exit signal"
+        elif exit_preview_records and not reasons[:1] == ["Automation level is Manual review only."]:
             status = "Exit blocked"
         elif not exit_preview_records and automation_level != "Manual review only":
             status = "Watching position"

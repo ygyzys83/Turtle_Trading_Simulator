@@ -506,7 +506,12 @@ def market_session_advisory(now: datetime | None = None) -> dict:
     regular_open = time(9, 30) <= current.time() <= time(16, 0)
     open_now = is_weekday and regular_open
     message = "Regular US equity session is open." if open_now else "Regular US equity session appears closed; paper market orders may queue."
-    return {"Market Session": "open" if open_now else "closed_or_extended", "Timestamp": current.isoformat(), "Message": message}
+    return {
+        "Market Session": "open" if open_now else "closed_or_extended",
+        "Open": open_now,
+        "Timestamp": current.isoformat(),
+        "Message": message,
+    }
 
 
 class BrokerStateStore:

@@ -23,6 +23,8 @@ from agentloop_trader.automation import (
     paper_automation_candidate_records,
     evidence_dashboard_records,
     paper_automation_dry_run,
+    strategy_settings_match,
+    strategy_settings_match_reason,
 )
 from agentloop_trader.backtest import (
     simulate_trend_pullback_strategy,
@@ -129,8 +131,13 @@ from agentloop_trader.shadow import record_shadow_decision, shadow_records
 from agentloop_trader.ui_summary import (
     agent_loop_stage_records,
     agent_decision_summary,
+    buy_requirement_records,
     compact_status_records,
+    no_buy_reason,
     operator_state_record,
+    optional_quality_input_records,
+    optional_sell_quality_records,
+    sell_requirement_records,
     setup_scorecard_records,
     strategy_context_records,
 )
@@ -227,16 +234,20 @@ def fetch_stock_data(ticker, period, interval):
     if missing:
         raise ValueError(f"Missing columns: {', '.join(missing)}")
 
-    data = data[required].dropna()
+    available_columns = required + (["Volume"] if "Volume" in data.columns else [])
+    data = data[available_columns].dropna(subset=required)
     if data.empty:
         raise ValueError(f"No usable rows for {clean}.")
 
     if interval == "4h":
-        data = data.resample("4h").agg({
+        aggregations = {
             "Close": "last",
             "High": "max",
             "Low": "min",
-        }).dropna()
+        }
+        if "Volume" in data.columns:
+            aggregations["Volume"] = "sum"
+        data = data.resample("4h").agg(aggregations).dropna(subset=required)
 
     data.attrs["symbol"] = clean
     return data
@@ -270,6 +281,57 @@ def plain_yes_no(value: bool) -> str:
 def count_waiting_alpaca_orders(order_rows: list[dict]) -> int:
     waiting_statuses = {"accepted", "new", "pending_new", "partially_filled"}
     return sum(str(row.get("Status", "")).strip().lower() in waiting_statuses for row in order_rows)
+
+
+def saved_buy_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
+    clean_symbol = str(symbol).strip().upper()
+    matching_buys = [
+        order
+        for order in tracked_orders
+        if str(order.get("symbol", "")).strip().upper() == clean_symbol
+        and str(order.get("side", "")).strip().lower() == "buy"
+        and order.get("strategy_settings")
+    ]
+    return dict(matching_buys[-1].get("strategy_settings", {})) if matching_buys else None
+
+
+def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
+    clean_symbol = str(symbol).strip().upper()
+    matching_buys = [
+        order
+        for order in tracked_orders
+        if str(order.get("symbol", "")).strip().upper() == clean_symbol
+        and str(order.get("side", "")).strip().lower() == "buy"
+        and (order.get("exit_settings") or order.get("strategy_settings"))
+    ]
+    if not matching_buys:
+        return None
+    latest = matching_buys[-1]
+    return dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
+
+
+def update_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict], exit_settings: dict) -> list[dict]:
+    clean_symbol = str(symbol).strip().upper()
+    updated = []
+    matched = False
+    for order in tracked_orders:
+        record = dict(order)
+        if str(record.get("symbol", "")).strip().upper() == clean_symbol and str(record.get("side", "")).strip().lower() == "buy":
+            record["exit_settings"] = dict(exit_settings)
+            matched = True
+        updated.append(record)
+    if not matched:
+        placeholder = {
+            "broker_order_id": f"managed-exit-{clean_symbol}",
+            "symbol": clean_symbol,
+            "side": "buy",
+            "quantity": "",
+            "status": "managed_exit_settings",
+            "source": "position_exit_settings",
+            "exit_settings": dict(exit_settings),
+        }
+        updated.append(placeholder)
+    return updated
 
 
 def alpaca_order_row_id(row: dict) -> str:
@@ -383,11 +445,27 @@ workspace_mode = st.sidebar.radio(
 )
 show_portfolio_evidence = workspace_mode == "Portfolio Evidence"
 
+st.sidebar.markdown("### Automation")
+automation_level_options = {
+    "Manual - I click paper orders": "Manual review only",
+    "Auto exits - app sells paper positions": "Auto exits only",
+    "Auto entries and exits - app trades paper": "Auto entries and exits",
+}
+automation_level_label = st.sidebar.selectbox("Automation level", list(automation_level_options.keys()), index=0)
+automation_level = automation_level_options[automation_level_label]
+st.sidebar.caption(
+    "Auto exits manages open positions. Auto entries and exits is experimental until multi-ticker research is added."
+)
+if automation_level == "Auto entries and exits":
+    st.sidebar.caption("Auto entries can buy the ticker currently loaded in the research screen.")
+
 st.sidebar.markdown("### 1. Ticker and Price Data")
 data_source = st.sidebar.radio("Prices to use", ["Synthetic", "Stock via yfinance"], horizontal=True)
 market_data = None
 source_caption = "synthetic price data"
 ticker = "SYNTH"
+interval = "1d"
+period = "synthetic"
 
 if data_source == "Stock via yfinance":
     ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
@@ -561,20 +639,6 @@ st.sidebar.markdown("### 5. Paper Account")
 reset_paper_broker = st.sidebar.button("Reset paper account")
 emergency_disable_session = st.sidebar.button("Stop trading now")
 enable_alpaca_paper_orders = st.sidebar.checkbox("Use Alpaca paper account", value=False)
-
-st.sidebar.markdown("### 6. Automation")
-automation_level_options = {
-    "Manual - I click paper orders": "Manual review only",
-    "Auto exits - app sells paper positions": "Auto exits only",
-    "Auto entries and exits - app trades paper": "Auto entries and exits",
-}
-automation_level_label = st.sidebar.selectbox("Automation level", list(automation_level_options.keys()), index=0)
-automation_level = automation_level_options[automation_level_label]
-st.sidebar.caption(
-    "Paper trading is the sandbox. Auto exits can sell open Alpaca paper positions when the exit rule triggers."
-)
-if automation_level == "Auto entries and exits":
-    st.sidebar.caption("Auto entries and exits can send paper buys and paper exits when strategy and risk checks pass.")
 
 st.sidebar.markdown("### Research Loops")
 run_walk_forward = st.sidebar.checkbox("Test on newer price data", value=True)
@@ -775,6 +839,76 @@ current_strategy_config = StrategyConfig(
     risk_per_trade_pct=risk_pct,
     moving_average_window=ma_w,
 )
+current_strategy_settings = {
+    "symbol": ticker,
+    "interval": interval,
+    "history": period,
+    "strategy_type": strategy_type,
+    "strategy_label": strategy_label,
+    "account_size": account,
+    "entry_window": entry_w,
+    "exit_window": exit_w,
+    "atr_stop_multiplier": atr_mult,
+    "risk_per_trade_pct": risk_pct,
+    "moving_average_window": ma_w,
+    "pullback_average_length": pullback_w,
+    "momentum_turn_length": momentum_w,
+}
+current_exit_settings = dict(current_strategy_settings)
+current_exit_settings["auto_exit_enabled"] = True
+
+
+def evaluate_exit_rule_from_settings(settings: dict | None) -> tuple[bool, str]:
+    if not settings:
+        return False, "No saved exit settings for this position; auto exit is paused."
+    if not bool(settings.get("auto_exit_enabled", True)):
+        return False, "Auto exit is off for this position."
+    try:
+        symbol = str(settings.get("symbol", "")).strip().upper()
+        history = str(settings.get("history", "1y"))
+        saved_interval = str(settings.get("interval", "1d"))
+        saved_strategy_type = str(settings.get("strategy_type", "breakout"))
+        saved_account = float(settings.get("account_size") or account)
+        saved_exit_w = int(settings.get("exit_window") or exit_w)
+        saved_atr_mult = float(settings.get("atr_stop_multiplier") or atr_mult)
+        saved_risk_dec = float(settings.get("risk_per_trade_pct") or risk_pct) / 100
+        saved_ma_w = int(settings.get("moving_average_window") or ma_w)
+        saved_pullback_w = int(settings.get("pullback_average_length") or pullback_w)
+        saved_momentum_w = int(settings.get("momentum_turn_length") or momentum_w)
+        saved_entry_w = int(settings.get("entry_window") or entry_w)
+        if not symbol:
+            return False, "Saved exit settings do not include a ticker."
+        if history == "synthetic":
+            return False, "Saved exit settings use synthetic data; auto exit needs real ticker data."
+        data = fetch_stock_data(symbol, history, saved_interval)
+        if saved_strategy_type == "pullback":
+            _, _, _, _, saved_live, _, _ = simulate_trend_pullback_strategy(
+                account=saved_account,
+                pullback_w=saved_pullback_w,
+                exit_w=saved_exit_w,
+                atr_mult=saved_atr_mult,
+                risk_pct_dec=saved_risk_dec,
+                trend_w=saved_ma_w,
+                momentum_w=saved_momentum_w,
+                seed=None,
+                market_data=data,
+            )
+        else:
+            _, _, _, _, saved_live, _, _ = simulate_turtle_strategy(
+                account=saved_account,
+                entry_w=saved_entry_w,
+                exit_w=saved_exit_w,
+                atr_mult=saved_atr_mult,
+                risk_pct_dec=saved_risk_dec,
+                ma_w=saved_ma_w,
+                seed=None,
+                market_data=data,
+            )
+        return bool(saved_live.get("exit_ready", False)), str(saved_live.get("exit_reason", "Strategy exit rule is not triggered."))
+    except Exception as exc:
+        return False, f"Could not check saved exit rule: {exc}"
+
+
 parameter_candidates = []
 recommended_candidate = None
 parameter_loop_error = None
@@ -944,6 +1078,21 @@ open_order_reasons = open_order_exposure_reasons(intent, alpaca_orders)
 duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_hash, tracked_alpaca_orders)
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
 cancelable_alpaca_orders = cancelable_alpaca_order_records(alpaca_orders)
+first_exit_preview = next((preview for preview in exit_previews if preview.valid), None)
+first_exit_symbol = str(first_exit_preview.order.get("symbol", "")).strip().upper() if first_exit_preview else ""
+saved_exit_settings = saved_exit_settings_for_symbol(first_exit_symbol, tracked_alpaca_orders) if first_exit_symbol else None
+auto_exit_enabled_for_position = bool(saved_exit_settings.get("auto_exit_enabled", True)) if saved_exit_settings else False
+exit_settings_available = True if not first_exit_symbol else bool(saved_exit_settings and auto_exit_enabled_for_position)
+managed_exit_ready, managed_exit_reason = evaluate_exit_rule_from_settings(saved_exit_settings) if first_exit_symbol else (False, "No Alpaca paper position is waiting for auto-exit.")
+exit_settings_reason = (
+    "No Alpaca paper position is waiting for auto-exit."
+    if not first_exit_symbol
+    else "Auto exit is off for this position."
+    if saved_exit_settings and not auto_exit_enabled_for_position
+    else "Saved exit settings are loaded for this position."
+    if exit_settings_available
+    else "No saved exit settings for this position; auto exit is paused."
+)
 buy_preview_ready = (
     intent is not None
     and preflight_check.ready
@@ -1259,6 +1408,32 @@ else:
 sub_section("3.1 Setup quality")
 st.dataframe(pd.DataFrame(setup_scorecard_rows), use_container_width=True, hide_index=True)
 
+with st.expander("Required for BUY vs quality checks", expanded=False):
+    st.markdown("#### Required for BUY")
+    st.dataframe(pd.DataFrame(buy_requirement_records(live)), use_container_width=True, hide_index=True)
+    st.caption("Every required BUY rule must pass before the app can create a BUY intent.")
+    st.markdown("#### Quality checks only")
+    st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), use_container_width=True, hide_index=True)
+    st.caption("Quality checks help you judge the setup. They do not create a BUY intent by themselves.")
+
+with st.expander("Required for SELL vs quality checks", expanded=False):
+    st.markdown("#### Required for automatic SELL")
+    st.dataframe(
+        pd.DataFrame(
+            sell_requirement_records(
+                live,
+                exit_preview_count=len(exit_previews),
+                exit_settings_saved=exit_settings_available if first_exit_symbol else None,
+            )
+        ),
+        use_container_width=True,
+        hide_index=True,
+    )
+    st.caption("Every required SELL rule must pass before the app can send an automatic paper sell.")
+    st.markdown("#### Quality checks only")
+    st.dataframe(pd.DataFrame(optional_sell_quality_records(setup_inputs)), use_container_width=True, hide_index=True)
+    st.caption("Quality checks help you review the position. They do not create an automatic SELL by themselves.")
+
 lp = round(float(live["last_p"]), 2)
 dh = round(float(live["don_high"]), 2)
 dl = round(float(live["don_low"]), 2)
@@ -1297,7 +1472,10 @@ with st.expander("Agent trade idea", expanded=False):
         st.markdown(f"- {item}")
 
 sub_section("3.2 Final answer")
-if preflight_check.blocked_reasons or risk_check.rejected_reasons:
+if intent is None:
+    final_answer = "WAIT"
+    final_detail = no_buy_reason(live)
+elif preflight_check.blocked_reasons or risk_check.rejected_reasons:
     final_answer = "BLOCK"
     final_detail = (preflight_check.blocked_reasons or risk_check.rejected_reasons)[0]
 elif intent is not None and preflight_check.ready:
@@ -1312,6 +1490,8 @@ st.markdown(
     f"<span style='color:{answer_color};font-weight:700'>{final_answer}</span> - {final_detail}",
     unsafe_allow_html=True,
 )
+if intent is None:
+    st.info(final_detail)
 preflight_color = "#3B6D11" if preflight_check.ready else "#A32D2D"
 st.markdown(
     f"**{operator_state['State']}:** "
@@ -1407,7 +1587,149 @@ with st.expander("Local simulator account", expanded=False):
     metric_card(portfolio_cols[1], "Session P&L", f"${session_pnl:,.2f}", "Since last reset", session_color)
     metric_card(portfolio_cols[2], "Simulator exposure", f"${paper_positions_notional:,.2f}", "Book value")
 
-sub_section("4.1 Account safety")
+sub_section("4.1 Open positions", "Select a paper position and manage its own exit automation settings.")
+if alpaca_positions:
+    position_options = [
+        f"{str(position.get('Symbol', '')).strip().upper()} qty {position.get('Quantity', '')}"
+        for position in alpaca_positions
+    ]
+    selected_position_idx = st.selectbox(
+        "Alpaca paper position",
+        range(len(position_options)),
+        format_func=lambda idx: position_options[idx],
+    )
+    selected_position = alpaca_positions[selected_position_idx]
+    selected_position_symbol = str(selected_position.get("Symbol", "")).strip().upper()
+    selected_entry_settings = saved_buy_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"])
+    selected_exit_settings = (
+        saved_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"])
+        or selected_entry_settings
+        or {**current_exit_settings, "symbol": selected_position_symbol}
+    )
+
+    try:
+        selected_avg_entry = float(selected_position.get("Average Entry") or 0)
+    except (TypeError, ValueError):
+        selected_avg_entry = 0.0
+    position_cols = st.columns(4)
+    metric_card(position_cols[0], "Symbol", selected_position_symbol, "Alpaca paper")
+    metric_card(position_cols[1], "Quantity", selected_position.get("Quantity", ""), "Current position")
+    metric_card(position_cols[2], "Avg entry", f"${selected_avg_entry:,.2f}", "From Alpaca")
+    metric_card(position_cols[3], "Auto exit", "On" if selected_exit_settings.get("auto_exit_enabled", True) else "Off", "Position setting")
+
+    with st.expander("Entry and exit settings for selected position", expanded=False):
+        st.markdown("#### Saved entry settings")
+        if selected_entry_settings:
+            st.dataframe(
+                pd.DataFrame([{"Setting": key.replace("_", " ").title(), "Value": value} for key, value in selected_entry_settings.items()]),
+                use_container_width=True,
+                hide_index=True,
+            )
+        else:
+            st.caption("No saved entry settings found for this position.")
+
+        with st.form(f"exit_settings_{selected_position_symbol}"):
+            st.markdown("#### Edit exit settings")
+            exit_auto_enabled = st.checkbox(
+                "Auto exit this position",
+                value=bool(selected_exit_settings.get("auto_exit_enabled", True)),
+                key=f"auto_exit_enabled_{selected_position_symbol}",
+            )
+            exit_strategy_options = {
+                "Breakout continuation": "breakout",
+                "Trend pullback continuation": "pullback",
+            }
+            default_exit_strategy = str(selected_exit_settings.get("strategy_type", strategy_type))
+            default_exit_strategy_label = next(
+                (label for label, value in exit_strategy_options.items() if value == default_exit_strategy),
+                strategy_label,
+            )
+            edited_exit_strategy_label = st.selectbox(
+                "Exit strategy",
+                list(exit_strategy_options.keys()),
+                index=list(exit_strategy_options.keys()).index(default_exit_strategy_label),
+                key=f"exit_strategy_{selected_position_symbol}",
+            )
+            edited_exit_strategy_type = exit_strategy_options[edited_exit_strategy_label]
+            edited_exit_window = st.slider(
+                "Sell exit length (bars)",
+                5,
+                30,
+                int(selected_exit_settings.get("exit_window", exit_w)),
+                step=5,
+                key=f"exit_window_{selected_position_symbol}",
+            )
+            edited_atr_mult = st.slider(
+                "Stop distance (ATR multiplier)",
+                1.0,
+                4.0,
+                float(selected_exit_settings.get("atr_stop_multiplier", atr_mult)),
+                step=0.5,
+                key=f"exit_atr_mult_{selected_position_symbol}",
+            )
+            edited_trend_filter = st.slider(
+                "Trend filter length (bars)",
+                50,
+                300,
+                int(selected_exit_settings.get("moving_average_window", ma_w)),
+                step=50,
+                key=f"exit_trend_filter_{selected_position_symbol}",
+            )
+            edited_pullback_length = st.slider(
+                "Pullback average length (bars)",
+                10,
+                50,
+                int(selected_exit_settings.get("pullback_average_length", pullback_w)),
+                step=5,
+                key=f"exit_pullback_length_{selected_position_symbol}",
+            )
+            edited_momentum_length = st.slider(
+                "Momentum turn length (bars)",
+                3,
+                20,
+                int(selected_exit_settings.get("momentum_turn_length", momentum_w)),
+                step=1,
+                key=f"exit_momentum_length_{selected_position_symbol}",
+            )
+            save_exit_settings = st.form_submit_button("Save Exit Settings For This Position")
+
+        if save_exit_settings:
+            edited_exit_settings = {
+                **selected_exit_settings,
+                "symbol": selected_position_symbol,
+                "strategy_type": edited_exit_strategy_type,
+                "strategy_label": edited_exit_strategy_label,
+                "exit_window": edited_exit_window,
+                "atr_stop_multiplier": edited_atr_mult,
+                "moving_average_window": edited_trend_filter,
+                "pullback_average_length": edited_pullback_length,
+                "momentum_turn_length": edited_momentum_length,
+                "auto_exit_enabled": exit_auto_enabled,
+            }
+            updated_orders = update_exit_settings_for_symbol(
+                selected_position_symbol,
+                st.session_state["tracked_alpaca_orders"],
+                edited_exit_settings,
+            )
+            broker_state_store.replace_all(updated_orders)
+            st.session_state["tracked_alpaca_orders"] = updated_orders
+            settings_event = AuditEvent(
+                event_type="position_exit_settings_saved",
+                message="Exit settings saved for an Alpaca paper position.",
+                payload={
+                    "symbol": selected_position_symbol,
+                    "exit_settings": edited_exit_settings,
+                    "broker_writes_submitted": 0,
+                },
+            )
+            st.session_state["session_audit_events"].append(settings_event)
+            if persist_audit_log:
+                audit_store.append(settings_event)
+            st.rerun()
+else:
+    st.caption("No Alpaca paper positions are open.")
+
+sub_section("4.2 Account safety")
 monitor_color = {"OK": "#3B6D11", "WARN": "#8A6D1D", "BREACH": "#A32D2D"}.get(monitoring_result.status, "inherit")
 monitor_label = {"OK": "OK", "WARN": "Needs attention", "BREACH": "Blocked"}.get(monitoring_result.status, monitoring_result.status)
 current_market_advisory = market_session_advisory()
@@ -1441,7 +1763,7 @@ for alert in monitoring_result.alerts:
     else:
         st.caption(alert)
 
-sub_section("4.2 Paper actions")
+sub_section("4.3 Manual paper actions", "Use these buttons when you want to send, sell, or cancel Alpaca paper orders yourself.")
 can_submit = intent is not None and execution_mode == "paper"
 submit_disabled = intent is None or not preflight_check.ready or execution_mode != "paper"
 with st.expander("Local simulator order - does not contact Alpaca", expanded=False):
@@ -1479,7 +1801,7 @@ alpaca_base_disabled = (
     or duplicate_preview_submitted
 )
 if intent is not None:
-    st.markdown("#### Send paper buy order")
+    st.markdown("#### Manual paper buy")
     if show_portfolio_evidence:
         st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_preview)), use_container_width=True, hide_index=True)
     elif alpaca_preview.valid:
@@ -1517,6 +1839,8 @@ if st.button("Send Paper Buy to Alpaca", disabled=alpaca_submit_disabled):
                 "quantity": intent.quantity,
                 "preview_hash": alpaca_preview.preview_hash,
                 "broker_order_id": str(getattr(alpaca_order, "id", "")),
+                "strategy_settings": current_strategy_settings,
+                "exit_settings": current_exit_settings,
             },
         )
         broker_order_id = str(getattr(alpaca_order, "id", ""))
@@ -1529,6 +1853,8 @@ if st.button("Send Paper Buy to Alpaca", disabled=alpaca_submit_disabled):
                 "quantity": intent.quantity,
                 "status": str(getattr(alpaca_order, "status", "")),
                 "submitted_at": str(getattr(alpaca_order, "submitted_at", "")),
+                "strategy_settings": current_strategy_settings,
+                "exit_settings": current_exit_settings,
             }
             st.session_state["tracked_alpaca_orders"].append(tracked_record)
             broker_state_store.upsert(tracked_record)
@@ -1772,11 +2098,15 @@ auto_exit_status = auto_exit_decision(
     kill_switch_enabled=effective_kill_switch,
     broker_state_stale=alpaca_state_health.stale,
     market_open=bool(current_market_advisory.get("Open", False)),
+    strategy_exit_ready=managed_exit_ready,
+    strategy_exit_reason=managed_exit_reason,
     exit_preview_records=exit_preview_rows_for_auto,
     exit_blockers=exit_blockers_by_hash_for_auto,
+    entry_settings_match=exit_settings_available,
+    entry_settings_reason=exit_settings_reason,
     already_sent_hashes=set(st.session_state.get("auto_exit_sent_hashes", [])),
 )
-sub_section("4.3 Automation status")
+sub_section("4.4 Automation status")
 automation_checked_at = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
 if automation_level == "Manual review only":
     st.info("Automation is off. You click paper order buttons manually.")
@@ -1788,6 +2118,13 @@ else:
     visible_status = auto_entry_status.status if automation_level == "Auto entries and exits" else auto_exit_status.status
     visible_reasons = auto_entry_status.reasons if automation_level == "Auto entries and exits" else auto_exit_status.reasons
     st.warning(f"{visible_status}: {'; '.join(visible_reasons)}")
+if automation_level == "Auto entries and exits":
+    st.caption(
+        "Automatic paper buys use Section 4.4, not the manual button in Section 4.3. "
+        "They send only when the market is open, Alpaca paper is connected, risk checks pass, and the app reruns."
+    )
+elif automation_level == "Auto exits only":
+    st.caption("Auto exits can sell Alpaca paper positions. New paper buys still require the manual button in Section 4.3.")
 runtime_state = AutomationRuntimeState(
     mode=automation_level_label,
     status=(
@@ -1977,6 +2314,8 @@ if (not auto_exit_status.ready) and auto_entry_status.ready:
                 "status": str(getattr(alpaca_auto_entry_order, "status", "")),
                 "submitted_at": str(getattr(alpaca_auto_entry_order, "submitted_at", "")),
                 "source": "auto_entries_and_exits",
+                "strategy_settings": current_strategy_settings,
+                "exit_settings": current_exit_settings,
             }
             st.session_state["tracked_alpaca_orders"].append(tracked_record)
             broker_state_store.upsert(tracked_record)
@@ -1995,6 +2334,8 @@ if (not auto_exit_status.ready) and auto_entry_status.ready:
                 "automation_level": automation_level,
                 "checked_at": automation_checked_at,
                 "broker_writes_submitted": 1,
+                "strategy_settings": current_strategy_settings,
+                "exit_settings": current_exit_settings,
             },
         )
         st.session_state["session_audit_events"].append(auto_entry_submit_event)

@@ -1,8 +1,13 @@
 from agentloop_trader.ui_summary import (
     agent_decision_summary,
     agent_loop_stage_records,
+    buy_requirement_records,
     compact_status_records,
+    no_buy_reason,
     operator_state_record,
+    optional_quality_input_records,
+    optional_sell_quality_records,
+    sell_requirement_records,
     setup_scorecard_records,
     strategy_context_records,
 )
@@ -195,3 +200,55 @@ def test_setup_scorecard_records_show_pullback_core_inputs():
     assert reads["Overall"]["Status"] == "A"
     assert reads["Pullback"]["Status"] == "Controlled"
     assert reads["Momentum turn"]["Status"] == "Yes"
+
+
+def test_buy_requirement_records_separate_hard_buy_rules():
+    rows = buy_requirement_records(
+        {
+            "buy_requirements": {
+                "Price above entry level": False,
+                "Trend filter rising": True,
+            }
+        }
+    )
+    rules = {row["Required BUY Rule"]: row for row in rows}
+
+    assert rules["Trend filter rising"]["Status"] == "Pass"
+    assert rules["Price above entry level"]["Status"] == "Not met"
+    assert "must pass" in rules["Price above entry level"]["Plain English"]
+
+
+def test_optional_quality_input_records_do_not_claim_to_create_buy():
+    rows = optional_quality_input_records({"volume": True, "rsi": True, "market_condition": False})
+    inputs = {row["Quality Input"]: row for row in rows}
+
+    assert inputs["Volume"]["Creates BUY?"] == "No"
+    assert inputs["RSI"]["Creates BUY?"] == "No"
+    assert "Market condition" not in inputs
+
+
+def test_no_buy_reason_prefers_strategy_reason():
+    assert no_buy_reason({"no_trade_reason": "No BUY because momentum has not turned up."}) == (
+        "No BUY because momentum has not turned up."
+    )
+
+
+def test_sell_requirement_records_separate_hard_sell_rules():
+    rows = sell_requirement_records(
+        {"sell_requirements": {"Price below pullback average": False}},
+        exit_preview_count=1,
+        exit_settings_saved=True,
+    )
+    rules = {row["Required SELL Rule"]: row for row in rows}
+
+    assert rules["Price below pullback average"]["Status"] == "Not met"
+    assert rules["Alpaca paper position can be sold"]["Status"] == "Pass"
+    assert rules["Saved exit settings are available"]["Status"] == "Pass"
+
+
+def test_optional_sell_quality_records_do_not_claim_to_create_sell():
+    rows = optional_sell_quality_records({"volume": True, "rsi": True})
+    inputs = {row["Quality Input"]: row for row in rows}
+
+    assert inputs["Volume"]["Creates SELL?"] == "No"
+    assert inputs["RSI"]["Creates SELL?"] == "No"

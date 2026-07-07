@@ -54,6 +54,97 @@ def test_latest_bar_breakout_generates_trade_intent():
     assert live["signal"] == "long"
     assert live["trade_intent"] is not None
     assert live["trade_intent"].symbol == "TEST"
+    assert live["no_trade_reason"] == "BUY intent is present."
+    assert all(live["buy_requirements"].values())
+
+
+def test_simulated_open_trade_does_not_block_latest_buy_intent():
+    prices = list(range(100, 150))
+    market_data = pd.DataFrame(
+        {
+            "Close": prices,
+            "High": [p + 0.25 for p in prices],
+            "Low": [p - 0.25 for p in prices],
+            "Volume": [1_000_000] * len(prices),
+        },
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="D"),
+    )
+    market_data.attrs["symbol"] = "REAL"
+
+    _, _, _, _, live, _, _ = simulate_turtle_strategy(
+        account=50_000,
+        entry_w=5,
+        exit_w=3,
+        atr_mult=2.0,
+        risk_pct_dec=0.01,
+        ma_w=5,
+        seed=None,
+        market_data=market_data,
+    )
+
+    assert live["in_simulated_trade"] is True
+    assert live["signal"] == "long"
+    assert live["trade_intent"] is not None
+    assert "simulated open trade" not in live["buy_requirements"]
+    assert live["no_trade_reason"] == "BUY intent is present."
+
+
+def test_latest_bar_breakout_explains_missing_buy_intent():
+    prices = [130 - i for i in range(30)]
+    market_data = pd.DataFrame(
+        {
+            "Close": prices,
+            "High": [p + 0.25 for p in prices],
+            "Low": [p - 0.25 for p in prices],
+            "Volume": [1_000_000] * len(prices),
+        },
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="D"),
+    )
+    market_data.attrs["symbol"] = "WAIT"
+
+    _, _, _, _, live, _, _ = simulate_turtle_strategy(
+        account=50_000,
+        entry_w=5,
+        exit_w=3,
+        atr_mult=2.0,
+        risk_pct_dec=0.01,
+        ma_w=5,
+        seed=None,
+        market_data=market_data,
+    )
+
+    assert live["trade_intent"] is None
+    assert live["buy_requirements"]["Price above 5-bar high"] is False
+    assert live["no_trade_reason"] == "No BUY because price is not above the 5-bar entry level."
+
+
+def test_real_market_volume_feeds_setup_quality():
+    prices = list(range(100, 150))
+    market_data = pd.DataFrame(
+        {
+            "Close": prices,
+            "High": [p + 0.25 for p in prices],
+            "Low": [p - 0.25 for p in prices],
+            "Volume": [1_000_000] * (len(prices) - 1) + [2_000_000],
+        },
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="D"),
+    )
+    market_data.attrs["symbol"] = "VOL"
+
+    _, _, _, _, live, _, _ = simulate_turtle_strategy(
+        account=50_000,
+        entry_w=10,
+        exit_w=5,
+        atr_mult=2.0,
+        risk_pct_dec=0.01,
+        ma_w=20,
+        seed=None,
+        market_data=market_data,
+    )
+
+    assert live["volume_status"] in {"Normal", "Strong"}
+    assert live["volume_confirmed"] is True
+    assert live["liquidity_status"] in {"Good", "Usable", "Thin"}
 
 
 def test_trend_pullback_backtest_returns_expected_contract():
@@ -106,6 +197,8 @@ def test_latest_bar_trend_pullback_generates_trade_intent():
     assert live["signal"] == "long"
     assert live["trade_intent"] is not None
     assert live["trade_intent"].symbol == "PULL"
+    assert live["no_trade_reason"] == "BUY intent is present."
+    assert all(live["buy_requirements"].values())
 
 
 def test_strategy_comparison_records_are_display_ready():

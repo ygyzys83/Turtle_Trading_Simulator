@@ -364,6 +364,14 @@ def test_market_session_advisory_identifies_weekend_closed():
     advisory = market_session_advisory(datetime(2026, 7, 5, 16, 0, tzinfo=UTC))
 
     assert advisory["Market Session"] == "closed_or_extended"
+    assert advisory["Open"] is False
+
+
+def test_market_session_advisory_exposes_regular_open_flag():
+    advisory = market_session_advisory(datetime(2026, 7, 7, 18, 0, tzinfo=UTC))
+
+    assert advisory["Market Session"] == "open"
+    assert advisory["Open"] is True
 
 
 def test_simulated_alpaca_fill_order_marks_local_lifecycle_without_broker_write():

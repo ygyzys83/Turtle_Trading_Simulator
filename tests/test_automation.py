@@ -13,6 +13,8 @@ from agentloop_trader.automation import (
     evidence_dashboard_records,
     paper_automation_candidate_records,
     paper_automation_dry_run,
+    strategy_settings_match,
+    strategy_settings_match_reason,
 )
 from agentloop_trader.broker_governance import BrokerStateHealth
 from agentloop_trader.models import PreflightCheckResult, RiskCheckResult, TradeIntent
@@ -58,6 +60,8 @@ def test_auto_exit_decision_is_ready_when_all_conditions_pass():
         kill_switch_enabled=False,
         broker_state_stale=False,
         market_open=True,
+        strategy_exit_ready=True,
+        strategy_exit_reason="Exit rule triggered.",
         exit_preview_records=[{"Symbol": "AAPL", "Quantity": "10", "Review ID": "exit-1", "Valid": True}],
         exit_blockers={},
         already_sent_hashes=set(),
@@ -67,6 +71,74 @@ def test_auto_exit_decision_is_ready_when_all_conditions_pass():
     assert decision.ready
     assert decision.status == "Exit ready"
     assert records["Symbol"] == "AAPL"
+
+
+def test_auto_exit_decision_waits_when_strategy_exit_rule_is_not_triggered():
+    decision = auto_exit_decision(
+        automation_level="Auto entries and exits",
+        execution_mode="paper",
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=True,
+        strategy_exit_ready=False,
+        strategy_exit_reason="Hold because price is above the 20-bar pullback average.",
+        exit_preview_records=[{"Symbol": "IBM", "Quantity": "62", "Review ID": "exit-ibm", "Valid": True}],
+        exit_blockers={},
+        already_sent_hashes=set(),
+    )
+
+    assert not decision.ready
+    assert decision.status == "Waiting for exit signal"
+    assert "Hold because price is above the 20-bar pullback average." in decision.reasons
+
+
+def test_auto_exit_decision_blocks_when_entry_settings_changed():
+    decision = auto_exit_decision(
+        automation_level="Auto entries and exits",
+        execution_mode="paper",
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=True,
+        strategy_exit_ready=True,
+        strategy_exit_reason="Exit rule triggered.",
+        exit_preview_records=[{"Symbol": "IBM", "Quantity": "62", "Review ID": "exit-ibm", "Valid": True}],
+        exit_blockers={},
+        entry_settings_match=False,
+        entry_settings_reason="Settings changed since entry; auto exit is paused.",
+        already_sent_hashes=set(),
+    )
+
+    assert not decision.ready
+    assert decision.status == "Exit blocked"
+    assert "Settings changed since entry" in decision.reasons[-1]
+
+
+def test_strategy_settings_match_compares_entry_and_current_settings():
+    entry = {
+        "symbol": "IBM",
+        "interval": "4h",
+        "history": "1y",
+        "strategy_type": "pullback",
+        "entry_window": 10,
+        "exit_window": 10,
+        "atr_stop_multiplier": 2.0,
+        "risk_per_trade_pct": 1.0,
+        "moving_average_window": 200,
+        "pullback_average_length": 20,
+        "momentum_turn_length": 5,
+    }
+    current = dict(entry)
+
+    assert strategy_settings_match(current, entry)
+    current["exit_window"] = 5
+    assert not strategy_settings_match(current, entry)
+    assert strategy_settings_match_reason(current, entry) == "Settings changed since entry; auto exit is paused."
 
 
 def test_auto_exit_decision_blocks_manual_mode_and_closed_market():
@@ -79,6 +151,8 @@ def test_auto_exit_decision_blocks_manual_mode_and_closed_market():
         kill_switch_enabled=False,
         broker_state_stale=False,
         market_open=False,
+        strategy_exit_ready=False,
+        strategy_exit_reason="Strategy exit rule is not triggered.",
         exit_preview_records=[{"Symbol": "AAPL", "Quantity": "10", "Review ID": "exit-1", "Valid": True}],
         exit_blockers={},
         already_sent_hashes=set(),
@@ -98,6 +172,8 @@ def test_auto_exit_decision_blocks_backtest_mode():
         kill_switch_enabled=False,
         broker_state_stale=False,
         market_open=True,
+        strategy_exit_ready=True,
+        strategy_exit_reason="Exit rule triggered.",
         exit_preview_records=[{"Symbol": "AAPL", "Quantity": "10", "Review ID": "exit-1", "Valid": True}],
         exit_blockers={},
         already_sent_hashes=set(),

@@ -287,10 +287,14 @@ def simulate_turtle_strategy(
     live_balance = balance + open_position_value
     pos_size = int((balance * risk_pct_dec) / (atr_mult * last_atr)) if last_atr else 0
 
+    entry_setup_ready = bool(last_p > dh_last and sma_up)
+    strategy_exit_ready = bool(last_p <= dl_last)
+    simulated_exit_ready = bool(in_trade and strategy_exit_ready)
+
     signal = "flat"
-    if not in_trade and last_p > dh_last and sma_up:
+    if entry_setup_ready:
         signal = "long"
-    elif in_trade and (last_p <= stop_price or last_p <= dl_last):
+    elif simulated_exit_ready:
         signal = "exit"
 
     proposed_trade_intent = None
@@ -310,6 +314,22 @@ def simulate_turtle_strategy(
             ],
         )
 
+    buy_requirements = {
+        f"Price above {entry_w}-bar high": last_p > dh_last,
+        f"{ma_w}-bar trend filter rising": sma_up,
+        "Position size above zero": pos_size > 0,
+    }
+    if proposed_trade_intent is not None:
+        no_trade_reason = "BUY intent is present."
+    elif last_p <= dh_last:
+        no_trade_reason = f"No BUY because price is not above the {entry_w}-bar entry level."
+    elif not sma_up:
+        no_trade_reason = f"No BUY because the {ma_w}-bar trend filter is not rising."
+    elif pos_size <= 0:
+        no_trade_reason = "No BUY because calculated share size is zero."
+    else:
+        no_trade_reason = "No BUY because the selected strategy rules are not fully met."
+
     live = _base_live_fields(
         prices=prices,
         smas=smas,
@@ -327,6 +347,18 @@ def simulate_turtle_strategy(
         strategy_name="Breakout continuation",
         setup_type="breakout",
     )
+    live["buy_requirements"] = buy_requirements
+    live["no_trade_reason"] = no_trade_reason
+    live["in_simulated_trade"] = in_trade
+    live["exit_ready"] = strategy_exit_ready
+    live["exit_reason"] = (
+        f"Exit now because price is at or below the {exit_w}-bar exit level."
+        if strategy_exit_ready
+        else f"Hold because price is above the {exit_w}-bar exit level."
+    )
+    live["sell_requirements"] = {
+        f"Price at or below {exit_w}-bar exit level": strategy_exit_ready,
+    }
 
     stats = _build_stats(account, balance, trade_log, equity_curve, exposure_bars, n_bars)
     return prices, smas, atrs, trade_log, live, stats, labels
@@ -371,21 +403,21 @@ def simulate_trend_pullback_strategy(
     start = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window)
     live_bar = n_bars - 1
 
-    def setup_at(i: int) -> tuple[bool, float | None, bool, bool]:
+    def setup_at(i: int) -> tuple[bool, float | None, bool, bool, bool]:
         p = float(prices[i])
         trend_sma = trend_smas[i]
         pullback_sma = pullback_smas[i]
         momentum_sma = momentum_smas[i]
         prev_momentum_sma = momentum_smas[i - 1] if i > 0 else None
         if trend_sma is None or pullback_sma is None or momentum_sma is None or prev_momentum_sma is None:
-            return False, None, False, False
+            return False, None, False, False, False
         prev_trend = trend_smas[i - 1] if i > 0 else trend_sma
         trend_ok = bool(p > trend_sma and trend_sma >= (prev_trend or trend_sma))
         recent_low = float(np.min(prices[max(0, i - pullback_w):i + 1]))
         pullback_depth = (p - recent_low) / p * 100 if p else None
         touched_pullback = recent_low <= pullback_sma * 1.02
         momentum_turn = bool(p > momentum_sma and momentum_sma >= prev_momentum_sma and p > prices[i - 1])
-        return trend_ok and touched_pullback and momentum_turn, pullback_depth, trend_ok, momentum_turn
+        return trend_ok and touched_pullback and momentum_turn, pullback_depth, trend_ok, touched_pullback, momentum_turn
 
     for i in range(start, live_bar):
         p = float(prices[i])
@@ -393,7 +425,7 @@ def simulate_trend_pullback_strategy(
         if atr is None:
             equity_curve.append(balance)
             continue
-        setup_ready, _, _, _ = setup_at(i)
+        setup_ready, _, _, _, _ = setup_at(i)
         exit_sma = pullback_smas[i]
 
         if not in_trade:
@@ -440,16 +472,19 @@ def simulate_trend_pullback_strategy(
     last_atr = atrs[-1]
     pullback_level = float(pullback_smas[-1]) if pullback_smas[-1] is not None else last_p
     exit_level = float(pullback_smas[-1]) if pullback_smas[-1] is not None else last_p
-    setup_ready, pullback_depth, trend_ok, momentum_turn = setup_at(live_bar)
+    setup_ready, pullback_depth, trend_ok, touched_pullback, momentum_turn = setup_at(live_bar)
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
     stop_distance = atr_mult * last_atr if last_atr else 0
     pos_size = int((balance * risk_pct_dec) / stop_distance) if stop_distance else 0
 
+    strategy_exit_ready = bool(last_p < exit_level)
+    simulated_exit_ready = bool(in_trade and strategy_exit_ready)
+
     signal = "flat"
-    if not in_trade and setup_ready:
+    if setup_ready:
         signal = "long"
-    elif in_trade and (last_p <= stop_price or last_p < exit_level):
+    elif simulated_exit_ready:
         signal = "exit"
 
     proposed_trade_intent = None
@@ -469,6 +504,25 @@ def simulate_trend_pullback_strategy(
                 "atr_position_sizing",
             ],
         )
+
+    buy_requirements = {
+        f"Price above {trend_w}-bar trend filter": trend_ok,
+        f"Pullback touched {pullback_w}-bar average": touched_pullback,
+        f"Momentum turned up above {momentum_w}-bar average": momentum_turn,
+        "Position size above zero": pos_size > 0,
+    }
+    if proposed_trade_intent is not None:
+        no_trade_reason = "BUY intent is present."
+    elif not trend_ok:
+        no_trade_reason = f"No BUY because price is not above the rising {trend_w}-bar trend filter."
+    elif not touched_pullback:
+        no_trade_reason = f"No BUY because price has not pulled back near the {pullback_w}-bar average."
+    elif not momentum_turn:
+        no_trade_reason = f"No BUY because momentum has not turned back up above the {momentum_w}-bar average."
+    elif pos_size <= 0:
+        no_trade_reason = "No BUY because calculated share size is zero."
+    else:
+        no_trade_reason = "No BUY because the selected strategy rules are not fully met."
 
     live = _base_live_fields(
         prices=prices,
@@ -491,6 +545,19 @@ def simulate_trend_pullback_strategy(
     )
     live["pullback_ready"] = setup_ready
     live["trend_ok"] = trend_ok
+    live["touched_pullback"] = touched_pullback
+    live["buy_requirements"] = buy_requirements
+    live["no_trade_reason"] = no_trade_reason
+    live["in_simulated_trade"] = in_trade
+    live["exit_ready"] = strategy_exit_ready
+    live["exit_reason"] = (
+        f"Exit now because price is below the {pullback_w}-bar pullback average."
+        if strategy_exit_ready
+        else f"Hold because price is above the {pullback_w}-bar pullback average."
+    )
+    live["sell_requirements"] = {
+        f"Price below {pullback_w}-bar pullback average": strategy_exit_ready,
+    }
 
     stats = _build_stats(account, balance, trade_log, equity_curve, exposure_bars, n_bars)
     return prices, trend_smas, atrs, trade_log, live, stats, labels

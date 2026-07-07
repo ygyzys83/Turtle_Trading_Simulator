@@ -248,6 +248,106 @@ def setup_scorecard_records(
     return rows
 
 
+def buy_requirement_records(live: dict) -> list[dict]:
+    requirements = live.get("buy_requirements") or {}
+    if not requirements:
+        return [
+            {
+                "Required BUY Rule": "Selected strategy rules",
+                "Status": "Unknown",
+                "Plain English": "The strategy did not provide a rule-by-rule BUY checklist.",
+            }
+        ]
+
+    rows = []
+    for rule, passed in requirements.items():
+        rows.append(
+            {
+                "Required BUY Rule": str(rule),
+                "Status": "Pass" if passed else "Not met",
+                "Plain English": "This must pass before the app can create a BUY intent.",
+            }
+        )
+    return rows
+
+
+def optional_quality_input_records(enabled_inputs: dict[str, bool] | None = None) -> list[dict]:
+    enabled = enabled_inputs or {}
+    descriptions = {
+        "breakout_strength": "Shows whether the breakout has enough distance above the entry level.",
+        "volume": "Shows whether the move is supported by normal or strong volume.",
+        "volatility": "Shows whether movement is quiet, normal, or wide.",
+        "room_above_exit": "Shows whether the setup has enough room above the exit line.",
+        "relative_strength": "Compares this ticker against the market benchmark when connected.",
+        "market_condition": "Checks whether the broad market supports new long trades when connected.",
+        "liquidity": "Checks whether the ticker trades enough dollar volume for clean fills.",
+        "event_risk": "Flags earnings or news risk when an event calendar is connected.",
+        "rsi": "Shows whether momentum is weak, healthy, strong, or stretched.",
+    }
+    labels = {
+        "breakout_strength": "Breakout strength",
+        "volume": "Volume",
+        "volatility": "Volatility",
+        "room_above_exit": "Room above exit",
+        "relative_strength": "Relative strength",
+        "market_condition": "Market condition",
+        "liquidity": "Liquidity",
+        "event_risk": "Event risk",
+        "rsi": "RSI",
+    }
+
+    rows = []
+    for key, description in descriptions.items():
+        if enabled.get(key, key in {"volatility", "room_above_exit"}):
+            rows.append(
+                {
+                    "Quality Input": labels[key],
+                    "Creates BUY?": "No",
+                    "Plain English": description,
+                }
+            )
+    return rows
+
+
+def sell_requirement_records(live: dict, exit_preview_count: int = 0, exit_settings_saved: bool | None = None) -> list[dict]:
+    requirements = dict(live.get("sell_requirements") or {})
+    requirements["Alpaca paper position can be sold"] = exit_preview_count > 0
+    if exit_settings_saved is not None:
+        requirements["Saved exit settings are available"] = exit_settings_saved
+
+    rows = []
+    for rule, passed in requirements.items():
+        rows.append(
+            {
+                "Required SELL Rule": str(rule),
+                "Status": "Pass" if passed else "Not met",
+                "Plain English": "This must pass before the app can send an automatic paper sell.",
+            }
+        )
+    return rows
+
+
+def optional_sell_quality_records(enabled_inputs: dict[str, bool] | None = None) -> list[dict]:
+    rows = optional_quality_input_records(enabled_inputs)
+    return [
+        {
+            "Quality Input": row["Quality Input"],
+            "Creates SELL?": "No",
+            "Plain English": row["Plain English"],
+        }
+        for row in rows
+    ]
+
+
+def no_buy_reason(live: dict) -> str:
+    reason = str(live.get("no_trade_reason") or "").strip()
+    if reason:
+        return reason
+    if live.get("trade_intent") is not None:
+        return "BUY intent is present."
+    return "No BUY because the selected strategy rules are not fully met."
+
+
 def agent_decision_summary(
     intent_present: bool,
     thesis: str,
