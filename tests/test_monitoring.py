@@ -53,11 +53,11 @@ def test_risk_halt_records_surface_breaches_and_stale_state():
         monitoring_result=MonitoringResult("BREACH", ["Kill Switch is on."], {}),
         broker_connected=False,
         broker_state_stale=True,
-        automation_ready_rows=[{"Check": "Stop trading off", "Passed": False, "Detail": "Stop trading is active."}],
+        automation_ready_rows=[{"Check": "Kill Switch off", "Passed": False, "Detail": "Kill Switch is on."}],
     )
     reasons = {row["Block"] for row in rows}
 
     assert "Risk limit hit" in reasons
     assert "Alpaca disconnected" in reasons
     assert "Refresh Alpaca" in reasons
-    assert "Stop trading off" in reasons
+    assert "Kill Switch off" in reasons

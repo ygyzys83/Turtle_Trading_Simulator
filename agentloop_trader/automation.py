@@ -50,6 +50,25 @@ class AutoExitDecision:
     reasons: list[str]
 
 
+@dataclass(frozen=True)
+class AutoEntryDecision:
+    status: str
+    ready: bool
+    preview_hash: str
+    symbol: str
+    quantity: str
+    reasons: list[str]
+
+
+@dataclass(frozen=True)
+class AutomationRuntimeState:
+    mode: str
+    status: str
+    last_checked_at: str
+    last_action: str
+    blocked_reason: str
+
+
 class AutomationDryRunStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else DEFAULT_AUTOMATION_DRY_RUN_PATH
@@ -124,8 +143,6 @@ def auto_exit_decision(
     already_sent_hashes = already_sent_hashes or set()
     if automation_level == "Manual review only":
         reasons.append("Automation level is Manual review only.")
-    if automation_level == "Auto entries and exits":
-        reasons.append("Auto entries and exits is preview-only in this version.")
     if execution_mode != "paper":
         reasons.append("How orders are handled must be Paper trading.")
     if not broker_connected:
@@ -133,7 +150,7 @@ def auto_exit_decision(
     if not broker_can_submit:
         reasons.append("Alpaca paper order submission is not available.")
     if not paper_orders_enabled:
-        reasons.append("Allow Alpaca paper orders is off.")
+        reasons.append("Use Alpaca paper account is off.")
     if kill_switch_enabled:
         reasons.append("Kill Switch is on.")
     if broker_state_stale:
@@ -183,6 +200,91 @@ def auto_exit_decision(
     )
 
 
+def auto_entry_decision(
+    automation_level: str,
+    execution_mode: str,
+    broker_connected: bool,
+    broker_can_submit: bool,
+    paper_orders_enabled: bool,
+    kill_switch_enabled: bool,
+    broker_state_stale: bool,
+    market_open: bool,
+    intent_present: bool,
+    risk_approved: bool,
+    preflight_ready: bool,
+    preview_valid: bool,
+    preview_hash: str,
+    symbol: str,
+    quantity: int | str,
+    blocked_reasons: list[str],
+    already_sent_hashes: set[str] | None = None,
+) -> AutoEntryDecision:
+    reasons: list[str] = []
+    already_sent_hashes = already_sent_hashes or set()
+    if automation_level == "Manual review only":
+        reasons.append("Automation level is Manual review only.")
+    if automation_level == "Auto exits only":
+        reasons.append("Auto entries are off.")
+    if execution_mode != "paper":
+        reasons.append("How orders are handled must be Paper trading.")
+    if not broker_connected:
+        reasons.append("Alpaca paper is not connected.")
+    if not broker_can_submit:
+        reasons.append("Alpaca paper order submission is not available.")
+    if not paper_orders_enabled:
+        reasons.append("Use Alpaca paper account is off.")
+    if kill_switch_enabled:
+        reasons.append("Kill Switch is on.")
+    if broker_state_stale:
+        reasons.append("Refresh Alpaca positions and orders.")
+    if not market_open:
+        reasons.append("Market is closed; automatic buys wait for market hours.")
+    if not intent_present:
+        reasons.append("No buy setup right now.")
+    if not risk_approved:
+        reasons.append("Risk check did not pass.")
+    if not preflight_ready:
+        reasons.append("Trade is blocked before broker submission.")
+    if not preview_valid:
+        reasons.append("Alpaca paper buy is not ready.")
+    reasons.extend(blocked_reasons)
+    if preview_hash and preview_hash in already_sent_hashes:
+        reasons.append("This exact auto buy was already sent.")
+
+    reasons = list(dict.fromkeys(reason for reason in reasons if reason))
+    if reasons:
+        status = "Off" if automation_level == "Manual review only" else "Buy blocked"
+        if not intent_present and automation_level == "Auto entries and exits":
+            status = "Waiting for buy setup"
+        return AutoEntryDecision(
+            status=status,
+            ready=False,
+            preview_hash=preview_hash,
+            symbol=symbol,
+            quantity=str(quantity),
+            reasons=reasons,
+        )
+    return AutoEntryDecision(
+        status="Buy ready",
+        ready=True,
+        preview_hash=preview_hash,
+        symbol=symbol,
+        quantity=str(quantity),
+        reasons=["Automatic paper buy can be sent now."],
+    )
+
+
+def auto_entry_decision_records(decision: AutoEntryDecision) -> list[dict]:
+    return [
+        {"Field": "Status", "Value": decision.status},
+        {"Field": "Ready To Send", "Value": decision.ready},
+        {"Field": "Symbol", "Value": decision.symbol},
+        {"Field": "Quantity", "Value": decision.quantity},
+        {"Field": "Review ID", "Value": decision.preview_hash},
+        {"Field": "Reason", "Value": "; ".join(decision.reasons)},
+    ]
+
+
 def auto_exit_decision_records(decision: AutoExitDecision) -> list[dict]:
     return [
         {"Field": "Status", "Value": decision.status},
@@ -191,6 +293,16 @@ def auto_exit_decision_records(decision: AutoExitDecision) -> list[dict]:
         {"Field": "Quantity", "Value": decision.quantity},
         {"Field": "Review ID", "Value": decision.preview_hash},
         {"Field": "Reason", "Value": "; ".join(decision.reasons)},
+    ]
+
+
+def automation_runtime_records(state: AutomationRuntimeState) -> list[dict]:
+    return [
+        {"Field": "Mode", "Value": state.mode},
+        {"Field": "Status", "Value": state.status},
+        {"Field": "Last Checked", "Value": state.last_checked_at},
+        {"Field": "Last Action", "Value": state.last_action},
+        {"Field": "Blocked Reason", "Value": state.blocked_reason},
     ]
 
 
@@ -300,7 +412,7 @@ def automation_readiness_records(
         {"Check": "Alpaca connected", "Passed": broker_connected, "Detail": "Alpaca is connected." if broker_connected else "Alpaca account is not connected."},
         {"Check": "Alpaca data current", "Passed": not broker_state_stale, "Detail": "Positions and orders are refreshed." if not broker_state_stale else "Refresh Alpaca before automation checks."},
         {"Check": "Paper orders allowed", "Passed": manual_order_gate_enabled, "Detail": "Paper orders are allowed." if manual_order_gate_enabled else "Paper orders are not allowed right now."},
-        {"Check": "Stop trading off", "Passed": not kill_switch_enabled, "Detail": "Stop trading is off." if not kill_switch_enabled else "Stop trading is on."},
+        {"Check": "Kill Switch off", "Passed": not kill_switch_enabled, "Detail": "Kill Switch is off." if not kill_switch_enabled else "Kill Switch is on."},
         {"Check": "Paper actions ready", "Passed": ready_candidates > 0, "Detail": f"{ready_candidates} paper action(s) ready; {broker_write_candidates} could contact Alpaca paper."},
     ]
 
@@ -399,15 +511,12 @@ def evidence_dashboard_records(audit_records: list[dict], tracked_orders: list[d
     )
     return [
         {"Metric": "Activity records loaded", "Value": len(audit_records)},
-        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted")},
-        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted")},
-        {"Metric": "Paper buys blocked", "Value": event_types.count("alpaca_paper_order_blocked")},
-        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
+        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")},
+        {"Metric": "Paper buys blocked", "Value": event_types.count("alpaca_paper_order_blocked") + event_types.count("auto_paper_entry_blocked")},
         {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
         {"Metric": "Paper cancels blocked", "Value": event_types.count("alpaca_paper_cancel_blocked")},
-        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted")},
         {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")},
-        {"Metric": "Paper exits blocked", "Value": event_types.count("alpaca_paper_exit_blocked")},
+        {"Metric": "Paper exits blocked", "Value": event_types.count("alpaca_paper_exit_blocked") + event_types.count("auto_paper_exit_blocked")},
         {"Metric": "Saved Alpaca orders", "Value": len(tracked_orders)},
         {"Metric": "Open Alpaca orders", "Value": lifecycle_statuses.count("open_at_alpaca")},
         {"Metric": "Filled Alpaca orders", "Value": tracked_statuses.count("filled")},

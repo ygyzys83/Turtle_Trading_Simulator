@@ -105,7 +105,7 @@ def test_paper_automation_gate_treats_dry_run_evidence_as_information():
             {"Check": "Automation check file", "Passed": True},
             {"Check": "Run summary file", "Passed": True},
         ],
-        readiness_rows=[{"Check": "Stop trading off", "Passed": True}],
+        readiness_rows=[{"Check": "Kill Switch off", "Passed": True}],
         halt_rows=[{"Block": "None", "Active": False}],
         dry_run_snapshots_loaded=0,
     )

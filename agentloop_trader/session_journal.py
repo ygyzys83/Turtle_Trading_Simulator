@@ -41,9 +41,9 @@ def session_summary_records(snapshot: PaperSessionSnapshot) -> list[dict]:
         {"Metric": "Saved Alpaca orders", "Value": len(snapshot.tracked_alpaca_orders)},
         {"Metric": "Filled Alpaca orders", "Value": alpaca_statuses.count("filled")},
         {"Metric": "Canceled Alpaca orders", "Value": alpaca_statuses.count("canceled") + alpaca_statuses.count("cancelled")},
-        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted")},
+        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")},
         {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
-        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted")},
+        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")},
     ]
 
 

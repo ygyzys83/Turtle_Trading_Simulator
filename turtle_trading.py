@@ -9,11 +9,15 @@ from agentloop_trader.audit_store import JsonlAuditStore
 from agentloop_trader.agents import build_trade_proposal, proposal_records
 from agentloop_trader.automation import (
     AutomationDryRunStore,
+    AutomationRuntimeState,
+    auto_entry_decision,
+    auto_entry_decision_records,
     auto_exit_decision,
     auto_exit_decision_records,
     automation_decision_records,
     automation_evidence_records,
     automation_readiness_records,
+    automation_runtime_records,
     automation_supervisor_dry_run_records,
     build_automation_snapshot,
     paper_automation_candidate_records,
@@ -562,7 +566,7 @@ st.sidebar.markdown("### 6. Automation")
 automation_level_options = {
     "Manual - I click paper orders": "Manual review only",
     "Auto exits - app sells paper positions": "Auto exits only",
-    "Auto entries and exits - preview only": "Auto entries and exits",
+    "Auto entries and exits - app trades paper": "Auto entries and exits",
 }
 automation_level_label = st.sidebar.selectbox("Automation level", list(automation_level_options.keys()), index=0)
 automation_level = automation_level_options[automation_level_label]
@@ -570,7 +574,7 @@ st.sidebar.caption(
     "Paper trading is the sandbox. Auto exits can sell open Alpaca paper positions when the exit rule triggers."
 )
 if automation_level == "Auto entries and exits":
-    st.sidebar.caption("Auto entries and exits is preview-only in this version. It will not send paper buy orders yet.")
+    st.sidebar.caption("Auto entries and exits can send paper buys and paper exits when strategy and risk checks pass.")
 
 st.sidebar.markdown("### Research Loops")
 run_walk_forward = st.sidebar.checkbox("Test on newer price data", value=True)
@@ -621,7 +625,11 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
     st.session_state["auto_exit_sent_hashes"] = []
+    st.session_state["auto_entry_sent_hashes"] = []
     st.session_state["last_auto_exit_decision_key"] = None
+    st.session_state["last_auto_entry_decision_key"] = None
+    st.session_state["last_automation_action"] = "None"
+    st.session_state["last_automation_blocked_reason"] = ""
     st.session_state["tracked_alpaca_orders"] = []
     st.session_state["simulated_alpaca_positions"] = []
 if reset_paper_broker:
@@ -633,7 +641,11 @@ if reset_paper_broker:
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
     st.session_state["auto_exit_sent_hashes"] = []
+    st.session_state["auto_entry_sent_hashes"] = []
     st.session_state["last_auto_exit_decision_key"] = None
+    st.session_state["last_auto_entry_decision_key"] = None
+    st.session_state["last_automation_action"] = "None"
+    st.session_state["last_automation_blocked_reason"] = ""
     st.session_state["tracked_alpaca_orders"] = []
     st.session_state["simulated_alpaca_positions"] = []
     st.session_state["session_disabled"] = False
@@ -641,7 +653,11 @@ st.session_state.setdefault("shadow_decisions", [])
 st.session_state.setdefault("paper_session_id", new_session_id())
 st.session_state.setdefault("paper_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
 st.session_state.setdefault("auto_exit_sent_hashes", [])
+st.session_state.setdefault("auto_entry_sent_hashes", [])
 st.session_state.setdefault("last_auto_exit_decision_key", None)
+st.session_state.setdefault("last_auto_entry_decision_key", None)
+st.session_state.setdefault("last_automation_action", "None")
+st.session_state.setdefault("last_automation_blocked_reason", "")
 st.session_state.setdefault("tracked_alpaca_orders", [])
 st.session_state.setdefault("simulated_alpaca_positions", [])
 audit_store = JsonlAuditStore(audit_log_path)
@@ -1281,6 +1297,21 @@ with st.expander("Agent trade idea", expanded=False):
         st.markdown(f"- {item}")
 
 sub_section("3.2 Final answer")
+if preflight_check.blocked_reasons or risk_check.rejected_reasons:
+    final_answer = "BLOCK"
+    final_detail = (preflight_check.blocked_reasons or risk_check.rejected_reasons)[0]
+elif intent is not None and preflight_check.ready:
+    final_answer = "TRADE"
+    final_detail = "Strategy setup and risk checks passed."
+else:
+    final_answer = "WAIT"
+    final_detail = "No valid trade setup right now."
+answer_color = {"TRADE": "#3B6D11", "WAIT": "#8A6D1D", "BLOCK": "#A32D2D"}[final_answer]
+st.markdown(
+    f"**Final answer:** "
+    f"<span style='color:{answer_color};font-weight:700'>{final_answer}</span> - {final_detail}",
+    unsafe_allow_html=True,
+)
 preflight_color = "#3B6D11" if preflight_check.ready else "#A32D2D"
 st.markdown(
     f"**{operator_state['State']}:** "
@@ -1707,6 +1738,31 @@ exit_blockers_by_hash_for_auto = {
     )
     for preview in exit_previews
 }
+auto_entry_blockers = (
+    list(alpaca_preview.blocked_reasons)
+    + duplicate_alpaca_reasons
+    + open_order_reasons
+    + (["This paper order is already tracked in the app."] if duplicate_preview_submitted else [])
+)
+auto_entry_status = auto_entry_decision(
+    automation_level=automation_level,
+    execution_mode=execution_mode,
+    broker_connected=alpaca_status.connected,
+    broker_can_submit=alpaca_status.can_submit_orders,
+    paper_orders_enabled=enable_alpaca_paper_orders,
+    kill_switch_enabled=effective_kill_switch,
+    broker_state_stale=alpaca_state_health.stale,
+    market_open=bool(current_market_advisory.get("Open", False)),
+    intent_present=intent is not None,
+    risk_approved=risk_check.approved,
+    preflight_ready=preflight_check.ready,
+    preview_valid=alpaca_preview.valid,
+    preview_hash=alpaca_preview.preview_hash,
+    symbol=intent.symbol_clean if intent else "",
+    quantity=intent.quantity if intent else "",
+    blocked_reasons=auto_entry_blockers,
+    already_sent_hashes=set(st.session_state.get("auto_entry_sent_hashes", [])),
+)
 auto_exit_status = auto_exit_decision(
     automation_level=automation_level,
     execution_mode=execution_mode,
@@ -1721,17 +1777,71 @@ auto_exit_status = auto_exit_decision(
     already_sent_hashes=set(st.session_state.get("auto_exit_sent_hashes", [])),
 )
 sub_section("4.3 Automation status")
-auto_exit_reason_text = "; ".join(auto_exit_status.reasons)
+automation_checked_at = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
 if automation_level == "Manual review only":
     st.info("Automation is off. You click paper order buttons manually.")
 elif auto_exit_status.ready:
     st.success(f"Auto exits can sell {auto_exit_status.quantity} {auto_exit_status.symbol} in Alpaca paper.")
+elif auto_entry_status.ready:
+    st.success(f"Auto entries and exits can buy {auto_entry_status.quantity} {auto_entry_status.symbol} in Alpaca paper.")
 else:
-    st.warning(f"{auto_exit_status.status}: {auto_exit_reason_text}")
+    visible_status = auto_entry_status.status if automation_level == "Auto entries and exits" else auto_exit_status.status
+    visible_reasons = auto_entry_status.reasons if automation_level == "Auto entries and exits" else auto_exit_status.reasons
+    st.warning(f"{visible_status}: {'; '.join(visible_reasons)}")
+runtime_state = AutomationRuntimeState(
+    mode=automation_level_label,
+    status=(
+        "Exit ready"
+        if auto_exit_status.ready
+        else "Buy ready"
+        if auto_entry_status.ready
+        else "Manual"
+        if automation_level == "Manual review only"
+        else auto_entry_status.status
+        if automation_level == "Auto entries and exits"
+        else auto_exit_status.status
+    ),
+    last_checked_at=automation_checked_at,
+    last_action=st.session_state.get("last_automation_action", "None"),
+    blocked_reason=st.session_state.get("last_automation_blocked_reason", ""),
+)
+st.caption(
+    f"Last checked: {runtime_state.last_checked_at}. "
+    f"Last action: {runtime_state.last_action}."
+)
 if show_portfolio_evidence:
+    st.markdown("#### Automation runtime")
+    st.dataframe(pd.DataFrame(automation_runtime_records(runtime_state)), use_container_width=True, hide_index=True)
+    st.markdown("#### Automatic buy check")
+    st.dataframe(pd.DataFrame(auto_entry_decision_records(auto_entry_status)), use_container_width=True, hide_index=True)
+    st.markdown("#### Automatic exit check")
     st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), use_container_width=True, hide_index=True)
-if automation_level == "Auto entries and exits":
-    st.info("Auto entries and exits is preview-only in this version. The app will not auto-submit buy orders yet.")
+auto_entry_key = (
+    automation_level,
+    auto_entry_status.status,
+    auto_entry_status.preview_hash,
+    tuple(auto_entry_status.reasons),
+)
+if automation_level == "Auto entries and exits" and st.session_state.get("last_auto_entry_decision_key") != auto_entry_key:
+    auto_entry_event = AuditEvent(
+        event_type="auto_entry_decision_recorded",
+        message=f"Automatic paper buy decision: {auto_entry_status.status}.",
+        payload={
+            "automation_level": automation_level,
+            "status": auto_entry_status.status,
+            "ready": auto_entry_status.ready,
+            "symbol": auto_entry_status.symbol,
+            "quantity": auto_entry_status.quantity,
+            "preview_hash": auto_entry_status.preview_hash,
+            "reasons": auto_entry_status.reasons,
+            "checked_at": automation_checked_at,
+            "broker_writes_submitted": 0,
+        },
+    )
+    st.session_state["session_audit_events"].append(auto_entry_event)
+    if persist_audit_log:
+        audit_store.append(auto_entry_event)
+    st.session_state["last_auto_entry_decision_key"] = auto_entry_key
 auto_exit_key = (
     automation_level,
     auto_exit_status.status,
@@ -1782,7 +1892,7 @@ if auto_exit_status.ready:
         mode="paper",
         approved_for_execution=True,
         requires_manual_approval=False,
-        reason="Auto exits only is enabled; paper exit passed all automation checks.",
+        reason="Paper exit passed all automation checks.",
         risk_check=RiskCheckResult(approved=True, rejected_reasons=[], checks={"auto_exit_position": True}),
     )
     try:
@@ -1808,6 +1918,8 @@ if auto_exit_status.ready:
             st.session_state["tracked_alpaca_orders"].append(tracked_record)
             broker_state_store.upsert(tracked_record)
         st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
+        st.session_state["last_automation_action"] = f"Paper exit sent: {auto_exit_intent.quantity} {auto_exit_symbol}"
+        st.session_state["last_automation_blocked_reason"] = ""
         auto_submit_event = AuditEvent(
             event_type="auto_paper_exit_submitted",
             message="Automatic paper exit sent to Alpaca.",
@@ -1828,6 +1940,8 @@ if auto_exit_status.ready:
         st.rerun()
     except Exception as exc:
         st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
+        st.session_state["last_automation_action"] = "Paper exit blocked"
+        st.session_state["last_automation_blocked_reason"] = str(exc)
         auto_block_event = AuditEvent(
             event_type="auto_paper_exit_blocked",
             message=str(exc),
@@ -1842,6 +1956,71 @@ if auto_exit_status.ready:
         if persist_audit_log:
             audit_store.append(auto_block_event)
         st.error(f"Automatic paper exit blocked: {exc}")
+
+if (not auto_exit_status.ready) and auto_entry_status.ready:
+    try:
+        if intent is None:
+            raise ValueError("Automatic buy could not find a current trade idea.")
+        alpaca_auto_entry_order = alpaca_adapter.submit_order(
+            intent,
+            execution_decision,
+            expected_preview_hash=auto_entry_status.preview_hash,
+        )
+        broker_order_id = str(getattr(alpaca_auto_entry_order, "id", ""))
+        if broker_order_id:
+            tracked_record = {
+                "broker_order_id": broker_order_id,
+                "preview_hash": auto_entry_status.preview_hash,
+                "symbol": intent.symbol_clean,
+                "side": intent.side,
+                "quantity": intent.quantity,
+                "status": str(getattr(alpaca_auto_entry_order, "status", "")),
+                "submitted_at": str(getattr(alpaca_auto_entry_order, "submitted_at", "")),
+                "source": "auto_entries_and_exits",
+            }
+            st.session_state["tracked_alpaca_orders"].append(tracked_record)
+            broker_state_store.upsert(tracked_record)
+        st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
+        st.session_state["last_automation_action"] = f"Paper buy sent: {intent.quantity} {intent.symbol_clean}"
+        st.session_state["last_automation_blocked_reason"] = ""
+        auto_entry_submit_event = AuditEvent(
+            event_type="auto_paper_entry_submitted",
+            message="Automatic paper buy sent to Alpaca.",
+            payload={
+                "symbol": intent.symbol_clean,
+                "side": intent.side,
+                "quantity": intent.quantity,
+                "preview_hash": auto_entry_status.preview_hash,
+                "broker_order_id": broker_order_id,
+                "automation_level": automation_level,
+                "checked_at": automation_checked_at,
+                "broker_writes_submitted": 1,
+            },
+        )
+        st.session_state["session_audit_events"].append(auto_entry_submit_event)
+        if persist_audit_log:
+            audit_store.append(auto_entry_submit_event)
+        st.success("Automatic paper buy sent to Alpaca.")
+        st.rerun()
+    except Exception as exc:
+        st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
+        st.session_state["last_automation_action"] = "Paper buy blocked"
+        st.session_state["last_automation_blocked_reason"] = str(exc)
+        auto_entry_block_event = AuditEvent(
+            event_type="auto_paper_entry_blocked",
+            message=str(exc),
+            payload={
+                "symbol": auto_entry_status.symbol,
+                "preview_hash": auto_entry_status.preview_hash,
+                "automation_level": automation_level,
+                "checked_at": automation_checked_at,
+                "broker_writes_submitted": 0,
+            },
+        )
+        st.session_state["session_audit_events"].append(auto_entry_block_event)
+        if persist_audit_log:
+            audit_store.append(auto_entry_block_event)
+        st.error(f"Automatic paper buy blocked: {exc}")
 
 if exit_previews:
     st.markdown("#### Sell paper position")

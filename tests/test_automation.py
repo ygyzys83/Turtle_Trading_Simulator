@@ -1,5 +1,7 @@
 from agentloop_trader.automation import (
     AutomationDryRunStore,
+    auto_entry_decision,
+    auto_entry_decision_records,
     auto_exit_decision,
     auto_exit_decision_records,
     automation_evidence_records,
@@ -106,6 +108,59 @@ def test_auto_exit_decision_blocks_backtest_mode():
     assert "How orders are handled must be Paper trading." in decision.reasons
 
 
+def test_auto_entry_decision_is_ready_when_all_conditions_pass():
+    decision = auto_entry_decision(
+        automation_level="Auto entries and exits",
+        execution_mode="paper",
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=True,
+        intent_present=True,
+        risk_approved=True,
+        preflight_ready=True,
+        preview_valid=True,
+        preview_hash="buy-1",
+        symbol="AAPL",
+        quantity=10,
+        blocked_reasons=[],
+        already_sent_hashes=set(),
+    )
+    records = {row["Field"]: row["Value"] for row in auto_entry_decision_records(decision)}
+
+    assert decision.ready
+    assert decision.status == "Buy ready"
+    assert records["Symbol"] == "AAPL"
+
+
+def test_auto_entry_decision_waits_without_buy_setup():
+    decision = auto_entry_decision(
+        automation_level="Auto entries and exits",
+        execution_mode="paper",
+        broker_connected=True,
+        broker_can_submit=True,
+        paper_orders_enabled=True,
+        kill_switch_enabled=False,
+        broker_state_stale=False,
+        market_open=True,
+        intent_present=False,
+        risk_approved=True,
+        preflight_ready=True,
+        preview_valid=True,
+        preview_hash="",
+        symbol="",
+        quantity="",
+        blocked_reasons=[],
+        already_sent_hashes=set(),
+    )
+
+    assert not decision.ready
+    assert decision.status == "Waiting for buy setup"
+    assert "No buy setup right now." in decision.reasons
+
+
 def test_paper_automation_candidates_include_entry_exit_and_cancel_dry_runs():
     entry_decision = paper_automation_dry_run(
         intent=TradeIntent(symbol="AAPL", side="buy", quantity=10),
@@ -176,9 +231,11 @@ def test_evidence_dashboard_records_count_key_events():
     records = evidence_dashboard_records(
         [
             {"event_type": "alpaca_paper_order_submitted"},
+            {"event_type": "auto_paper_entry_submitted"},
             {"event_type": "alpaca_paper_order_armed"},
             {"event_type": "alpaca_paper_order_state_refreshed"},
             {"event_type": "alpaca_paper_exit_submitted"},
+            {"event_type": "auto_paper_exit_submitted"},
             {"event_type": "alpaca_paper_exit_armed"},
             {"event_type": "alpaca_paper_exit_blocked"},
             {"event_type": "paper_order_filled"},
@@ -192,9 +249,8 @@ def test_evidence_dashboard_records_count_key_events():
     )
 
     metrics = {record["Metric"]: record["Value"] for record in records}
-    assert metrics["Paper buys sent"] == 1
-    assert metrics["Paper exits sent"] == 1
-    assert metrics["Paper exits sent"] == 1
+    assert metrics["Paper buys sent"] == 2
+    assert metrics["Paper exits sent"] == 2
     assert metrics["Paper exits blocked"] == 1
     assert metrics["Saved Alpaca orders"] == 4
     assert metrics["Open Alpaca orders"] == 1

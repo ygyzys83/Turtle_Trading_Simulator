@@ -153,7 +153,7 @@ def risk_halt_records(
     if broker_state_stale:
         rows.append({"Block": "Refresh Alpaca", "Active": True, "Detail": "Refresh Alpaca positions and orders."})
     for row in automation_ready_rows:
-        if row.get("Check") in {"Alpaca data current", "Kill Switch Off", "Stop trading off"} and not row.get("Passed"):
+        if row.get("Check") in {"Alpaca data current", "Kill Switch off"} and not row.get("Passed"):
             rows.append({"Block": row.get("Check", ""), "Active": True, "Detail": row.get("Detail", "")})
     if not rows:
         rows.append({"Block": "None", "Active": False, "Detail": "No active blocks."})
