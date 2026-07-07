@@ -33,7 +33,7 @@ def monitor_paper_session(
     status = "OK"
     if limits.kill_switch_enabled:
         status = "BREACH"
-        alerts.append("Stop trading switch is on.")
+        alerts.append("Kill Switch is on.")
     if session_loss_pct > limits.max_session_loss_pct:
         status = "BREACH"
         alerts.append(
@@ -105,7 +105,7 @@ def daily_risk_records(
         {"Metric": "Session P&L", "Value": round(session_pnl, 2)},
         {"Metric": "Session loss %", "Value": round(session_loss_pct, 2)},
         {"Metric": "Max session loss %", "Value": limits.max_session_loss_pct},
-        {"Metric": "Stop trading switch on", "Value": limits.kill_switch_enabled},
+        {"Metric": "Kill Switch on", "Value": limits.kill_switch_enabled},
         {"Metric": "Max open positions", "Value": limits.max_open_positions},
     ]
 

@@ -135,7 +135,7 @@ def auto_exit_decision(
     if not paper_orders_enabled:
         reasons.append("Allow Alpaca paper orders is off.")
     if kill_switch_enabled:
-        reasons.append("Stop trading switch is on.")
+        reasons.append("Kill Switch is on.")
     if broker_state_stale:
         reasons.append("Refresh Alpaca positions and orders.")
     if not market_open:

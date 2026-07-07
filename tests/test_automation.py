@@ -262,7 +262,7 @@ def test_automation_supervisor_dry_run_halts_before_candidates():
     rows = automation_supervisor_dry_run_records(
         candidates=[{"Ready": True}],
         readiness_rows=[{"Check": "No orders sent", "Passed": True}],
-        halt_rows=[{"Block": "Risk limit hit", "Active": True, "Detail": "Stop trading switch is on."}],
+        halt_rows=[{"Block": "Risk limit hit", "Active": True, "Detail": "Kill Switch is on."}],
     )
     values = {row["Field"]: row["Value"] for row in rows}
 

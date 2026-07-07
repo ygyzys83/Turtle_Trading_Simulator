@@ -67,7 +67,7 @@ def test_paper_account_health_records_surface_monitoring_breach():
         starting_cash=50_000,
         local_open_positions=1,
         tracked_alpaca_orders=[{"status": "accepted"}, {"status": "canceled"}],
-        monitoring_result=MonitoringResult("BREACH", ["Stop trading switch is on."], {}),
+        monitoring_result=MonitoringResult("BREACH", ["Kill Switch is on."], {}),
         limits=RiskLimits(max_open_positions=5),
     )
     checks = {row["Check"]: row for row in rows}

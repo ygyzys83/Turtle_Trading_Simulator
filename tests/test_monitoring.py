@@ -50,7 +50,7 @@ def test_broker_heartbeat_records_enforce_fresh_state_policy():
 
 def test_risk_halt_records_surface_breaches_and_stale_state():
     rows = risk_halt_records(
-        monitoring_result=MonitoringResult("BREACH", ["Stop trading switch is on."], {}),
+        monitoring_result=MonitoringResult("BREACH", ["Kill Switch is on."], {}),
         broker_connected=False,
         broker_state_stale=True,
         automation_ready_rows=[{"Check": "Stop trading off", "Passed": False, "Detail": "Stop trading is active."}],

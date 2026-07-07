@@ -3,7 +3,6 @@ from agentloop_trader.ui_summary import (
     agent_loop_stage_records,
     compact_status_records,
     operator_state_record,
-    portfolio_story_records,
     setup_scorecard_records,
     strategy_context_records,
 )
@@ -39,15 +38,6 @@ def test_agent_loop_stage_records_show_human_gate():
     assert stages["Find Trade"]["Ready"]
     assert stages["Your Action"]["Ready"]
     assert "click" in stages["Your Action"]["Detail"].lower()
-
-
-def test_portfolio_story_records_explain_agentic_loop():
-    rows = portfolio_story_records()
-    text = " ".join(row["Portfolio Signal"] for row in rows)
-
-    assert "agent" in text
-    assert "operator chooses" in text
-    assert "Closed trades are reviewed" in text
 
 
 def test_operator_state_record_prioritizes_refresh_before_orders():

@@ -306,18 +306,6 @@ def agent_loop_stage_records(
     ]
 
 
-def portfolio_story_records() -> list[dict]:
-    return [
-        {"Step": "1. Read", "Portfolio Signal": "The app reads prices and checks the strategy rules."},
-        {"Step": "2. Suggest", "Portfolio Signal": "The agent explains a trade idea and a proposed order."},
-        {"Step": "3. Check", "Portfolio Signal": "Risk rules can block the trade."},
-        {"Step": "4. Choose", "Portfolio Signal": "The operator chooses manual paper trading or automation."},
-        {"Step": "5. Send", "Portfolio Signal": "Valid paper orders can reach Alpaca paper."},
-        {"Step": "6. Refresh", "Portfolio Signal": "The app refreshes Alpaca to see what happened."},
-        {"Step": "7. Learn", "Portfolio Signal": "Closed trades are reviewed so the system can improve."},
-    ]
-
-
 def _display_signal(signal: str) -> str:
     if signal == "long":
         return "Buy setup"

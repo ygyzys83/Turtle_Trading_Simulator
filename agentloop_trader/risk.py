@@ -91,7 +91,7 @@ def check_trade_intent(
 
     checks["kill_switch_off"] = not limits.kill_switch_enabled
     if limits.kill_switch_enabled:
-        rejected.append("Stop trading switch is on.")
+        rejected.append("Kill Switch is on.")
 
     checks["symbol_allowed"] = not limits.allowed_symbols or symbol in limits.allowed_symbols
     if not checks["symbol_allowed"]:
@@ -231,7 +231,7 @@ def risk_policy_records(limits: RiskLimits) -> list[dict]:
         {"Policy": "Max session loss", "Value": f"{limits.max_session_loss_pct}%"},
         {"Policy": "Max open positions", "Value": limits.max_open_positions},
         {"Policy": "Stop loss required", "Value": limits.require_stop_loss},
-        {"Policy": "Stop trading switch on", "Value": limits.kill_switch_enabled},
+        {"Policy": "Kill Switch on", "Value": limits.kill_switch_enabled},
         {"Policy": "Broker target", "Value": "Alpaca paper account"},
     ]
 
