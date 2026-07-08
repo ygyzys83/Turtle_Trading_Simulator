@@ -38,6 +38,7 @@ class TradeIntent:
     quantity: int
     order_type: OrderType = "market"
     time_in_force: TimeInForce = "day"
+    limit_price: float | None = None
     entry_price: float | None = None
     stop_loss: float | None = None
     take_profit: float | None = None

@@ -230,7 +230,7 @@ class AlpacaBrokerAdapterStub:
         client = self._get_client()
         if client is None:
             raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
-        request = self._build_market_order_request(intent)
+        request = self._build_order_request(intent)
         return client.submit_order(order_data=request)
 
     def cancel_order(self, broker_order_id: str, expected_cancel_hash: str | None = None):
@@ -365,20 +365,33 @@ class AlpacaBrokerAdapterStub:
             return None
         return self._client
 
-    def _build_market_order_request(self, intent: TradeIntent):
+    def _build_order_request(self, intent: TradeIntent):
+        if intent.order_type == "limit" and (intent.limit_price is None or intent.limit_price <= 0):
+            raise RuntimeError("Limit orders need a limit price.")
         try:
             from alpaca.trading.enums import OrderSide, TimeInForce
-            from alpaca.trading.requests import MarketOrderRequest
+            from alpaca.trading.requests import LimitOrderRequest, MarketOrderRequest
         except Exception:
-            return {
+            order = {
                 "symbol": intent.symbol_clean,
                 "qty": intent.quantity,
                 "side": intent.side,
-                "type": "market",
+                "type": intent.order_type,
                 "time_in_force": intent.time_in_force,
             }
+            if intent.order_type == "limit":
+                order["limit_price"] = intent.limit_price
+            return order
         side = OrderSide.BUY if intent.side == "buy" else OrderSide.SELL
         tif = TimeInForce.DAY if intent.time_in_force == "day" else TimeInForce.GTC
+        if intent.order_type == "limit":
+            return LimitOrderRequest(
+                symbol=intent.symbol_clean,
+                qty=intent.quantity,
+                side=side,
+                time_in_force=tif,
+                limit_price=float(intent.limit_price),
+            )
         return MarketOrderRequest(
             symbol=intent.symbol_clean,
             qty=intent.quantity,
@@ -423,6 +436,7 @@ def build_alpaca_order_preview(
         "side": intent.side if intent else "",
         "quantity": intent.quantity if intent else 0,
         "order_type": intent.order_type if intent else "",
+        "limit_price": intent.limit_price if intent and intent.order_type == "limit" else "",
         "time_in_force": intent.time_in_force if intent else "",
         "source": "adjusted_deterministic_trade_intent",
     }
@@ -436,6 +450,8 @@ def build_alpaca_order_preview(
         blocked.append(f"Execution decision blocked order: {decision.reason}")
     if intent is not None and intent.quantity <= 0:
         blocked.append("Quantity must be greater than zero.")
+    if intent is not None and intent.order_type == "limit" and (intent.limit_price is None or intent.limit_price <= 0):
+        blocked.append("Limit orders need a limit price.")
 
     payload = json.dumps(order, sort_keys=True, separators=(",", ":"))
     preview_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -555,6 +571,7 @@ def _display_order_field(key: str) -> str:
         "side": "Side",
         "quantity": "Quantity",
         "order_type": "Order Type",
+        "limit_price": "Limit Price",
         "time_in_force": "Time In Force",
         "source": "Source",
         "action": "Action",

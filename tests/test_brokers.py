@@ -83,6 +83,12 @@ class FakeAlpacaClient:
         return SimpleNamespace(id=order_id, status="canceled")
 
 
+def _order_field(order, field):
+    if isinstance(order, dict):
+        return order.get(field)
+    return getattr(order, field, None)
+
+
 def _approved_intent_and_decision():
     intent = TradeIntent(symbol="AAPL", side="buy", quantity=10, entry_price=100, stop_loss=95)
     risk = check_trade_intent(intent, 50_000, RiskLimits(allowed_symbols=("AAPL",)))
@@ -158,6 +164,27 @@ def test_alpaca_adapter_submits_paper_order_when_all_gates_enabled():
 
     assert order.status == "accepted"
     assert client.submitted_orders
+
+
+def test_alpaca_adapter_submits_limit_order_when_intent_uses_limit_price():
+    client = FakeAlpacaClient()
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        trading_client=client,
+        allow_order_submission=True,
+    )
+    intent = TradeIntent(symbol="AAPL", side="buy", quantity=10, order_type="limit", limit_price=101.25, entry_price=101.25, stop_loss=96)
+    risk = check_trade_intent(intent, 50_000, RiskLimits(allowed_symbols=("AAPL",)))
+    decision = decide_execution("paper", risk)
+
+    preview = build_alpaca_order_preview(intent, decision, adapter.config)
+    order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
+
+    assert order.status == "accepted"
+    assert preview.order["order_type"] == "limit"
+    assert preview.order["limit_price"] == 101.25
+    submitted = client.submitted_orders[0]
+    assert _order_field(submitted, "limit_price") == 101.25
 
 
 def test_alpaca_adapter_submits_paper_exit_when_all_gates_enabled():
