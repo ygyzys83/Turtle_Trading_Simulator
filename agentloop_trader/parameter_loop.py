@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from itertools import product
 
 from agentloop_trader.evaluation import WalkForwardResult, evaluate_walk_forward
-from agentloop_trader.models import StrategyConfig
+from agentloop_trader.models import RiskLimits, StrategyConfig
 
 
 @dataclass(frozen=True)
@@ -62,6 +62,7 @@ def evaluate_parameter_candidates(
     market_data=None,
     train_fraction: float = 0.65,
     max_candidates: int = 12,
+    risk_limits: RiskLimits | None = None,
 ) -> list[ParameterCandidate]:
     candidates = []
     for config in generate_bounded_candidates(current, max_candidates=max_candidates):
@@ -76,6 +77,7 @@ def evaluate_parameter_candidates(
                 seed=seed,
                 market_data=market_data,
                 train_fraction=train_fraction,
+                risk_limits=risk_limits,
             )
         except ValueError as exc:
             candidates.append(

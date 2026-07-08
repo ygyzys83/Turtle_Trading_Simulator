@@ -98,6 +98,12 @@ def strategy_settings_match_reason(current: dict | None, entry: dict | None) -> 
     return "Settings changed since entry; auto exit is paused."
 
 
+def active_automation_level(selected_level: str, full_automation_enabled: bool, kill_switch_enabled: bool) -> str:
+    if selected_level == "Auto entries and exits" and (not full_automation_enabled or kill_switch_enabled):
+        return "Manual review only"
+    return selected_level
+
+
 class AutomationDryRunStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else DEFAULT_AUTOMATION_DRY_RUN_PATH

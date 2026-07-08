@@ -6,6 +6,7 @@ import pandas as pd
 
 from agentloop_trader.backtest import simulate_turtle_strategy
 from agentloop_trader.data import generate_synthetic_prices
+from agentloop_trader.models import RiskLimits
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,7 @@ def evaluate_walk_forward(
     seed: int | None = None,
     market_data=None,
     train_fraction: float = 0.65,
+    risk_limits: RiskLimits | None = None,
 ) -> WalkForwardResult:
     warmup_bars = max(entry_w, exit_w, ma_w, 14) + 2
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=seed)
@@ -97,7 +99,7 @@ def evaluate_walk_forward(
     train_data = data.iloc[:split_index].copy()
     train_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
     _, _, _, _, _, train_stats, _ = simulate_turtle_strategy(
-        account, entry_w, exit_w, atr_mult, risk_pct_dec, ma_w, seed, train_data
+        account, entry_w, exit_w, atr_mult, risk_pct_dec, ma_w, seed, train_data, risk_limits
     )
 
     oos_start = max(0, split_index - warmup_bars)
@@ -105,7 +107,7 @@ def evaluate_walk_forward(
     oos_data = data.iloc[oos_start:].copy()
     oos_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
     _, _, _, oos_trade_log, _, _, _ = simulate_turtle_strategy(
-        account, entry_w, exit_w, atr_mult, risk_pct_dec, ma_w, seed, oos_data
+        account, entry_w, exit_w, atr_mult, risk_pct_dec, ma_w, seed, oos_data, risk_limits
     )
     oos_trades = [
         trade

@@ -141,7 +141,48 @@ def setup_scorecard_records(
     blocks = [reason for reason in (blocked_reasons or []) if reason]
     enabled = enabled_inputs or {}
 
-    if setup_type == "pullback":
+    if setup_type in {"trendline", "trendline_retest"}:
+        trendline_level = _as_float(live.get("trendline_level"))
+        trendline_break = bool(live.get("trendline_break"))
+        retest_ready = bool(live.get("retest_ready"))
+        setup_ready = signal == "long"
+        core_rows = [
+            {
+                "Read": "Trend",
+                "Status": "Good" if trend_ok else "Weak",
+                "Plain English": "Stock is above a rising trend filter." if trend_ok else "Trend filter does not support a buy.",
+            },
+            {
+                "Read": "Trendline",
+                "Status": "Found" if trendline_level > 0 else "Not found",
+                "Plain English": (
+                    f"Descending trendline level is near ${trendline_level:,.2f}."
+                    if trendline_level > 0
+                    else "No clean descending trendline was found."
+                ),
+            },
+            {
+                "Read": "Break above line",
+                "Status": "Yes" if trendline_break else "No",
+                "Plain English": "Price is above the descending trendline." if trendline_break else "Price has not cleared the descending trendline.",
+            },
+        ]
+        if setup_type == "trendline_retest":
+            core_rows.append(
+                {
+                    "Read": "Retest",
+                    "Status": "Yes" if retest_ready else "No",
+                    "Plain English": "Price retested the broken trendline and turned up." if retest_ready else "Waiting for a retest and turn back up.",
+                }
+            )
+        core_rows.append(
+            {
+                "Read": "Risk approval",
+                "Status": "Passed" if risk_approved and not blocks else "Blocked",
+                "Plain English": "Risk checks allow this idea." if risk_approved and not blocks else (blocks[0] if blocks else "Risk checks do not allow this idea."),
+            }
+        )
+    elif setup_type == "pullback":
         setup_ready = bool(live.get("pullback_ready")) or signal == "long"
         core_rows = [
             {
@@ -209,7 +250,12 @@ def setup_scorecard_records(
         "volatility": {
             "Read": "Volatility",
             "Status": f"{atr_pct:.2f}% ATR",
-            "Plain English": _volatility_detail(atr_pct),
+            "Plain English": _volatility_detail(
+                atr_pct,
+                atr_dollars=atr,
+                stop_distance=stop_distance,
+                stop_price=last_price - stop_distance if last_price and stop_distance else None,
+            ),
         },
         "room_above_exit": {
             "Read": "Room above exit",
@@ -381,6 +427,138 @@ def position_exit_plan_records(settings: dict | None, exit_ready: bool = False, 
     ]
 
 
+def trade_evidence_summary_records(
+    intent_present: bool,
+    risk_approved: bool,
+    preflight_ready: bool,
+    setup_rows: list[dict] | None = None,
+    blocked_reasons: list[str] | None = None,
+) -> list[dict]:
+    setup_rows = setup_rows or []
+    blocked_reasons = [reason for reason in (blocked_reasons or []) if reason]
+    setup_grade = next((str(row.get("Status", "")) for row in setup_rows if row.get("Read") == "Overall"), "Unknown")
+    return [
+        {
+            "Evidence Area": "Setup quality",
+            "Current Read": setup_grade,
+            "What To Use It For": "Quickly judge whether the selected ticker has a clean setup.",
+        },
+        {
+            "Evidence Area": "Trade idea",
+            "Current Read": "Present" if intent_present else "None",
+            "What To Use It For": "Shows whether the strategy generated a possible BUY.",
+        },
+        {
+            "Evidence Area": "Risk check",
+            "Current Read": "Passed" if risk_approved else "Blocked",
+            "What To Use It For": "Confirms whether sizing and risk limits allow the idea.",
+        },
+        {
+            "Evidence Area": "Ready to send",
+            "Current Read": "Yes" if preflight_ready else "No",
+            "What To Use It For": "Confirms whether the trade can move to paper execution.",
+        },
+        {
+            "Evidence Area": "Main blocker",
+            "Current Read": blocked_reasons[0] if blocked_reasons else "None",
+            "What To Use It For": "First issue to fix or understand before taking action.",
+        },
+    ]
+
+
+def alpaca_evidence_summary_records(
+    alpaca_connected: bool,
+    alpaca_state_stale: bool,
+    paper_orders_enabled: bool,
+    alpaca_positions: list[dict] | None = None,
+    alpaca_orders: list[dict] | None = None,
+    tracked_orders: list[dict] | None = None,
+    automation_status: str = "",
+) -> list[dict]:
+    positions = alpaca_positions or []
+    orders = alpaca_orders or []
+    tracked = tracked_orders or []
+    waiting_orders = [
+        order for order in orders
+        if str(order.get("Status", order.get("status", ""))).strip().lower() in {"accepted", "new", "pending_new", "partially_filled"}
+    ]
+    return [
+        {
+            "Evidence Area": "Broker connection",
+            "Current Read": "Connected" if alpaca_connected else "Disconnected",
+            "What To Use It For": "Confirms whether the app can read Alpaca paper account data.",
+        },
+        {
+            "Evidence Area": "Broker data",
+            "Current Read": "Needs refresh" if alpaca_state_stale else "Current",
+            "What To Use It For": "Tells you whether position/order reads are fresh enough to trust.",
+        },
+        {
+            "Evidence Area": "Paper order switch",
+            "Current Read": "On" if paper_orders_enabled else "Off",
+            "What To Use It For": "Confirms whether Alpaca paper writes are allowed.",
+        },
+        {
+            "Evidence Area": "Open positions",
+            "Current Read": len(positions),
+            "What To Use It For": "Shows how many Alpaca paper positions need management.",
+        },
+        {
+            "Evidence Area": "Waiting orders",
+            "Current Read": len(waiting_orders),
+            "What To Use It For": "Shows how many Alpaca paper orders are still waiting to fill.",
+        },
+        {
+            "Evidence Area": "Saved order records",
+            "Current Read": len(tracked),
+            "What To Use It For": "Shows how many Alpaca paper orders the app is tracking locally.",
+        },
+        {
+            "Evidence Area": "Automation",
+            "Current Read": automation_status or "Not checked",
+            "What To Use It For": "Shows the current automation state without reading every detail table.",
+        },
+    ]
+
+
+def saved_records_overview_records(
+    audit_records: list[dict] | None = None,
+    tracked_orders: list[dict] | None = None,
+    automation_snapshots: list[dict] | None = None,
+) -> list[dict]:
+    audit_records = audit_records or []
+    tracked_orders = tracked_orders or []
+    automation_snapshots = automation_snapshots or []
+    event_types = [str(record.get("event_type", "")) for record in audit_records]
+    return [
+        {
+            "Record Set": "Activity log",
+            "Count": len(audit_records),
+            "Why It Matters": "Timeline of what the app decided, blocked, or sent.",
+        },
+        {
+            "Record Set": "Alpaca paper orders",
+            "Count": len(tracked_orders),
+            "Why It Matters": "Local record of paper orders submitted, canceled, filled, or reconciled.",
+        },
+        {
+            "Record Set": "Automation checks",
+            "Count": len(automation_snapshots),
+            "Why It Matters": "Saved snapshots of what automation saw before taking or skipping action.",
+        },
+        {
+            "Record Set": "Paper buys sent",
+            "Count": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted"),
+            "Why It Matters": "Confirms how many paper buys reached Alpaca.",
+        },
+        {
+            "Record Set": "Paper exits sent",
+            "Count": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted"),
+            "Why It Matters": "Confirms how many paper exits reached Alpaca.",
+        },
+    ]
+
+
 def no_buy_reason(live: dict) -> str:
     reason = str(live.get("no_trade_reason") or "").strip()
     if reason:
@@ -501,7 +679,14 @@ def _grade_detail(grade: str, setup_type: str, blocks: list[str]) -> str:
         return "The selected strategy has a setup, but one quality input is only okay."
     if grade == "C":
         return "The setup exists, but risk or quality checks need review."
-    strategy = "trend pullback" if setup_type == "pullback" else "breakout"
+    if setup_type == "pullback":
+        strategy = "trend pullback"
+    elif setup_type == "trendline_retest":
+        strategy = "trendline retest"
+    elif setup_type == "trendline":
+        strategy = "trendline breakout"
+    else:
+        strategy = "breakout"
     return f"No clean {strategy} setup right now."
 
 
@@ -552,14 +737,25 @@ def _volume_detail(status) -> str:
     return "Volume is unavailable for this data source."
 
 
-def _volatility_detail(atr_pct: float) -> str:
+def _volatility_detail(
+    atr_pct: float,
+    atr_dollars: float | None = None,
+    stop_distance: float | None = None,
+    stop_price: float | None = None,
+) -> str:
     if atr_pct <= 0:
         return "Volatility is not available."
+    atr_text = f"ATR is ${atr_dollars:,.2f}." if atr_dollars and atr_dollars > 0 else ""
+    stop_text = ""
+    if stop_distance and stop_distance > 0:
+        stop_text = f" Stop distance is ${stop_distance:,.2f}."
+    if stop_price and stop_price > 0:
+        stop_text = f"{stop_text} Approx stop is ${stop_price:,.2f}."
     if atr_pct < 1:
-        return "Quiet movement; stops may be tighter."
+        return f"Quiet movement; stops may be tighter. {atr_text}{stop_text}".strip()
     if atr_pct <= 3:
-        return "Normal movement for this setup."
-    return "Wide movement; position size should be smaller."
+        return f"Normal movement for this setup. {atr_text}{stop_text}".strip()
+    return f"Wide movement; position size should be smaller. {atr_text}{stop_text}".strip()
 
 
 def _rsi_detail(status) -> str:

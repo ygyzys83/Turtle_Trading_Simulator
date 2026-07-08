@@ -1,5 +1,6 @@
 from agentloop_trader.automation import (
     AutomationDryRunStore,
+    active_automation_level,
     auto_entry_decision,
     auto_entry_decision_records,
     auto_exit_decision,
@@ -235,6 +236,13 @@ def test_auto_entry_decision_waits_without_buy_setup():
     assert not decision.ready
     assert decision.status == "Waiting for buy setup"
     assert "No buy setup right now." in decision.reasons
+
+
+def test_active_automation_level_requires_enable_checkbox_for_full_auto():
+    assert active_automation_level("Auto entries and exits", False, False) == "Manual review only"
+    assert active_automation_level("Auto entries and exits", True, False) == "Auto entries and exits"
+    assert active_automation_level("Auto entries and exits", True, True) == "Manual review only"
+    assert active_automation_level("Auto exits only", False, True) == "Auto exits only"
 
 
 def test_paper_automation_candidates_include_entry_exit_and_cancel_dry_runs():

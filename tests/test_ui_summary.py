@@ -1,6 +1,7 @@
 from agentloop_trader.ui_summary import (
     agent_decision_summary,
     agent_loop_stage_records,
+    alpaca_evidence_summary_records,
     buy_requirement_records,
     compact_status_records,
     managed_position_records,
@@ -9,9 +10,11 @@ from agentloop_trader.ui_summary import (
     optional_quality_input_records,
     optional_sell_quality_records,
     position_exit_plan_records,
+    saved_records_overview_records,
     sell_requirement_records,
     setup_scorecard_records,
     strategy_context_records,
+    trade_evidence_summary_records,
 )
 
 
@@ -132,6 +135,9 @@ def test_setup_scorecard_records_show_clean_setup():
     assert reads["Overall"]["Status"] == "A"
     assert reads["Breakout"]["Status"] == "Triggered"
     assert reads["Room above exit"]["Status"] == "2.0x stop"
+    assert "ATR is $2.50" in reads["Volatility"]["Plain English"]
+    assert "Stop distance is $5.00" in reads["Volatility"]["Plain English"]
+    assert "Approx stop is $100.00" in reads["Volatility"]["Plain English"]
 
 
 def test_setup_scorecard_records_show_first_blocker():
@@ -287,3 +293,57 @@ def test_position_exit_plan_records_summarize_saved_exit_settings():
     assert records["Exit Strategy"] == "Trend pullback continuation"
     assert records["Auto Exit"] == "On"
     assert records["Current Exit Check"] == "Hold because price is above the pullback average."
+
+
+def test_trade_evidence_summary_records_put_plain_answer_before_details():
+    rows = trade_evidence_summary_records(
+        intent_present=True,
+        risk_approved=False,
+        preflight_ready=False,
+        setup_rows=[{"Read": "Overall", "Status": "C"}],
+        blocked_reasons=["Position would be too large."],
+    )
+    records = {row["Evidence Area"]: row for row in rows}
+
+    assert records["Setup quality"]["Current Read"] == "C"
+    assert records["Trade idea"]["Current Read"] == "Present"
+    assert records["Risk check"]["Current Read"] == "Blocked"
+    assert records["Main blocker"]["Current Read"] == "Position would be too large."
+
+
+def test_alpaca_evidence_summary_records_count_operating_state():
+    rows = alpaca_evidence_summary_records(
+        alpaca_connected=True,
+        alpaca_state_stale=False,
+        paper_orders_enabled=True,
+        alpaca_positions=[{"Symbol": "IBM"}],
+        alpaca_orders=[{"Status": "accepted"}, {"Status": "filled"}],
+        tracked_orders=[{"broker_order_id": "1"}, {"broker_order_id": "2"}],
+        automation_status="Auto exits only",
+    )
+    records = {row["Evidence Area"]: row for row in rows}
+
+    assert records["Broker connection"]["Current Read"] == "Connected"
+    assert records["Open positions"]["Current Read"] == 1
+    assert records["Waiting orders"]["Current Read"] == 1
+    assert records["Saved order records"]["Current Read"] == 2
+    assert records["Automation"]["Current Read"] == "Auto exits only"
+
+
+def test_saved_records_overview_records_summarize_evidence_without_raw_log():
+    rows = saved_records_overview_records(
+        audit_records=[
+            {"event_type": "alpaca_paper_order_submitted"},
+            {"event_type": "auto_paper_entry_submitted"},
+            {"event_type": "auto_paper_exit_submitted"},
+        ],
+        tracked_orders=[{"broker_order_id": "1"}],
+        automation_snapshots=[{"session_id": "s1"}, {"session_id": "s2"}],
+    )
+    records = {row["Record Set"]: row for row in rows}
+
+    assert records["Activity log"]["Count"] == 3
+    assert records["Alpaca paper orders"]["Count"] == 1
+    assert records["Automation checks"]["Count"] == 2
+    assert records["Paper buys sent"]["Count"] == 2
+    assert records["Paper exits sent"]["Count"] == 1
