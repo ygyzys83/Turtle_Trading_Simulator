@@ -3,10 +3,12 @@ from agentloop_trader.ui_summary import (
     agent_loop_stage_records,
     buy_requirement_records,
     compact_status_records,
+    managed_position_records,
     no_buy_reason,
     operator_state_record,
     optional_quality_input_records,
     optional_sell_quality_records,
+    position_exit_plan_records,
     sell_requirement_records,
     setup_scorecard_records,
     strategy_context_records,
@@ -252,3 +254,36 @@ def test_optional_sell_quality_records_do_not_claim_to_create_sell():
 
     assert inputs["Volume"]["Creates SELL?"] == "No"
     assert inputs["RSI"]["Creates SELL?"] == "No"
+
+
+def test_managed_position_records_show_daily_management_state():
+    rows = managed_position_records(
+        [{"Symbol": "IBM", "Quantity": "62", "Market Value": "19200", "Average Entry": "310.5"}],
+        {"IBM": {"auto_exit_enabled": True, "strategy_label": "Trend pullback continuation"}},
+    )
+
+    assert rows[0]["Symbol"] == "IBM"
+    assert rows[0]["Auto Exit"] == "On"
+    assert rows[0]["Management Status"] == "Managed"
+    assert rows[0]["Market Value"] == "$19,200.00"
+
+
+def test_position_exit_plan_records_summarize_saved_exit_settings():
+    rows = position_exit_plan_records(
+        {
+            "strategy_label": "Trend pullback continuation",
+            "auto_exit_enabled": True,
+            "exit_window": 10,
+            "atr_stop_multiplier": 2.0,
+            "moving_average_window": 200,
+            "pullback_average_length": 20,
+            "momentum_turn_length": 5,
+        },
+        exit_ready=False,
+        exit_reason="Hold because price is above the pullback average.",
+    )
+    records = {row["Field"]: row["Value"] for row in rows}
+
+    assert records["Exit Strategy"] == "Trend pullback continuation"
+    assert records["Auto Exit"] == "On"
+    assert records["Current Exit Check"] == "Hold because price is above the pullback average."

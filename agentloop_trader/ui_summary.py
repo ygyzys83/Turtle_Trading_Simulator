@@ -339,6 +339,48 @@ def optional_sell_quality_records(enabled_inputs: dict[str, bool] | None = None)
     ]
 
 
+def managed_position_records(position_records: list[dict], exit_settings_by_symbol: dict[str, dict] | None = None) -> list[dict]:
+    exit_settings_by_symbol = exit_settings_by_symbol or {}
+    rows = []
+    for position in position_records:
+        symbol = str(position.get("Symbol", "")).strip().upper()
+        settings = exit_settings_by_symbol.get(symbol, {})
+        auto_exit_enabled = bool(settings.get("auto_exit_enabled", False)) if settings else False
+        strategy = str(settings.get("strategy_label") or settings.get("strategy_type") or "Not saved")
+        rows.append(
+            {
+                "Symbol": symbol,
+                "Quantity": position.get("Quantity", ""),
+                "Market Value": _money(_as_float(position.get("Market Value"))),
+                "Avg Entry": _money(_as_float(position.get("Average Entry"))),
+                "Auto Exit": "On" if auto_exit_enabled else "Off",
+                "Exit Strategy": strategy,
+                "Management Status": "Managed" if settings else "Needs exit settings",
+            }
+        )
+    return rows
+
+
+def position_exit_plan_records(settings: dict | None, exit_ready: bool = False, exit_reason: str = "") -> list[dict]:
+    if not settings:
+        return [
+            {"Field": "Exit Settings", "Value": "Not saved"},
+            {"Field": "Auto Exit", "Value": "Off"},
+            {"Field": "Current Exit Check", "Value": exit_reason or "No saved exit settings for this position."},
+        ]
+    strategy = str(settings.get("strategy_label") or settings.get("strategy_type") or "Unknown")
+    return [
+        {"Field": "Exit Strategy", "Value": strategy},
+        {"Field": "Auto Exit", "Value": "On" if settings.get("auto_exit_enabled", True) else "Off"},
+        {"Field": "Sell Exit Length", "Value": settings.get("exit_window", "")},
+        {"Field": "ATR Stop", "Value": settings.get("atr_stop_multiplier", "")},
+        {"Field": "Trend Filter", "Value": settings.get("moving_average_window", "")},
+        {"Field": "Pullback Average", "Value": settings.get("pullback_average_length", "")},
+        {"Field": "Momentum Turn", "Value": settings.get("momentum_turn_length", "")},
+        {"Field": "Current Exit Check", "Value": "Exit now" if exit_ready else (exit_reason or "Hold")},
+    ]
+
+
 def no_buy_reason(live: dict) -> str:
     reason = str(live.get("no_trade_reason") or "").strip()
     if reason:
@@ -530,6 +572,10 @@ def _rsi_detail(status) -> str:
     if status == "Weak":
         return "Momentum does not support a long setup."
     return "RSI is unavailable."
+
+
+def _money(value: float) -> str:
+    return f"${value:,.2f}"
 
 
 def _as_float(value) -> float:
