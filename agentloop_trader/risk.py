@@ -125,7 +125,7 @@ def check_trade_intent(
             f"${max_notional:,.2f}."
         )
 
-    checks["no_duplicate_position"] = symbol not in {s.upper() for s in open_positions}
+    checks["no_duplicate_position"] = limits.allow_add_to_existing_position or symbol not in {s.upper() for s in open_positions}
     if not checks["no_duplicate_position"]:
         rejected.append(f"{symbol} already has an open position.")
 
@@ -230,6 +230,7 @@ def risk_policy_records(limits: RiskLimits) -> list[dict]:
         {"Policy": "Max symbol concentration", "Value": f"{limits.max_symbol_concentration_pct}%"},
         {"Policy": "Max session loss", "Value": f"{limits.max_session_loss_pct}%"},
         {"Policy": "Max open positions", "Value": limits.max_open_positions},
+        {"Policy": "Add to existing position", "Value": limits.allow_add_to_existing_position},
         {"Policy": "Stop loss required", "Value": limits.require_stop_loss},
         {"Policy": "Kill Switch on", "Value": limits.kill_switch_enabled},
         {"Policy": "Broker target", "Value": "Alpaca paper account"},

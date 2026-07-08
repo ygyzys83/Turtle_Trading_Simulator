@@ -100,6 +100,39 @@ def test_preflight_includes_execution_reason_when_risk_passes_but_mode_blocks():
     assert "Backtest only does not send orders." in preflight.blocked_reasons
 
 
+def test_risk_allows_adding_to_existing_position_when_enabled():
+    intent = TradeIntent(
+        symbol="AAPL",
+        side="buy",
+        quantity=10,
+        entry_price=100,
+        stop_loss=95,
+    )
+
+    blocked = check_trade_intent(
+        intent,
+        account_equity=50_000,
+        limits=RiskLimits(allowed_symbols=("AAPL",)),
+        open_positions={"AAPL"},
+    )
+    allowed = check_trade_intent(
+        intent,
+        account_equity=50_000,
+        limits=RiskLimits(
+            allowed_symbols=("AAPL",),
+            allow_add_to_existing_position=True,
+            max_position_notional_pct=100,
+            max_symbol_concentration_pct=100,
+        ),
+        open_positions={"AAPL"},
+    )
+
+    assert not blocked.approved
+    assert "AAPL already has an open position." in blocked.rejected_reasons
+    assert allowed.approved
+    assert allowed.checks["no_duplicate_position"]
+
+
 def test_constrain_trade_intent_reduces_quantity_to_strictest_risk_limit():
     intent = TradeIntent(
         symbol="AAPL",

@@ -105,6 +105,7 @@ class RiskLimits:
     max_session_loss_pct: float = 2.0
     max_quantity: int = 100_000
     max_open_positions: int = 5
+    allow_add_to_existing_position: bool = False
     require_stop_loss: bool = True
     kill_switch_enabled: bool = False
 

@@ -341,6 +341,28 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
     ]
 
 
+def combined_position_risk_records(position: dict, exit_trigger_price: float | None) -> list[dict]:
+    symbol = str(position.get("Symbol", "")).strip().upper()
+    quantity = optional_float(position.get("Quantity"))
+    avg_entry = optional_float(position.get("Average Entry"))
+    market_value = optional_float(position.get("Market Value"))
+    current_price = market_value / quantity if market_value is not None and quantity else None
+    trigger = optional_float(exit_trigger_price)
+    dollars_at_risk = (avg_entry - trigger) * quantity if avg_entry is not None and trigger is not None and quantity else None
+    pct_at_risk = ((avg_entry - trigger) / avg_entry * 100) if avg_entry and trigger is not None else None
+    distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
+    return [
+        {"Field": "Ticker", "Value": symbol or "Not available"},
+        {"Field": "Total shares", "Value": f"{quantity:g}" if quantity is not None else "Not available"},
+        {"Field": "Alpaca average entry", "Value": money_or_missing(avg_entry)},
+        {"Field": "Current price", "Value": money_or_missing(current_price)},
+        {"Field": "Auto exit trigger", "Value": money_or_missing(trigger)},
+        {"Field": "Dollars at risk if exit triggers", "Value": money_or_missing(max(0.0, dollars_at_risk)) if dollars_at_risk is not None else "Not available"},
+        {"Field": "Percent at risk if exit triggers", "Value": pct_or_missing(max(0.0, pct_at_risk)) if pct_at_risk is not None else "Not available"},
+        {"Field": "Distance from current price to exit", "Value": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not available"},
+    ]
+
+
 def apply_paper_buy_order_settings(
     intent: TradeIntent | None,
     order_style: str,
@@ -789,6 +811,14 @@ with st.sidebar.expander("Advanced safety", expanded=False):
             "Use commas to allow only specific tickers, such as AAPL, MSFT, NVDA."
         ),
     )
+    allow_add_to_existing_position = st.checkbox(
+        "Allow adding to an existing paper position",
+        value=False,
+        help=(
+            "When this is on, a new BUY can add shares to an Alpaca paper position you already hold. "
+            "Risk limits, cash, concentration, and open-order checks still apply."
+        ),
+    )
 allowed_symbols = tuple(s.strip().upper() for s in allowed_symbols_text.split(",") if s.strip())
 
 st.sidebar.markdown("### Research Loops")
@@ -950,6 +980,7 @@ risk_limits = RiskLimits(
     max_symbol_concentration_pct=max_symbol_concentration,
     max_session_loss_pct=max_session_loss,
     max_open_positions=max_open_positions,
+    allow_add_to_existing_position=allow_add_to_existing_position,
     require_stop_loss=True,
     kill_switch_enabled=effective_kill_switch,
 )
@@ -1096,6 +1127,7 @@ current_strategy_settings = {
     "paper_buy_order_type": paper_buy_order_style,
     "paper_buy_limit_offset_pct": paper_buy_limit_offset_pct,
     "automation_refresh_seconds": automation_refresh_seconds,
+    "allow_add_to_existing_position": allow_add_to_existing_position,
 }
 current_exit_settings = dict(current_strategy_settings)
 current_exit_settings["auto_exit_enabled"] = True
@@ -1377,7 +1409,11 @@ for col, row in zip(status_cols, status_rows):
 
 tracked_alpaca_orders = st.session_state.get("tracked_alpaca_orders", [])
 alpaca_preview = build_alpaca_order_preview(intent, execution_decision, alpaca_adapter.config)
-duplicate_alpaca_reasons = duplicate_exposure_reasons(intent, alpaca_positions)
+duplicate_alpaca_reasons = duplicate_exposure_reasons(
+    intent,
+    alpaca_positions,
+    allow_duplicate=allow_add_to_existing_position,
+)
 open_order_reasons = open_order_exposure_reasons(intent, alpaca_orders)
 duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_hash, tracked_alpaca_orders)
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
@@ -1671,6 +1707,13 @@ def run_paper_automation_once() -> None:
                 }
                 st.session_state["tracked_alpaca_orders"].append(tracked_record)
                 broker_state_store.upsert(tracked_record)
+                updated_orders = update_exit_settings_for_symbol(
+                    intent.symbol_clean,
+                    st.session_state["tracked_alpaca_orders"],
+                    current_exit_settings,
+                )
+                broker_state_store.replace_all(updated_orders)
+                st.session_state["tracked_alpaca_orders"] = updated_orders
             st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
             order_type = "limit" if intent.order_type == "limit" else "market"
             st.session_state["last_automation_action"] = f"Paper buy {order_type} sent: {intent.quantity} {intent.symbol_clean}"
@@ -1832,6 +1875,12 @@ def render_open_positions_panel() -> None:
     metric_card(position_cols[3], "Auto exit", "On" if selected_exit_settings.get("auto_exit_enabled", True) else "Off", "Position setting")
     if selected_exit_trigger_price:
         st.info(f"Auto exit trigger: sell {selected_position_symbol} if price is at or below ${float(selected_exit_trigger_price):,.2f}.")
+    st.markdown("#### Combined position risk")
+    st.dataframe(
+        pd.DataFrame(combined_position_risk_records(selected_position, selected_exit_trigger_price)),
+        use_container_width=True,
+        hide_index=True,
+    )
     st.dataframe(
         pd.DataFrame(
             position_exit_plan_records(
@@ -2532,6 +2581,13 @@ if command_center_view == "Alpaca":
                 }
                 st.session_state["tracked_alpaca_orders"].append(tracked_record)
                 broker_state_store.upsert(tracked_record)
+                updated_orders = update_exit_settings_for_symbol(
+                    intent.symbol_clean,
+                    st.session_state["tracked_alpaca_orders"],
+                    current_exit_settings,
+                )
+                broker_state_store.replace_all(updated_orders)
+                st.session_state["tracked_alpaca_orders"] = updated_orders
             st.session_state["session_audit_events"].append(alpaca_event)
             if persist_audit_log:
                 audit_store.append(alpaca_event)
