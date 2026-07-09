@@ -46,6 +46,8 @@ class AlpacaTrackedOrder:
     symbol: str
     side: str
     quantity: str
+    order_type: str
+    limit_price: str
     status: str
     submitted_at: str
     filled_at: str
@@ -536,6 +538,8 @@ def alpaca_tracked_order_from_broker_order(order, preview_hash: str) -> AlpacaTr
         symbol=str(getattr(order, "symbol", "")),
         side=str(getattr(order, "side", "")).upper(),
         quantity=str(getattr(order, "qty", "")),
+        order_type=str(getattr(order, "type", "")),
+        limit_price=str(getattr(order, "limit_price", "") or ""),
         status=str(getattr(order, "status", "")),
         submitted_at=str(getattr(order, "submitted_at", "")),
         filled_at=str(getattr(order, "filled_at", "")),
@@ -553,6 +557,8 @@ def alpaca_tracked_order_records(orders: list[AlpacaTrackedOrder]) -> list[dict]
             "Symbol": order.symbol,
             "Side": order.side,
             "Quantity": order.quantity,
+            "Order Type": order.order_type,
+            "Limit Price": order.limit_price,
             "Status": order.status,
             "Submitted": order.submitted_at,
             "Filled": order.filled_at,

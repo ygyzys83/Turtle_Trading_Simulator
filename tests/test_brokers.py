@@ -243,6 +243,8 @@ def test_alpaca_tracked_order_records_include_lifecycle_fields():
         symbol="AAPL",
         side="buy",
         qty="40",
+        type="limit",
+        limit_price="211.50",
         status="filled",
         submitted_at="2026-07-05T16:37:41Z",
         filled_at="2026-07-05T16:37:42Z",
@@ -256,6 +258,8 @@ def test_alpaca_tracked_order_records_include_lifecycle_fields():
     assert record["Order ID"] == "order-12"
     assert record["Alpaca Order ID"] == "order-123456"
     assert record["Review ID"] == "hash123"
+    assert record["Order Type"] == "limit"
+    assert record["Limit Price"] == "211.50"
     assert record["Status"] == "filled"
     assert record["Filled Qty"] == "40"
     assert record["Avg Fill"] == "212.34"

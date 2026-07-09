@@ -1,6 +1,13 @@
 from __future__ import annotations
 
 
+def _order_status(value) -> str:
+    text = str(value or "").strip().lower()
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text
+
+
 def operator_state_record(
     intent_present: bool,
     risk_approved: bool,
@@ -490,7 +497,7 @@ def alpaca_evidence_summary_records(
     tracked = tracked_orders or []
     waiting_orders = [
         order for order in orders
-        if str(order.get("Status", order.get("status", ""))).strip().lower() in {"accepted", "new", "pending_new", "partially_filled"}
+        if _order_status(order.get("Status", order.get("status", ""))) in {"accepted", "new", "pending_new", "partially_filled"}
     ]
     return [
         {
