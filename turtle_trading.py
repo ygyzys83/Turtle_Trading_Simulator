@@ -483,15 +483,19 @@ def tracked_order_lookup(tracked_orders: list[dict]) -> dict[str, dict]:
     }
 
 
-def enriched_cancelable_order_records(cancelable_orders: list[dict], tracked_orders: list[dict]) -> list[dict]:
+def enriched_cancelable_order_records(cancelable_orders: list[dict], tracked_orders: list[dict], alpaca_order_rows: list[dict] | None = None) -> list[dict]:
     tracked_by_id = tracked_order_lookup(tracked_orders)
+    alpaca_by_id = {alpaca_order_row_id(order): order for order in (alpaca_order_rows or []) if alpaca_order_row_id(order)}
     enriched = []
     for order in cancelable_orders:
         record = dict(order)
+        raw_order = alpaca_by_id.get(alpaca_order_row_id(order), {})
         tracked = tracked_by_id.get(alpaca_order_row_id(order), {})
         record["Order Type"] = str(
             tracked.get("order_type")
             or tracked.get("Order Type")
+            or raw_order.get("Order Type")
+            or raw_order.get("order_type")
             or order.get("Order Type")
             or order.get("order_type")
             or ""
@@ -499,6 +503,8 @@ def enriched_cancelable_order_records(cancelable_orders: list[dict], tracked_ord
         record["Limit Price"] = (
             tracked.get("limit_price")
             or tracked.get("Limit Price")
+            or raw_order.get("Limit Price")
+            or raw_order.get("limit_price")
             or order.get("Limit Price")
             or order.get("limit_price")
             or ""
@@ -510,7 +516,7 @@ def enriched_cancelable_order_records(cancelable_orders: list[dict], tracked_ord
 
 
 def is_waiting_limit_buy_order(order: dict) -> bool:
-    side = str(order.get("Side", order.get("side", ""))).strip().lower()
+    side = normalized_order_status(order.get("Side", order.get("side", "")))
     status = normalized_order_status(order.get("Status", order.get("status", "")))
     order_type = normalized_order_status(order.get("Order Type", order.get("order_type", "")))
     limit_price = optional_float(order.get("Limit Price") or order.get("limit_price"))
@@ -564,6 +570,66 @@ def stale_limit_buy_orders(orders: list[dict], max_age_minutes: int) -> list[dic
         if age_minutes is not None and age_minutes >= max_age_minutes:
             stale.append((age_minutes, order))
     return [order for _, order in sorted(stale, key=lambda item: item[0], reverse=True)]
+
+
+def stale_limit_cancel_blockers(orders: list[dict], max_age_minutes: int) -> list[str]:
+    blockers = []
+    waiting_limit_orders = [order for order in orders if is_waiting_limit_buy_order(order)]
+    stale_orders = stale_limit_buy_orders(orders, max_age_minutes)
+    if not auto_cancel_stale_limit_orders:
+        blockers.append("Auto-cancel old limit buys is off.")
+    if active_automation_level == "Manual review only":
+        blockers.append("Automation is set to Manual.")
+    if execution_mode != "paper":
+        blockers.append("Order mode is not Paper trading.")
+    if not enable_alpaca_paper_orders:
+        blockers.append("Use Alpaca paper account is off.")
+    if not alpaca_status.connected:
+        blockers.append("Alpaca is not connected.")
+    if not alpaca_status.can_submit_orders:
+        blockers.append("Alpaca paper order submission is off.")
+    if alpaca_state_health.stale:
+        blockers.append("Alpaca data needs refresh.")
+    if effective_kill_switch:
+        blockers.append("Kill Switch is on.")
+    if not waiting_limit_orders:
+        blockers.append("No waiting BUY limit orders were found.")
+    elif not stale_orders:
+        blockers.append(f"Waiting BUY limit order has not reached {order_age_label(max_age_minutes)} yet.")
+    if any(is_waiting_limit_buy_order(order) and order_age_minutes(order) is None for order in orders):
+        blockers.append("At least one waiting BUY limit order is missing its submitted time.")
+    return blockers
+
+
+def stale_limit_cancel_status_records(orders: list[dict], max_age_minutes: int) -> list[dict]:
+    waiting_limit_orders = [order for order in orders if is_waiting_limit_buy_order(order)]
+    stale_orders = stale_limit_buy_orders(orders, max_age_minutes)
+    oldest_age = max((order_age_minutes(order) or 0 for order in waiting_limit_orders), default=None)
+    blockers = stale_limit_cancel_blockers(orders, max_age_minutes)
+    return [
+        {"Item": "Auto-cancel old limit buys", "Value": plain_yes_no(auto_cancel_stale_limit_orders)},
+        {"Item": "Automation running", "Value": plain_yes_no(active_automation_level != "Manual review only")},
+        {"Item": "Waiting BUY limit orders", "Value": str(len(waiting_limit_orders))},
+        {"Item": "Old enough to cancel", "Value": str(len(stale_orders))},
+        {"Item": "Oldest order age", "Value": order_age_label(oldest_age)},
+        {"Item": "Cancel check", "Value": "Ready" if not blockers else "Blocked"},
+        {"Item": "Reason", "Value": "Ready to cancel the oldest stale limit buy." if not blockers else " ".join(blockers)},
+    ]
+
+
+def cancelable_order_debug_records(orders: list[dict]) -> list[dict]:
+    return [
+        {
+            "Ticker": str(order.get("Symbol", "")),
+            "Side": str(order.get("Side", order.get("side", ""))),
+            "Status": str(order.get("Status", order.get("status", ""))),
+            "Order Type": str(order.get("Order Type", order.get("order_type", ""))),
+            "Limit Price": str(order.get("Limit Price", order.get("limit_price", ""))),
+            "Submitted": str(order.get("Submitted", order.get("submitted_at", ""))),
+            "Recognized As BUY Limit": plain_yes_no(is_waiting_limit_buy_order(order)),
+        }
+        for order in orders
+    ]
 
 
 def round_alpaca_price(price: float) -> float:
@@ -1070,14 +1136,13 @@ paper_buy_order_style = st.sidebar.selectbox(
 auto_cancel_stale_limit_orders = st.sidebar.checkbox(
     "Auto-cancel old limit buys",
     value=False,
-    disabled=paper_buy_order_style == "Market",
     help="When this is on, the app cancels unfilled paper BUY limit orders after the waiting time you choose below.",
 )
 stale_limit_order_label = st.sidebar.selectbox(
     "Cancel unfilled limit buy after",
     list(STALE_LIMIT_ORDER_OPTIONS.keys()),
     index=4,
-    disabled=paper_buy_order_style == "Market" or not auto_cancel_stale_limit_orders,
+    disabled=not auto_cancel_stale_limit_orders,
     help="Default is 1 hour. Shorter times keep stale limit orders from lingering; longer times give the order more time to fill.",
 )
 stale_limit_order_minutes = STALE_LIMIT_ORDER_OPTIONS[stale_limit_order_label]
@@ -1124,7 +1189,7 @@ reset_paper_broker = st.sidebar.button("Reset paper account")
 st.sidebar.markdown("### 1. Ticker and Price Data")
 data_source = st.sidebar.radio(
     "Prices to use",
-    ["Ticker (Alpaca)", "Ticker (yfinance)", "Synthetic"],
+    ["Synthetic", "Ticker (Alpaca)", "Ticker (yfinance)"],
     horizontal=True,
 )
 market_data = None
@@ -1958,7 +2023,7 @@ open_order_reasons = open_order_exposure_reasons(intent, alpaca_orders)
 duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_hash, tracked_alpaca_orders)
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
 cancelable_alpaca_orders = cancelable_alpaca_order_records(alpaca_orders)
-managed_cancelable_alpaca_orders = enriched_cancelable_order_records(cancelable_alpaca_orders, tracked_alpaca_orders)
+managed_cancelable_alpaca_orders = enriched_cancelable_order_records(cancelable_alpaca_orders, tracked_alpaca_orders, alpaca_orders)
 waiting_limit_buy_rows = waiting_limit_buy_order_records(
     managed_cancelable_alpaca_orders,
     ticker,
@@ -2146,16 +2211,12 @@ def record_automation_decisions(checked_at: str) -> None:
 
 
 def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
-    if not auto_cancel_stale_limit_orders or paper_buy_order_style == "Market":
+    if not auto_cancel_stale_limit_orders:
         return False
-    if (
-        execution_mode != "paper"
-        or not enable_alpaca_paper_orders
-        or not alpaca_status.connected
-        or not alpaca_status.can_submit_orders
-        or alpaca_state_health.stale
-        or effective_kill_switch
-    ):
+    blockers = stale_limit_cancel_blockers(managed_cancelable_alpaca_orders, stale_limit_order_minutes)
+    if blockers:
+        st.session_state["last_automation_action"] = "Limit buy cancel waiting"
+        st.session_state["last_automation_blocked_reason"] = " ".join(blockers)
         return False
     stale_orders = stale_limit_buy_orders(managed_cancelable_alpaca_orders, stale_limit_order_minutes)
     if not stale_orders:
@@ -3211,6 +3272,20 @@ if command_center_view == "Alpaca":
             st.caption(f"Auto-cancel is on: an unfilled paper BUY limit order is canceled after {stale_limit_order_label}.")
         else:
             st.caption("Auto-cancel is off: waiting limit buys stay open until you cancel them or Alpaca expires them.")
+    if auto_cancel_stale_limit_orders or waiting_limit_buy_rows:
+        st.markdown("#### Limit buy auto-cancel status")
+        st.dataframe(
+            pd.DataFrame(stale_limit_cancel_status_records(managed_cancelable_alpaca_orders, stale_limit_order_minutes)),
+            use_container_width=True,
+            hide_index=True,
+        )
+        if show_portfolio_evidence:
+            with st.expander("Limit buy detection details *", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(cancelable_order_debug_records(managed_cancelable_alpaca_orders)),
+                    use_container_width=True,
+                    hide_index=True,
+                )
     can_submit = intent is not None and execution_mode == "paper"
     submit_disabled = intent is None or not preflight_check.ready or execution_mode != "paper"
     if show_portfolio_evidence:
