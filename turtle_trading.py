@@ -994,6 +994,99 @@ def strategy_use_case_records(selected_strategy: str) -> list[dict]:
     ]
 
 
+def exit_model_records() -> list[dict]:
+    return [
+        {
+            "Exit Rule": "Initial stop",
+            "Current Setting": f"{atr_mult:.2f} ATR",
+            "Plain English": "The first stop is based on the selected ATR stop distance.",
+        },
+        {
+            "Exit Rule": "Strategy exit",
+            "Current Setting": f"{exit_w} bars",
+            "Plain English": "The selected strategy also watches its saved sell line.",
+        },
+        {
+            "Exit Rule": "Break-even protection",
+            "Current Setting": "+1R",
+            "Plain English": "After the trade gains one original-risk unit, the stop can move to the entry price.",
+        },
+        {
+            "Exit Rule": "ATR trailing stop",
+            "Current Setting": "+2R then 3.0 ATR",
+            "Plain English": "After the trade gains two original-risk units, the stop trails from the highest price since entry.",
+        },
+        {
+            "Exit Rule": "Active sell trigger",
+            "Current Setting": "Highest protection level",
+            "Plain English": "The app uses the highest valid stop so protection can tighten but not loosen.",
+        },
+    ]
+
+
+def strategy_decision_detail() -> str:
+    if intent is not None and preflight_check.ready:
+        return f"{strategy_label} produced a BUY and risk checks passed."
+    blockers = [reason for reason in (preflight_check.blocked_reasons or risk_check.rejected_reasons) if reason]
+    if blockers:
+        return f"Blocked before order: {blockers[0]}"
+    requirements = live.get("buy_requirements") or {}
+    missing = [str(rule) for rule, passed in requirements.items() if not passed]
+    if missing:
+        return f"No BUY because this rule is not met: {missing[0]}."
+    if bool(live.get("in_simulated_trade")):
+        return "No BUY because the historical simulation is already in a trade, but Alpaca reality is checked separately."
+    return no_buy_reason(live)
+
+
+def research_summary_records() -> list[dict]:
+    rows_by_name = {str(row.get("Read", "")): row for row in setup_scorecard_rows}
+    required = required_setup_reads(strategy_type)
+    required_rows = [row for row in setup_scorecard_rows if str(row.get("Read", "")) in required]
+    passed_required = sum(
+        1
+        for row in required_rows
+        if str(row.get("Status", "")).lower() in {"good", "yes", "passed", "triggered", "found"}
+    )
+    overall = rows_by_name.get("Overall", {})
+    volume = rows_by_name.get("Volume", {})
+    volatility = rows_by_name.get("Volatility", {})
+    liquidity = rows_by_name.get("Liquidity", {})
+    rsi = rows_by_name.get("RSI condition", {})
+    return [
+        {
+            "Research Area": "Final read",
+            "Status": final_answer,
+            "Plain English": strategy_decision_detail(),
+        },
+        {
+            "Research Area": "Setup quality",
+            "Status": overall.get("Status", "Unknown"),
+            "Plain English": overall.get("Plain English", "Overall setup grade."),
+        },
+        {
+            "Research Area": "Required strategy rules",
+            "Status": f"{passed_required}/{len(required_rows)} passed" if required_rows else "Unknown",
+            "Plain English": "These rules create or block the BUY idea.",
+        },
+        {
+            "Research Area": "Risk approval",
+            "Status": "Passed" if risk_check.approved and preflight_check.ready else "Blocked",
+            "Plain English": "Risk and preflight checks must pass before paper orders can be sent.",
+        },
+        {
+            "Research Area": "Volume / liquidity",
+            "Status": f"{volume.get('Status', 'Unknown')} / {liquidity.get('Status', 'Unknown')}",
+            "Plain English": "Checks whether the setup has enough trading activity for cleaner fills.",
+        },
+        {
+            "Research Area": "Volatility / RSI",
+            "Status": f"{volatility.get('Status', 'Unknown')} / {rsi.get('Status', 'Unknown')}",
+            "Plain English": "Shows whether price movement is normal or stretched.",
+        },
+    ]
+
+
 def decision_ticket_records() -> list[dict]:
     if intent is None:
         return [
@@ -1998,6 +2091,8 @@ comparison_rows = strategy_comparison_records({
     "Trendline breakout": trendline_stats,
     "Trendline retest continuation": retest_stats,
 })
+for row in comparison_rows:
+    row["Exit Style"] = "Strategy exit + break-even + ATR trail"
 
 walk_forward_result = None
 walk_forward_error = None
@@ -2559,16 +2654,16 @@ setup_scorecard_rows = setup_scorecard_records(
 )
 if intent is None:
     final_answer = "WAIT"
-    final_detail = no_buy_reason(live)
+    final_detail = strategy_decision_detail()
 elif preflight_check.blocked_reasons or risk_check.rejected_reasons:
     final_answer = "BLOCK"
-    final_detail = (preflight_check.blocked_reasons or risk_check.rejected_reasons)[0]
+    final_detail = strategy_decision_detail()
 elif preflight_check.ready:
     final_answer = "TRADE"
-    final_detail = "Strategy setup and risk checks passed."
+    final_detail = strategy_decision_detail()
 else:
     final_answer = "WAIT"
-    final_detail = "No valid trade setup right now."
+    final_detail = strategy_decision_detail()
 answer_color = {"TRADE": "#3B6D11", "WAIT": "#8A6D1D", "BLOCK": "#A32D2D"}[final_answer]
 
 exit_preview_rows_for_auto = exit_preview_records(exit_previews)
@@ -3388,6 +3483,8 @@ elif command_center_view == "New Trade":
     st.markdown("#### Trade read")
     st.dataframe(pd.DataFrame(trade_read_records()), width="stretch", hide_index=True)
     st.caption("Required for BUY rows must pass before the app can create a BUY. Quality checks help you judge the setup.")
+    st.markdown("#### Research summary")
+    st.dataframe(pd.DataFrame(research_summary_records()), width="stretch", hide_index=True)
     with st.expander("Strategy use cases", expanded=False):
         st.dataframe(pd.DataFrame(strategy_use_case_records(strategy_label)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
@@ -3603,11 +3700,13 @@ if command_center_view == "New Trade":
     metric_card(c5, "Worst drop", f"{stats['max_drawdown_pct']}%", "Largest equity pullback")
     metric_card(c6, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
     metric_card(c7, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
+    st.markdown("#### Exit model used in this backtest")
+    st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
     
     with st.expander("Optional strategy tests" + (" *" if show_portfolio_evidence else ""), expanded=False):
         st.markdown("#### Strategy comparison")
         st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
-        st.caption("This compares breakout and pullback on the same ticker and settings.")
+        st.caption("This compares all four strategies on the same ticker. Each uses the same profit-protection exit model.")
         
         st.markdown("#### Test on newer price data")
         if walk_forward_result is None:
