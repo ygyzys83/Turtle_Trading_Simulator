@@ -372,6 +372,13 @@ def fetch_alpaca_stock_data(ticker: str, period: str, interval: str, api_key: st
     return data
 
 
+def fetch_price_data_for_source(symbol: str, history: str, interval_value: str, price_source: str) -> pd.DataFrame:
+    if price_source == "Ticker (Alpaca)":
+        market_data_config = AlpacaConfig.from_env()
+        return fetch_alpaca_stock_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret)
+    return fetch_stock_data(symbol, history, interval_value)
+
+
 def metric_card(col, label, value, sub, color_class=""):
     col.markdown(f"""
     <div class="metric-card">
@@ -710,6 +717,7 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
     return [
         {"Field": "Ticker", "Value": str(settings.get("symbol", "Not recorded"))},
         {"Field": "Strategy", "Value": str(settings.get("strategy_label", settings.get("strategy_type", "Not recorded")))},
+        {"Field": "Price data source", "Value": str(settings.get("price_data_source", "Not recorded"))},
         {"Field": "Price interval", "Value": str(settings.get("interval", "Not recorded"))},
         {"Field": "History used", "Value": str(settings.get("history", "Not recorded"))},
         {"Field": "Sizing account", "Value": str(settings.get("sizing_account_source", "Not recorded"))},
@@ -823,7 +831,8 @@ def automation_status_text() -> tuple[str, str, str]:
 def apply_paper_buy_order_settings(
     intent: TradeIntent | None,
     order_style: str,
-    limit_offset_pct: float,
+    limit_adjustment_pct: float,
+    custom_limit_price: float,
     reference_price: float,
 ) -> TradeIntent | None:
     if intent is None or intent.side != "buy":
@@ -833,18 +842,255 @@ def apply_paper_buy_order_settings(
     base_price = reference_price or intent.entry_price
     if base_price is None or base_price <= 0:
         return replace(intent, order_type="market", limit_price=None)
-    offset = max(0.0, float(limit_offset_pct)) / 100
-    limit_price = round_alpaca_price(base_price * (1 + offset))
     source_signals = list(intent.source_signals)
     if "paper_limit_order" not in source_signals:
         source_signals.append("paper_limit_order")
+    if order_style == "Custom limit price":
+        custom_price = optional_float(custom_limit_price)
+        limit_price = round_alpaca_price(custom_price) if custom_price and custom_price > 0 else None
+    else:
+        adjustment = max(0.0, float(limit_adjustment_pct)) / 100
+        if order_style == "Limit below current price":
+            adjustment *= -1
+        else:
+            adjustment = adjustment if order_style == "Limit above current price" else 0.0
+        limit_price = round_alpaca_price(base_price * (1 + adjustment))
     return replace(
         intent,
         order_type="limit",
         limit_price=limit_price,
-        entry_price=limit_price,
+        entry_price=limit_price or base_price,
         source_signals=source_signals,
     )
+
+
+def paper_buy_price_records(
+    intent: TradeIntent | None,
+    order_style: str,
+    limit_adjustment_pct: float,
+    custom_limit_price: float,
+    reference_price: float,
+) -> list[dict]:
+    if intent is None:
+        return [{"Field": "Paper buy price", "Value": "No BUY idea right now"}]
+    order_type = "Market" if intent.order_type == "market" else "Limit"
+    max_price = "Market order" if intent.order_type == "market" else money_or_missing(intent.limit_price)
+    adjustment_label = "None"
+    if order_style == "Limit below current price":
+        adjustment_label = f"{limit_adjustment_pct:.2f}% below reference"
+    elif order_style == "Limit above current price":
+        adjustment_label = f"{limit_adjustment_pct:.2f}% above reference"
+    elif order_style == "Custom limit price":
+        adjustment_label = f"Exact price: {money_or_missing(custom_limit_price)}"
+    limit_rule = (
+        "Buy at the next available market price."
+        if intent.order_type == "market"
+        else "Enter a custom limit price before sending this order."
+        if intent.limit_price is None
+        else "Do not buy above the listed limit price."
+    )
+    return [
+        {"Field": "Order sent to Alpaca", "Value": order_type},
+        {"Field": "Shares", "Value": f"{intent.quantity:,}"},
+        {"Field": "Reference price", "Value": money_or_missing(reference_price)},
+        {"Field": "Price instruction", "Value": order_style},
+        {"Field": "Price adjustment", "Value": adjustment_label},
+        {"Field": "Highest buy price", "Value": max_price},
+        {"Field": "Plain English", "Value": limit_rule},
+    ]
+
+
+def add_automation_history(action: str, detail: str = "", checked_at: str | None = None) -> None:
+    timestamp = checked_at or pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
+    record = {
+        "Time": timestamp,
+        "Action": str(action or "None"),
+        "Detail": str(detail or ""),
+    }
+    history = list(st.session_state.get("automation_event_history", []))
+    if not history or (history[-1].get("Action"), history[-1].get("Detail")) != (record["Action"], record["Detail"]):
+        history.append(record)
+    st.session_state["automation_event_history"] = history[-5:]
+
+
+def set_automation_action(action: str, detail: str = "", checked_at: str | None = None) -> None:
+    st.session_state["last_automation_action"] = action
+    st.session_state["last_automation_blocked_reason"] = detail
+    add_automation_history(action, detail, checked_at)
+
+
+def recent_automation_event_records() -> list[dict]:
+    return list(reversed(st.session_state.get("automation_event_history", [])))
+
+
+def strategy_use_case_records(selected_strategy: str) -> list[dict]:
+    descriptions = {
+        "Breakout continuation": "Best when price is clearing a recent range high and the broad trend is already up.",
+        "Trend pullback continuation": "Best when an uptrend pauses, pulls toward a moving average, then turns back up.",
+        "Trendline breakout": "Best when price breaks a descending resistance line after a controlled pullback.",
+        "Trendline retest continuation": "Best when price breaks resistance, retests that line, then resumes higher.",
+    }
+    cautions = {
+        "Breakout continuation": "Can chase extended moves if volume and volatility are poor.",
+        "Trend pullback continuation": "Can enter too early if the pullback keeps falling.",
+        "Trendline breakout": "Trendlines are estimated, so false breaks can happen.",
+        "Trendline retest continuation": "Fewer signals; the retest may never happen.",
+    }
+    return [
+        {"Strategy": name, "Best Use": descriptions[name], "Main Caution": cautions[name], "Selected": plain_yes_no(name == selected_strategy)}
+        for name in descriptions
+    ]
+
+
+def decision_ticket_records() -> list[dict]:
+    if intent is None:
+        return [
+            {"Item": "Decision", "Value": final_answer},
+            {"Item": "Reason", "Value": final_detail},
+            {"Item": "Next action", "Value": operator_state["Next Action"]},
+            {"Item": "Ticker", "Value": ticker},
+            {"Item": "Strategy", "Value": strategy_label},
+        ]
+    dollars_at_risk = max(0.0, (intent.entry_price - intent.stop_loss) * intent.quantity) if intent.stop_loss is not None else None
+    risk_pct_account = (dollars_at_risk / paper_order_risk_equity * 100) if dollars_at_risk is not None and paper_order_risk_equity else None
+    return [
+        {"Item": "Decision", "Value": final_answer},
+        {"Item": "Reason", "Value": final_detail},
+        {"Item": "Ticker", "Value": intent.symbol_clean},
+        {"Item": "Strategy", "Value": strategy_label},
+        {"Item": "Shares", "Value": f"{intent.quantity:,}"},
+        {"Item": "Reference price", "Value": money_or_missing(live.get("last_p"))},
+        {"Item": "Highest buy price", "Value": "Market order" if intent.order_type == "market" else money_or_missing(intent.limit_price)},
+        {"Item": "Stop loss", "Value": money_or_missing(intent.stop_loss)},
+        {"Item": "Dollars at risk", "Value": money_or_missing(dollars_at_risk)},
+        {"Item": "Account risk", "Value": pct_or_missing(risk_pct_account)},
+        {"Item": "Next action", "Value": operator_state["Next Action"]},
+    ]
+
+
+def research_card_records() -> list[dict]:
+    rows_by_name = {str(row.get("Read", "")): row for row in setup_scorecard_rows}
+    keys = [
+        "Overall",
+        "Trend",
+        "Breakout strength",
+        "Pullback",
+        "Momentum turn",
+        "Volume",
+        "Volatility",
+        "Liquidity",
+        "RSI condition",
+        "Market condition",
+        "Event risk",
+        "Risk approval",
+    ]
+    rows = []
+    for key in keys:
+        source = rows_by_name.get(key)
+        if source:
+            rows.append({"Research Area": key, "Read": source.get("Status", ""), "Plain English": source.get("Plain English", "")})
+    return rows
+
+
+def required_setup_reads(selected_strategy_type: str) -> set[str]:
+    base = {"Trend", "Risk approval"}
+    if selected_strategy_type == "pullback":
+        return base | {"Pullback", "Momentum turn"}
+    if selected_strategy_type == "trendline":
+        return base | {"Trendline", "Break above line"}
+    if selected_strategy_type == "trendline_retest":
+        return base | {"Trendline", "Break above line", "Retest"}
+    return base | {"Breakout"}
+
+
+def trade_read_records() -> list[dict]:
+    rows = [
+        {"Section": "Decision", "Item": "Final answer", "Status / Value": final_answer, "Plain English": final_detail},
+        {"Section": "Decision", "Item": "Next action", "Status / Value": operator_state["Next Action"], "Plain English": "What to do from here."},
+        {"Section": "Decision", "Item": "Ticker", "Status / Value": ticker, "Plain English": "Ticker being researched."},
+        {"Section": "Decision", "Item": "Strategy", "Status / Value": strategy_label, "Plain English": "Trading rule selected in the sidebar."},
+    ]
+    if intent is not None:
+        dollars_at_risk = max(0.0, (intent.entry_price - intent.stop_loss) * intent.quantity) if intent.stop_loss is not None else None
+        risk_pct_account = (dollars_at_risk / paper_order_risk_equity * 100) if dollars_at_risk is not None and paper_order_risk_equity else None
+        rows.extend(
+            [
+                {"Section": "Decision", "Item": "Shares", "Status / Value": f"{intent.quantity:,}", "Plain English": "Order size after risk sizing."},
+                {
+                    "Section": "Decision",
+                    "Item": "Highest buy price",
+                    "Status / Value": "Market order" if intent.order_type == "market" else money_or_missing(intent.limit_price),
+                    "Plain English": "Highest price the app plans to pay.",
+                },
+                {"Section": "Decision", "Item": "Stop loss", "Status / Value": money_or_missing(intent.stop_loss), "Plain English": "Current protective stop level."},
+                {"Section": "Decision", "Item": "Dollars at risk", "Status / Value": money_or_missing(dollars_at_risk), "Plain English": "Estimated loss if the stop is hit."},
+                {"Section": "Decision", "Item": "Account risk", "Status / Value": pct_or_missing(risk_pct_account), "Plain English": "Estimated risk as a percent of the account used for sizing."},
+            ]
+        )
+
+    required_reads = required_setup_reads(strategy_type)
+    for source in setup_scorecard_rows:
+        read = str(source.get("Read", ""))
+        if read == "Overall":
+            continue
+        section = "Required for BUY" if read in required_reads else "Quality check"
+        rows.append(
+            {
+                "Section": section,
+                "Item": read,
+                "Status / Value": source.get("Status", ""),
+                "Plain English": source.get("Plain English", ""),
+            }
+        )
+    return rows
+
+
+def automation_watch_records() -> list[dict]:
+    watched = []
+    if active_automation_level == "Auto exits only":
+        watched.append("open paper positions")
+    elif active_automation_level == "Auto entries and exits":
+        watched.append(f"{ticker} buy setup")
+        watched.append("open paper positions")
+    if auto_cancel_stale_limit_orders:
+        watched.append("old BUY limit orders")
+    return [
+        {"Item": "Automation session started", "Value": st.session_state.get("automation_session_started_at", "Not started")},
+        {"Item": "Watching", "Value": ", ".join(watched) if watched else "Nothing automatic right now"},
+        {"Item": "Check interval", "Value": f"{automation_refresh_seconds} seconds"},
+        {"Item": "Last check", "Value": st.session_state.get("last_automation_checked_at", "Not checked yet")},
+        {"Item": "Last action", "Value": st.session_state.get("last_automation_action", "None")},
+    ]
+
+
+def auto_entry_session_safety_blockers(symbol: str) -> list[str]:
+    events = st.session_state.get("session_audit_events", [])
+    auto_buys = [event for event in events if getattr(event, "event_type", "") == "auto_paper_entry_submitted"]
+    if len(auto_buys) >= max_auto_buys_per_session:
+        return [f"Automatic buys reached the session limit of {max_auto_buys_per_session}."]
+    if reentry_cooldown_minutes <= 0 or not symbol:
+        return []
+    latest_exit_time = None
+    for event in events:
+        if getattr(event, "event_type", "") not in {"auto_paper_exit_submitted", "alpaca_paper_exit_submitted"}:
+            continue
+        payload = getattr(event, "payload", {}) or {}
+        if str(payload.get("symbol", "")).strip().upper() != symbol:
+            continue
+        try:
+            event_time = pd.Timestamp(payload.get("checked_at") or getattr(event, "created_at", None))
+            if event_time.tzinfo is None:
+                event_time = event_time.tz_localize("America/Los_Angeles")
+            latest_exit_time = max(latest_exit_time, event_time) if latest_exit_time is not None else event_time
+        except Exception:
+            continue
+    if latest_exit_time is None:
+        return []
+    elapsed_minutes = (pd.Timestamp.now(tz="America/Los_Angeles") - latest_exit_time.tz_convert("America/Los_Angeles")).total_seconds() / 60
+    if elapsed_minutes < reentry_cooldown_minutes:
+        remaining = reentry_cooldown_minutes - elapsed_minutes
+        return [f"Waiting {remaining:.0f} more minutes before another automatic buy in {symbol}."]
+    return []
 
 
 def saved_buy_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
@@ -1128,10 +1374,14 @@ automation_refresh_seconds = st.sidebar.selectbox(
     help="How often the app checks for automatic paper buys or sells while automation is on.",
 )
 paper_buy_order_style = st.sidebar.selectbox(
-    "Paper buy order type",
-    ["Limit at current price", "Limit above current price", "Market"],
-    index=0,
-    help="Limit orders control the maximum buy price. Market orders prioritize immediate fills.",
+    "Paper buy price",
+    ["Limit below current price", "Limit at current price", "Limit above current price", "Custom limit price", "Market"],
+    index=1,
+    help=(
+        "Limit below current price waits for a pullback. Limit at current price uses the current reference price. "
+        "Limit above current price adds a small cushion. Custom limit price lets you type the exact max buy price. "
+        "Market buys immediately at the available market price."
+    ),
 )
 auto_cancel_stale_limit_orders = st.sidebar.checkbox(
     "Auto-cancel old limit buys",
@@ -1172,17 +1422,52 @@ with st.sidebar.expander("Advanced safety", expanded=False):
             "Risk limits, cash, concentration, and open-order checks still apply."
         ),
     )
+    max_auto_buys_per_session = st.number_input(
+        "Max automatic buys this session",
+        min_value=1,
+        max_value=20,
+        value=3,
+        step=1,
+        help="Caps app-triggered automatic paper buys until you reset the paper session or restart the app.",
+    )
+    reentry_cooldown_minutes = st.selectbox(
+        "Wait after an exit before re-buying",
+        [0, 15, 30, 60, 120, 240],
+        index=3,
+        format_func=lambda minutes: "No wait" if minutes == 0 else f"{minutes} minutes",
+        help="Prevents the app from automatically re-buying the same ticker right after an app-recorded paper exit.",
+    )
 allowed_symbols = tuple(s.strip().upper() for s in allowed_symbols_text.split(",") if s.strip())
-paper_buy_limit_offset_pct = 0.0
-if paper_buy_order_style == "Limit above current price":
-    paper_buy_limit_offset_pct = st.sidebar.number_input(
-        "Buy limit offset (%)",
+paper_buy_limit_adjustment_pct = 0.0
+paper_buy_custom_limit_price = 0.0
+if paper_buy_order_style == "Limit below current price":
+    paper_buy_limit_adjustment_pct = st.sidebar.number_input(
+        "Buy limit discount (%)",
+        min_value=0.00,
+        max_value=10.00,
+        value=0.25,
+        step=0.01,
+        format="%.2f",
+        help="Subtracts this percent from the current reference price. Example: 0.50% on $100 sets a $99.50 buy limit.",
+    )
+elif paper_buy_order_style == "Limit above current price":
+    paper_buy_limit_adjustment_pct = st.sidebar.number_input(
+        "Buy limit cushion (%)",
         min_value=0.00,
         max_value=2.00,
         value=0.10,
         step=0.01,
         format="%.2f",
-        help="Adds a small cushion above the reference price so a buy limit order has a better chance to fill.",
+        help="Adds this percent above the current reference price. Example: 0.10% on $100 sets a $100.10 buy limit.",
+    )
+elif paper_buy_order_style == "Custom limit price":
+    paper_buy_custom_limit_price = st.sidebar.number_input(
+        "Exact buy limit price ($)",
+        min_value=0.00,
+        value=0.00,
+        step=0.01,
+        format="%.2f",
+        help="The order will not buy above this exact price. Leave at 0.00 to block sending until you type a price.",
     )
 reset_paper_broker = st.sidebar.button("Reset paper account")
 
@@ -1467,6 +1752,8 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["last_auto_entry_decision_key"] = None
     st.session_state["last_automation_action"] = "None"
     st.session_state["last_automation_blocked_reason"] = ""
+    st.session_state["automation_event_history"] = []
+    st.session_state["automation_session_started_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["tracked_alpaca_orders"] = []
     st.session_state["simulated_alpaca_positions"] = []
 if reset_paper_broker:
@@ -1483,6 +1770,8 @@ if reset_paper_broker:
     st.session_state["last_auto_entry_decision_key"] = None
     st.session_state["last_automation_action"] = "None"
     st.session_state["last_automation_blocked_reason"] = ""
+    st.session_state["automation_event_history"] = []
+    st.session_state["automation_session_started_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["tracked_alpaca_orders"] = []
     st.session_state["simulated_alpaca_positions"] = []
 st.session_state.setdefault("shadow_decisions", [])
@@ -1494,6 +1783,8 @@ st.session_state.setdefault("last_auto_exit_decision_key", None)
 st.session_state.setdefault("last_auto_entry_decision_key", None)
 st.session_state.setdefault("last_automation_action", "None")
 st.session_state.setdefault("last_automation_blocked_reason", "")
+st.session_state.setdefault("automation_event_history", [])
+st.session_state.setdefault("automation_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
 st.session_state.setdefault("tracked_alpaca_orders", [])
 st.session_state.setdefault("simulated_alpaca_positions", [])
 audit_store = JsonlAuditStore(audit_log_path)
@@ -1676,6 +1967,7 @@ current_strategy_settings = {
     "symbol": ticker,
     "interval": interval,
     "history": period,
+    "price_data_source": data_source,
     "strategy_type": strategy_type,
     "strategy_label": strategy_label,
     "account_size": account,
@@ -1687,12 +1979,15 @@ current_strategy_settings = {
     "pullback_average_length": pullback_w,
     "momentum_turn_length": momentum_w,
     "paper_buy_order_type": paper_buy_order_style,
-    "paper_buy_limit_offset_pct": paper_buy_limit_offset_pct,
+    "paper_buy_limit_adjustment_pct": paper_buy_limit_adjustment_pct,
+    "paper_buy_custom_limit_price": paper_buy_custom_limit_price,
     "auto_cancel_stale_limit_orders": auto_cancel_stale_limit_orders,
     "stale_limit_order_minutes": stale_limit_order_minutes,
     "allow_limit_buys_outside_market_hours": allow_limit_buys_outside_market_hours,
     "automation_refresh_seconds": automation_refresh_seconds,
     "allow_add_to_existing_position": allow_add_to_existing_position,
+    "max_auto_buys_per_session": max_auto_buys_per_session,
+    "reentry_cooldown_minutes": reentry_cooldown_minutes,
 }
 current_exit_settings = dict(current_strategy_settings)
 current_exit_settings["auto_exit_enabled"] = True
@@ -1728,7 +2023,8 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             return {"ready": False, "reason": "Saved exit settings do not include a ticker.", "trigger_price": None}
         if history == "synthetic":
             return {"ready": False, "reason": "Saved exit settings use synthetic data; auto exit needs real ticker data.", "trigger_price": None}
-        data = fetch_stock_data(symbol, history, saved_interval)
+        saved_price_source = str(settings.get("price_data_source", "Ticker (yfinance)"))
+        data = fetch_price_data_for_source(symbol, history, saved_interval, saved_price_source)
         if saved_strategy_type == "pullback":
             _, _, _, _, saved_live, _, _ = simulate_trend_pullback_strategy(
                 account=saved_account,
@@ -1869,7 +2165,8 @@ current_manifest_record = run_manifest_record(current_run_manifest)
 intent = apply_paper_buy_order_settings(
     live.get("trade_intent"),
     paper_buy_order_style,
-    paper_buy_limit_offset_pct,
+    paper_buy_limit_adjustment_pct,
+    paper_buy_custom_limit_price,
     float(live.get("last_p", 0) or 0),
 )
 intent = resize_trade_intent_for_account(intent, paper_order_risk_equity, risk_dec)
@@ -2112,6 +2409,7 @@ auto_entry_blockers = (
     + duplicate_alpaca_reasons
     + open_order_reasons
     + (["This paper order is already tracked in the app."] if duplicate_preview_submitted else [])
+    + auto_entry_session_safety_blockers(intent.symbol_clean if intent else "")
 )
 auto_entry_status = auto_entry_decision(
     automation_level=active_automation_level,
@@ -2215,8 +2513,7 @@ def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
         return False
     blockers = stale_limit_cancel_blockers(managed_cancelable_alpaca_orders, stale_limit_order_minutes)
     if blockers:
-        st.session_state["last_automation_action"] = "Limit buy cancel waiting"
-        st.session_state["last_automation_blocked_reason"] = " ".join(blockers)
+        set_automation_action("Limit buy cancel waiting", " ".join(blockers), automation_checked_at)
         return False
     stale_orders = stale_limit_buy_orders(managed_cancelable_alpaca_orders, stale_limit_order_minutes)
     if not stale_orders:
@@ -2226,8 +2523,7 @@ def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
     age_minutes = order_age_minutes(selected_order)
     cancel_preview = build_alpaca_cancel_preview(selected_order, alpaca_adapter.config)
     if not cancel_preview.valid:
-        st.session_state["last_automation_action"] = "Limit buy cancel blocked"
-        st.session_state["last_automation_blocked_reason"] = " ".join(cancel_preview.blocked_reasons)
+        set_automation_action("Limit buy cancel blocked", " ".join(cancel_preview.blocked_reasons), automation_checked_at)
         return False
     try:
         cancel_result = alpaca_adapter.cancel_order(
@@ -2250,8 +2546,11 @@ def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
         )
         st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
         sync_auto_entry_sent_hashes_with_open_orders()
-        st.session_state["last_automation_action"] = f"Canceled old limit buy: {selected_order.get('Symbol', '')}"
-        st.session_state["last_automation_blocked_reason"] = f"Order waited {order_age_label(age_minutes)}."
+        set_automation_action(
+            f"Canceled old limit buy: {selected_order.get('Symbol', '')}",
+            f"Order waited {order_age_label(age_minutes)}.",
+            automation_checked_at,
+        )
         cancel_event = AuditEvent(
             event_type="auto_old_limit_buy_cancel_submitted",
             message="Automatic stale paper limit buy cancel sent to Alpaca.",
@@ -2274,8 +2573,7 @@ def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
             audit_store.append(cancel_event)
         return True
     except Exception as exc:
-        st.session_state["last_automation_action"] = "Limit buy cancel blocked"
-        st.session_state["last_automation_blocked_reason"] = str(exc)
+        set_automation_action("Limit buy cancel blocked", str(exc), automation_checked_at)
         cancel_event = AuditEvent(
             event_type="auto_old_limit_buy_cancel_blocked",
             message=str(exc),
@@ -2299,8 +2597,11 @@ def run_paper_automation_once() -> None:
     record_automation_decisions(automation_checked_at)
     _, broker_order_state_changed = refresh_tracked_alpaca_orders_from_broker()
     if broker_order_state_changed:
-        st.session_state["last_automation_action"] = "Alpaca orders refreshed"
-        st.session_state["last_automation_blocked_reason"] = "Order status changed at Alpaca. Automation will re-check with fresh order state."
+        set_automation_action(
+            "Alpaca orders refreshed",
+            "Order status changed at Alpaca. Automation will re-check with fresh order state.",
+            automation_checked_at,
+        )
         st.rerun()
 
     if auto_exit_status.ready:
@@ -2353,8 +2654,7 @@ def run_paper_automation_once() -> None:
                 st.session_state["tracked_alpaca_orders"].append(tracked_record)
                 broker_state_store.upsert(tracked_record)
             st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
-            st.session_state["last_automation_action"] = f"Paper exit sent: {auto_exit_intent.quantity} {auto_exit_symbol}"
-            st.session_state["last_automation_blocked_reason"] = ""
+            set_automation_action(f"Paper exit sent: {auto_exit_intent.quantity} {auto_exit_symbol}", "", automation_checked_at)
             auto_submit_event = AuditEvent(
                 event_type="auto_paper_exit_submitted",
                 message="Automatic paper exit sent to Alpaca.",
@@ -2374,8 +2674,7 @@ def run_paper_automation_once() -> None:
                 audit_store.append(auto_submit_event)
         except Exception as exc:
             st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
-            st.session_state["last_automation_action"] = "Paper exit blocked"
-            st.session_state["last_automation_blocked_reason"] = str(exc)
+            set_automation_action("Paper exit blocked", str(exc), automation_checked_at)
             auto_block_event = AuditEvent(
                 event_type="auto_paper_exit_blocked",
                 message=str(exc),
@@ -2400,16 +2699,14 @@ def run_paper_automation_once() -> None:
                 raise ValueError("Automatic buy could not find a current trade idea.")
             live_sent_hashes = active_tracked_preview_hashes(st.session_state.get("tracked_alpaca_orders", []))
             if auto_entry_status.preview_hash in live_sent_hashes:
-                st.session_state["last_automation_action"] = "Paper buy skipped"
-                st.session_state["last_automation_blocked_reason"] = "This exact paper buy is already open at Alpaca."
+                set_automation_action("Paper buy skipped", "This exact paper buy is already open at Alpaca.", automation_checked_at)
                 return
             local_buy_reasons = local_open_buy_order_reasons(
                 intent.symbol_clean,
                 st.session_state.get("tracked_alpaca_orders", []),
             )
             if local_buy_reasons:
-                st.session_state["last_automation_action"] = "Paper buy skipped"
-                st.session_state["last_automation_blocked_reason"] = "; ".join(local_buy_reasons)
+                set_automation_action("Paper buy skipped", "; ".join(local_buy_reasons), automation_checked_at)
                 return
             st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
             alpaca_auto_entry_order = alpaca_adapter.submit_order(
@@ -2443,8 +2740,7 @@ def run_paper_automation_once() -> None:
                 broker_state_store.replace_all(updated_orders)
                 st.session_state["tracked_alpaca_orders"] = updated_orders
             order_type = "limit" if intent.order_type == "limit" else "market"
-            st.session_state["last_automation_action"] = f"Paper buy {order_type} sent: {intent.quantity} {intent.symbol_clean}"
-            st.session_state["last_automation_blocked_reason"] = ""
+            set_automation_action(f"Paper buy {order_type} sent: {intent.quantity} {intent.symbol_clean}", "", automation_checked_at)
             auto_entry_submit_event = AuditEvent(
                 event_type="auto_paper_entry_submitted",
                 message="Automatic paper buy sent to Alpaca.",
@@ -2469,8 +2765,7 @@ def run_paper_automation_once() -> None:
         except Exception as exc:
             if auto_entry_status.preview_hash not in st.session_state["auto_entry_sent_hashes"]:
                 st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
-            st.session_state["last_automation_action"] = "Paper buy blocked"
-            st.session_state["last_automation_blocked_reason"] = str(exc)
+            set_automation_action("Paper buy blocked", str(exc), automation_checked_at)
             auto_entry_block_event = AuditEvent(
                 event_type="auto_paper_entry_blocked",
                 message=str(exc),
@@ -2542,11 +2837,11 @@ def render_automation_status() -> None:
     )
     if show_portfolio_evidence:
         st.markdown("#### Automation runtime *")
-        st.dataframe(pd.DataFrame(automation_runtime_records(runtime_state)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(automation_runtime_records(runtime_state)), width="stretch", hide_index=True)
         st.markdown("#### Automatic buy check *")
-        st.dataframe(pd.DataFrame(auto_entry_decision_records(auto_entry_status)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(auto_entry_decision_records(auto_entry_status)), width="stretch", hide_index=True)
         st.markdown("#### Automatic exit check *")
-        st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), width="stretch", hide_index=True)
 
 
 def render_daily_automation_panel() -> None:
@@ -2568,6 +2863,12 @@ def render_daily_automation_panel() -> None:
             else "Unfilled limit buys stay open until you cancel them or Alpaca expires them."
         )
         st.caption(limit_cancel_text)
+    st.markdown("#### Automation watch")
+    st.dataframe(pd.DataFrame(automation_watch_records()), width="stretch", hide_index=True)
+    recent_actions = recent_automation_event_records()
+    if recent_actions:
+        with st.expander("Last 5 automation actions", expanded=False):
+            st.dataframe(pd.DataFrame(recent_actions), width="stretch", hide_index=True)
 
 
 def render_open_positions_panel() -> None:
@@ -2590,12 +2891,12 @@ def render_open_positions_panel() -> None:
         return
 
     st.markdown("#### Positions being managed")
-    st.dataframe(pd.DataFrame(daily_position_rows(alpaca_positions, position_settings_by_symbol)), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(daily_position_rows(alpaca_positions, position_settings_by_symbol)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         with st.expander("Position management details *", expanded=False):
             st.dataframe(
                 pd.DataFrame(managed_position_records(alpaca_positions, position_settings_by_symbol)),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
     position_options = [
@@ -2653,10 +2954,49 @@ def render_open_positions_panel() -> None:
         st.warning(selected_exit_reason)
     else:
         st.info(selected_exit_reason)
+    st.markdown("#### Daily position plan")
+    st.dataframe(
+        pd.DataFrame(
+            position_exit_plan_records(
+                selected_exit_settings,
+                exit_ready=selected_exit_ready,
+                exit_reason=selected_exit_reason,
+                exit_trigger_price=selected_exit_trigger_price,
+            )
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    quick_cols = st.columns(3)
+    if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
+        quick_settings = dict(selected_exit_settings)
+        quick_settings["symbol"] = selected_position_symbol
+        quick_settings["atr_stop_multiplier"] = max(0.5, float(quick_settings.get("atr_stop_multiplier", atr_mult)) - 0.25)
+        updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+        broker_state_store.replace_all(updated_orders)
+        st.session_state["tracked_alpaca_orders"] = updated_orders
+        st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_tightened", message="ATR stop tightened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+        st.rerun()
+    if quick_cols[1].button("Loosen ATR Stop", key=f"loosen_exit_{selected_position_symbol}"):
+        quick_settings = dict(selected_exit_settings)
+        quick_settings["symbol"] = selected_position_symbol
+        quick_settings["atr_stop_multiplier"] = min(5.0, float(quick_settings.get("atr_stop_multiplier", atr_mult)) + 0.25)
+        updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+        broker_state_store.replace_all(updated_orders)
+        st.session_state["tracked_alpaca_orders"] = updated_orders
+        st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_loosened", message="ATR stop loosened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+        st.rerun()
+    if quick_cols[2].button("Use Current Sidebar Exit Settings", key=f"use_current_exit_{selected_position_symbol}"):
+        quick_settings = {**current_exit_settings, "symbol": selected_position_symbol, "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", True))}
+        updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+        broker_state_store.replace_all(updated_orders)
+        st.session_state["tracked_alpaca_orders"] = updated_orders
+        st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+        st.rerun()
     st.markdown("#### Exit risk")
     st.dataframe(
         pd.DataFrame(combined_position_risk_records(selected_position, selected_exit_trigger_price)),
-        use_container_width=True,
+        width="stretch",
         hide_index=True,
     )
     if show_portfolio_evidence:
@@ -2670,7 +3010,7 @@ def render_open_positions_panel() -> None:
                         selected_exit_trigger_price,
                     )
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 
@@ -2787,13 +3127,13 @@ def render_open_positions_panel() -> None:
             st.markdown("#### Entry snapshot")
             st.dataframe(
                 pd.DataFrame(entry_snapshot_records(selected_entry_settings)),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.markdown("#### All saved entry settings")
             st.dataframe(
                 pd.DataFrame([{"Setting": plain_setting_name(key), "Value": str(value)} for key, value in selected_entry_settings.items()]),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         else:
@@ -2833,15 +3173,21 @@ elif command_center_view == "New Trade":
             next_action=operator_state["Next Action"],
         )
     )
-    st.markdown("#### Setup quality")
-    st.dataframe(pd.DataFrame(setup_scorecard_rows), use_container_width=True, hide_index=True)
-    with st.expander("Required rules vs quality checks", expanded=False):
-        st.markdown("#### Required for BUY")
-        st.dataframe(pd.DataFrame(buy_requirement_records(live)), use_container_width=True, hide_index=True)
-        st.caption("Every required BUY rule must pass before the app can create a BUY intent.")
-        st.markdown("#### Quality checks only")
-        st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), use_container_width=True, hide_index=True)
-        st.caption("Quality checks help you judge the setup. They do not create a BUY intent by themselves.")
+    st.markdown("#### Trade read")
+    st.dataframe(pd.DataFrame(trade_read_records()), width="stretch", hide_index=True)
+    st.caption("Required for BUY rows must pass before the app can create a BUY. Quality checks help you judge the setup.")
+    with st.expander("Strategy use cases", expanded=False):
+        st.dataframe(pd.DataFrame(strategy_use_case_records(strategy_label)), width="stretch", hide_index=True)
+    if show_portfolio_evidence:
+        with st.expander("Detailed setup evidence *", expanded=False):
+            st.markdown("#### Decision ticket *")
+            st.dataframe(pd.DataFrame(decision_ticket_records()), width="stretch", hide_index=True)
+            st.markdown("#### Setup quality details *")
+            st.dataframe(pd.DataFrame(setup_scorecard_rows), width="stretch", hide_index=True)
+            st.markdown("#### Required BUY rules *")
+            st.dataframe(pd.DataFrame(buy_requirement_records(live)), width="stretch", hide_index=True)
+            st.markdown("#### Quality input definitions *")
+            st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), width="stretch", hide_index=True)
     if intent is None:
         st.info("No trade right now. The strategy is waiting.")
     else:
@@ -2854,9 +3200,23 @@ elif command_center_view == "New Trade":
             f"Order sizing uses {paper_order_account_source}: "
             f"${paper_order_risk_equity:,.2f} account value and ${paper_order_available_cash:,.2f} available cash."
         )
+        st.markdown("#### Paper buy price")
+        st.dataframe(
+            pd.DataFrame(
+                paper_buy_price_records(
+                    intent,
+                    paper_buy_order_style,
+                    paper_buy_limit_adjustment_pct,
+                    paper_buy_custom_limit_price,
+                    float(live.get("last_p", 0) or 0),
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
         st.caption(intent.rationale)
         with st.expander("Trade idea details", expanded=False):
-            st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         st.markdown("#### New trade evidence *")
         st.dataframe(
@@ -2869,13 +3229,13 @@ elif command_center_view == "New Trade":
                     broker_connected=alpaca_status.connected,
                 )
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         with st.expander("Research and strategy context *", expanded=False):
             st.dataframe(
                 pd.DataFrame(strategy_context_records(live, entry_w, exit_w, ma_w)),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
 elif command_center_view == "Alpaca":
@@ -2887,10 +3247,10 @@ elif command_center_view == "Alpaca":
         {"Item": "Alpaca orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders)},
         {"Item": "Alpaca data fresh", "Value": plain_yes_no(not alpaca_state_health.stale)},
     ]
-    st.dataframe(pd.DataFrame(risk_broker_rows), use_container_width=True, hide_index=True)
+    st.dataframe(pd.DataFrame(risk_broker_rows), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         st.markdown("#### Broker details *")
-        st.dataframe(pd.DataFrame(broker_status_records(broker_statuses)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(broker_status_records(broker_statuses)), width="stretch", hide_index=True)
     if alpaca_state_health.reasons:
         st.warning(" ".join(alpaca_state_health.reasons))
 
@@ -2900,14 +3260,14 @@ elif command_center_view == "Alpaca":
             st.markdown("- Paper orders require paper mode, passed risk checks, a connected paper account, and the paper account switch.")
             st.markdown("- The app cannot let the agent change risk rules, credentials, order code, or the Kill Switch.")
             st.markdown("- Live automation stays blocked while paper trading is being tested.")
-            st.dataframe(pd.DataFrame(production_readiness_checks()), use_container_width=True, hide_index=True)
-            st.dataframe(pd.DataFrame(immutable_boundary_records()), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(production_readiness_checks()), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(immutable_boundary_records()), width="stretch", hide_index=True)
             st.markdown("#### Broker failure examples")
-            st.dataframe(pd.DataFrame(broker_state_simulation_records()), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(broker_state_simulation_records()), width="stretch", hide_index=True)
     
     if show_portfolio_evidence:
         with st.expander("Session settings record *", expanded=False):
-            st.dataframe(pd.DataFrame(run_manifest_records([current_manifest_record])), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(run_manifest_records([current_manifest_record])), width="stretch", hide_index=True)
             if st.button("Save Run Summary"):
                 manifest_store.append(current_run_manifest)
                 manifest_event = AuditEvent(
@@ -2926,7 +3286,7 @@ elif command_center_view == "Alpaca":
             recent_manifests = manifest_store.read_recent(limit=10)
             if recent_manifests:
                 st.markdown("#### Recent run summaries")
-                st.dataframe(pd.DataFrame(run_manifest_records(recent_manifests)), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(run_manifest_records(recent_manifests)), width="stretch", hide_index=True)
             st.caption("This saves the app settings used for a session. It does not contact Alpaca.")
     
         with st.expander("Live trading setup records *", expanded=False):
@@ -2934,7 +3294,7 @@ elif command_center_view == "Alpaca":
             live_lock_rows = live_mode_lockfile_records(live_lockfile_path)
             live_lockfile_present = any(row["Check"] == "Live trading locked" and row["Passed"] for row in live_lock_rows)
             st.markdown("#### Live trading lock")
-            st.dataframe(pd.DataFrame(live_lock_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(live_lock_rows), width="stretch", hide_index=True)
             if st.button("Create Live Trading Lock"):
                 lock_path = write_live_mode_lockfile(live_lockfile_path)
                 lock_event = AuditEvent(
@@ -2958,7 +3318,7 @@ elif command_center_view == "Alpaca":
                         live_lockfile_present=live_lockfile_present,
                     )
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.caption("These checks are local only. The lock file does not enable live trading.")
@@ -2970,7 +3330,7 @@ if command_center_view == "New Trade":
     selected_trade = trade_log[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(trade_log) else None
     st.plotly_chart(
         build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, selected_trade),
-        use_container_width=True,
+        width="stretch",
         config={"scrollZoom": True},
     )
     
@@ -2996,7 +3356,7 @@ if command_center_view == "New Trade":
     
         event = st.dataframe(
             display_df.style.map(color_pnl, subset=["P&L $", "% Account"]),
-            use_container_width=True,
+            width="stretch",
             height=min(400, 38 + 35 * len(display_df)),
             on_select="rerun",
             selection_mode="single-row",
@@ -3010,7 +3370,7 @@ if command_center_view == "New Trade":
         if selected_trade is not None:
             st.markdown("#### Trade review")
             review = review_closed_trade(selected_trade, trade_proposal.thesis)
-            st.dataframe(pd.DataFrame(review_records(review)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(review_records(review)), width="stretch", hide_index=True)
             with st.expander("Lessons from this trade", expanded=False):
                 for lesson in review.lessons:
                     st.markdown(f"- {lesson}")
@@ -3033,7 +3393,7 @@ if command_center_view == "New Trade":
     
     with st.expander("Optional strategy tests" + (" *" if show_portfolio_evidence else ""), expanded=False):
         st.markdown("#### Strategy comparison")
-        st.dataframe(pd.DataFrame(comparison_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
         st.caption("This compares breakout and pullback on the same ticker and settings.")
         
         st.markdown("#### Test on newer price data")
@@ -3056,7 +3416,7 @@ if command_center_view == "New Trade":
             if show_portfolio_evidence:
                 st.dataframe(
                     pd.DataFrame(walk_forward_records(walk_forward_result)),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             with st.expander("What this test used", expanded=False):
@@ -3085,7 +3445,7 @@ if command_center_view == "New Trade":
             if show_portfolio_evidence:
                 st.dataframe(
                     pd.DataFrame(candidate_records(parameter_candidates)),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
             st.caption("This comparison can suggest strategy settings only. It cannot change risk limits, broker access, order mode, credentials, or the Kill Switch.")
@@ -3102,7 +3462,7 @@ if command_center_view == "New Trade":
             else:
                 st.markdown('<span class="signal-flat">NO TRADE RIGHT NOW</span>', unsafe_allow_html=True)
             st.markdown("#### Required for BUY")
-            st.dataframe(pd.DataFrame(buy_requirement_records(live)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(buy_requirement_records(live)), width="stretch", hide_index=True)
             st.markdown("#### Required for automatic SELL")
             st.dataframe(
                 pd.DataFrame(
@@ -3112,13 +3472,13 @@ if command_center_view == "New Trade":
                         exit_settings_saved=exit_settings_available if first_exit_symbol else None,
                     )
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.markdown("#### Quality checks")
-            st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), width="stretch", hide_index=True)
         with detail_tabs[1]:
-            st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), width="stretch", hide_index=True)
             st.markdown(f"**Trade idea:** {trade_proposal.thesis.thesis}")
             st.markdown(f"**What would make this wrong:** {trade_proposal.thesis.invalidation}")
             st.markdown("#### What the agent used")
@@ -3140,14 +3500,14 @@ if command_center_view == "New Trade":
                         blocked_reasons=preflight_check.blocked_reasons or risk_check.rejected_reasons,
                     )
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
-            st.dataframe(pd.DataFrame(risk_policy_records(risk_limits)), use_container_width=True, hide_index=True)
-            st.dataframe(pd.DataFrame(preflight_records(preflight_check)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(risk_policy_records(risk_limits)), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(preflight_records(preflight_check)), width="stretch", hide_index=True)
             checks_df = pd.DataFrame([{"Check": name.replace("_", " ").title(), "Passed": passed} for name, passed in risk_check.checks.items()])
             if not checks_df.empty:
-                st.dataframe(checks_df, use_container_width=True, hide_index=True)
+                st.dataframe(checks_df, width="stretch", hide_index=True)
 if command_center_view == "Alpaca":
     page_section("4. Alpaca paper trading", "Check the paper account, send paper orders, and control automation from one place.")
     st.info(f"{operator_state['State']}: {operator_state['Next Action']}")
@@ -3165,7 +3525,7 @@ if command_center_view == "Alpaca":
                     automation_status=active_automation_level,
                 )
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     sub_section("4.1 Account status", "Current Alpaca paper connection, positions, and orders.")
@@ -3176,40 +3536,40 @@ if command_center_view == "Alpaca":
             {"Item": "Open Alpaca positions", "Value": len(alpaca_positions)},
             {"Item": "Alpaca orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders)},
         ]
-        st.dataframe(pd.DataFrame(broker_summary_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(broker_summary_rows), width="stretch", hide_index=True)
         if show_portfolio_evidence:
             st.markdown("#### Broker details *")
             st.dataframe(
                 pd.DataFrame(broker_status_records(broker_statuses)),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.markdown("#### Alpaca setup checks *")
-            st.dataframe(pd.DataFrame(alpaca_config_validation_records(alpaca_adapter.config)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alpaca_config_validation_records(alpaca_adapter.config)), width="stretch", hide_index=True)
         alpaca_tabs = st.tabs(["Alpaca account", "Alpaca positions", "Alpaca orders"])
         with alpaca_tabs[0]:
             account_records = alpaca_account_records
             if account_records:
-                st.dataframe(pd.DataFrame(account_records), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(account_records), width="stretch", hide_index=True)
             else:
                 st.caption("No Alpaca account data available. Configure paper credentials and install alpaca-py.")
         with alpaca_tabs[1]:
             if alpaca_positions:
-                st.dataframe(pd.DataFrame(alpaca_positions), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(alpaca_positions), width="stretch", hide_index=True)
             else:
                 st.caption("No Alpaca positions available.")
         with alpaca_tabs[2]:
             if alpaca_orders:
-                st.dataframe(pd.DataFrame(alpaca_orders), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(alpaca_orders), width="stretch", hide_index=True)
             else:
                 st.caption("No Alpaca orders available.")
         reconcile_rows = reconcile_alpaca_positions(alpaca_positions, st.session_state["tracked_alpaca_orders"])
         if show_portfolio_evidence and reconcile_rows:
             st.markdown("#### Position tracking details *")
-            st.dataframe(pd.DataFrame(reconcile_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(reconcile_rows), width="stretch", hide_index=True)
         if show_portfolio_evidence and exit_previews:
             st.markdown("#### Exit order details *")
-            st.dataframe(pd.DataFrame(exit_preview_records(exit_previews)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(exit_preview_records(exit_previews)), width="stretch", hide_index=True)
         if alpaca_state_health.reasons:
             st.warning(" ".join(alpaca_state_health.reasons))
     
@@ -3241,8 +3601,8 @@ if command_center_view == "Alpaca":
     )
     st.caption(current_market_advisory.get("Message", ""))
     if show_portfolio_evidence:
-        st.dataframe(pd.DataFrame(monitoring_records(monitoring_result)), use_container_width=True, hide_index=True)
-        st.dataframe(pd.DataFrame([current_market_advisory]), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(monitoring_records(monitoring_result)), width="stretch", hide_index=True)
+        st.dataframe(pd.DataFrame([current_market_advisory]), width="stretch", hide_index=True)
         st.markdown("#### Broker health details *")
         st.dataframe(
             pd.DataFrame(
@@ -3253,7 +3613,7 @@ if command_center_view == "Alpaca":
                     market_advisory=current_market_advisory,
                 )
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
     for alert in monitoring_result.alerts:
@@ -3267,7 +3627,7 @@ if command_center_view == "Alpaca":
     sub_section("4.3 Paper order actions", "Send a paper buy, sell an open paper position, or cancel a waiting paper order.")
     if waiting_limit_buy_rows:
         st.markdown("#### Waiting limit buys")
-        st.dataframe(pd.DataFrame(waiting_limit_buy_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(waiting_limit_buy_rows), width="stretch", hide_index=True)
         if auto_cancel_stale_limit_orders:
             st.caption(f"Auto-cancel is on: an unfilled paper BUY limit order is canceled after {stale_limit_order_label}.")
         else:
@@ -3276,14 +3636,14 @@ if command_center_view == "Alpaca":
         st.markdown("#### Limit buy auto-cancel status")
         st.dataframe(
             pd.DataFrame(stale_limit_cancel_status_records(managed_cancelable_alpaca_orders, stale_limit_order_minutes)),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         if show_portfolio_evidence:
             with st.expander("Limit buy detection details *", expanded=False):
                 st.dataframe(
                     pd.DataFrame(cancelable_order_debug_records(managed_cancelable_alpaca_orders)),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
     can_submit = intent is not None and execution_mode == "paper"
@@ -3325,8 +3685,21 @@ if command_center_view == "Alpaca":
     )
     if intent is not None:
         st.markdown("#### Manual paper buy")
+        st.dataframe(
+            pd.DataFrame(
+                paper_buy_price_records(
+                    intent,
+                    paper_buy_order_style,
+                    paper_buy_limit_adjustment_pct,
+                    paper_buy_custom_limit_price,
+                    float(live.get("last_p", 0) or 0),
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
         if show_portfolio_evidence:
-            st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_preview)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_preview)), width="stretch", hide_index=True)
         elif alpaca_preview.valid:
             limit_note = (
                 f" limit ${float(alpaca_preview.order.get('limit_price')):,.2f}"
@@ -3421,7 +3794,7 @@ if command_center_view == "Alpaca":
             )
             for item in tracked_alpaca_orders
         ]
-        st.dataframe(pd.DataFrame(tracked_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(tracked_rows), width="stretch", hide_index=True)
     
     if st.session_state.get("tracked_alpaca_orders") or alpaca_positions:
         tracked_refresh_rows = alpaca_adapter.refreshed_tracked_order_records(st.session_state["tracked_alpaca_orders"])
@@ -3438,8 +3811,8 @@ if command_center_view == "Alpaca":
         )
         if show_portfolio_evidence:
             st.markdown("#### Paper order history *")
-            st.dataframe(pd.DataFrame(lifecycle_summary), use_container_width=True, hide_index=True)
-            st.dataframe(pd.DataFrame(lifecycle_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(lifecycle_summary), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(lifecycle_rows), width="stretch", hide_index=True)
     
         position_lifecycle_rows = alpaca_position_lifecycle_records(alpaca_positions, refreshed_order_state)
         if position_lifecycle_rows:
@@ -3447,10 +3820,10 @@ if command_center_view == "Alpaca":
                 st.markdown("#### Paper position history *")
                 st.dataframe(
                     pd.DataFrame(alpaca_position_lifecycle_summary_records(position_lifecycle_rows)),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
-                st.dataframe(pd.DataFrame(position_lifecycle_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(position_lifecycle_rows), width="stretch", hide_index=True)
                 st.caption("These rows explain how Alpaca positions connect to local app records.")
             untracked_position_rows = [row for row in position_lifecycle_rows if row.get("Tracking Status") == "Needs app tracking"]
             if untracked_position_rows:
@@ -3566,17 +3939,17 @@ if command_center_view == "Alpaca":
                 )
                 st.dataframe(
                     pd.DataFrame(alpaca_position_lifecycle_summary_records(simulated_lifecycle_rows)),
-                    use_container_width=True,
+                    width="stretch",
                     hide_index=True,
                 )
-                st.dataframe(pd.DataFrame(simulated_lifecycle_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(simulated_lifecycle_rows), width="stretch", hide_index=True)
     
             st.markdown("#### Practice exit check")
             exit_readiness_rows = simulated_exit_preview_readiness_records(
                 selected_sim_order,
                 alpaca_adapter.config,
             )
-            st.dataframe(pd.DataFrame(exit_readiness_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(exit_readiness_rows), width="stretch", hide_index=True)
             if st.button("Save Practice Exit Check"):
                 exit_sim_event = AuditEvent(
                     event_type="simulated_exit_readiness_recorded",
@@ -3609,7 +3982,7 @@ if command_center_view == "Alpaca":
         )
         alpaca_exit_preview = exit_previews[selected_exit_idx]
         if show_portfolio_evidence:
-            st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_exit_preview)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alpaca_preview_records(alpaca_exit_preview)), width="stretch", hide_index=True)
         elif alpaca_exit_preview.valid:
             st.info(f"Ready: sell {alpaca_exit_preview.order.get('quantity', '')} {alpaca_exit_preview.order.get('symbol', '')} in Alpaca paper.")
     
@@ -3726,7 +4099,7 @@ if command_center_view == "Alpaca":
         selected_cancel_order = managed_cancelable_alpaca_orders[selected_cancel_idx]
         alpaca_cancel_preview = build_alpaca_cancel_preview(selected_cancel_order, alpaca_adapter.config)
         if show_portfolio_evidence:
-            st.dataframe(pd.DataFrame(alpaca_cancel_preview_records(alpaca_cancel_preview)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(alpaca_cancel_preview_records(alpaca_cancel_preview)), width="stretch", hide_index=True)
         if alpaca_cancel_preview.blocked_reasons:
             show_blockers("Cancel blocked", alpaca_cancel_preview.blocked_reasons)
         if alpaca_state_health.stale:
@@ -3816,7 +4189,7 @@ if command_center_view == "Alpaca":
             st.info("No automation action is ready right now.")
             show_blockers("Reason", automation_decision.reasons)
         if show_portfolio_evidence:
-            st.dataframe(pd.DataFrame(automation_decision_records(automation_decision)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(automation_decision_records(automation_decision)), width="stretch", hide_index=True)
         exit_preview_rows = exit_preview_records(exit_previews)
         exit_blockers_by_hash = {
             preview.preview_hash: (
@@ -3847,11 +4220,11 @@ if command_center_view == "Alpaca":
         if show_portfolio_evidence:
             st.dataframe(
                 pd.DataFrame(readiness_rows),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.markdown("#### Paper actions ready")
-            st.dataframe(pd.DataFrame(automation_candidates), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(automation_candidates), width="stretch", hide_index=True)
         automation_halt_rows = risk_halt_records(
             monitoring_result=monitoring_result,
             broker_connected=alpaca_status.connected,
@@ -3911,7 +4284,7 @@ if command_center_view == "Alpaca":
             st.warning(str(final_gate.get("Detail")))
         if show_portfolio_evidence:
             st.markdown("#### Market data *")
-            st.dataframe(pd.DataFrame(market_freshness_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(market_freshness_rows), width="stretch", hide_index=True)
             st.markdown("#### Strategy state *")
             st.dataframe(
                 pd.DataFrame(
@@ -3923,17 +4296,17 @@ if command_center_view == "Alpaca":
                         preflight=preflight_check,
                     )
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.markdown("#### Paper account *")
-            st.dataframe(pd.DataFrame(account_health_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(account_health_rows), width="stretch", hide_index=True)
             st.markdown("#### Restart check *")
-            st.dataframe(pd.DataFrame(restart_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(restart_rows), width="stretch", hide_index=True)
             st.markdown("#### Timer check *")
-            st.dataframe(pd.DataFrame(scheduler_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(scheduler_rows), width="stretch", hide_index=True)
             st.markdown("#### Safety blocks *")
-            st.dataframe(pd.DataFrame(paper_automation_gate_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(paper_automation_gate_rows), width="stretch", hide_index=True)
             st.markdown("#### Automation decision *")
             st.dataframe(
                 pd.DataFrame(
@@ -3943,7 +4316,7 @@ if command_center_view == "Alpaca":
                         halt_rows=automation_halt_rows,
                     )
                 ),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
         if st.button("Record Automation Check"):
@@ -3969,7 +4342,7 @@ if command_center_view == "Alpaca":
             st.rerun()
         if show_portfolio_evidence:
             st.markdown("#### Saved automation checks *")
-            st.dataframe(pd.DataFrame(automation_evidence_records(recent_automation_snapshots)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(automation_evidence_records(recent_automation_snapshots)), width="stretch", hide_index=True)
         st.caption("This check records what automation sees. It does not submit, exit, or cancel broker orders.")
     
     position_records = paper_broker.position_records()
@@ -4000,7 +4373,7 @@ if command_center_view == "Alpaca":
             st.caption("No trade is available to save as a practice decision.")
         shadow_rows = shadow_records(st.session_state["shadow_decisions"])
         if shadow_rows:
-            st.dataframe(pd.DataFrame(shadow_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(shadow_rows), width="stretch", hide_index=True)
         else:
             st.caption("No practice decisions saved this session.")
     
@@ -4008,12 +4381,12 @@ if command_center_view == "Alpaca":
         exec_tabs = st.tabs(["Positions", "Orders"])
         with exec_tabs[0]:
             if position_records:
-                st.dataframe(pd.DataFrame(position_records), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(position_records), width="stretch", hide_index=True)
             else:
                 st.caption("No open paper positions.")
         with exec_tabs[1]:
             if order_records:
-                st.dataframe(pd.DataFrame(order_records), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(order_records), width="stretch", hide_index=True)
             else:
                 st.caption("No paper orders submitted.")
     
@@ -4051,19 +4424,19 @@ if command_center_view == "Alpaca":
                     automation_snapshots=recent_automation_records,
                 )
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         sub_section("5.2 This session *")
-        st.dataframe(pd.DataFrame(session_summary_records(session_snapshot)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(session_summary_records(session_snapshot)), width="stretch", hide_index=True)
         timeline_rows = session_timeline_records(session_audit_records)
         if timeline_rows:
-            st.dataframe(pd.DataFrame(timeline_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(timeline_rows), width="stretch", hide_index=True)
         else:
             st.caption("No session events recorded yet.")
     
         sub_section("5.3 Local simulator results *")
-        st.dataframe(pd.DataFrame(paper_performance_records(session_snapshot)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(paper_performance_records(session_snapshot)), width="stretch", hide_index=True)
         if st.button("Save Paper Performance Review"):
             performance_event = AuditEvent(
                 event_type="paper_performance_reviewed",
@@ -4077,7 +4450,7 @@ if command_center_view == "Alpaca":
         st.caption("This uses the sidebar account size and local simulator records. Alpaca account balance is shown above under Alpaca Account.")
     
         sub_section("5.4 Alpaca paper order history *")
-        st.dataframe(pd.DataFrame(alpaca_paper_activity_records(session_snapshot)), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(alpaca_paper_activity_records(session_snapshot)), width="stretch", hide_index=True)
         st.caption("This is saved Alpaca paper order history. It does not affect simulator cash or simulator equity.")
     
         sub_section("5.5 Risk details *")
@@ -4092,11 +4465,11 @@ if command_center_view == "Alpaca":
                     limits=risk_limits,
                 )
             ),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         sub_section("5.6 Current blocks *")
-        st.dataframe(pd.DataFrame(current_risk_halt_rows), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(current_risk_halt_rows), width="stretch", hide_index=True)
     
     readiness_event_types = {record.get("event_type", "") for record in current_evidence_records}
     current_pre_live_readiness_rows = pre_live_readiness_report(
@@ -4122,26 +4495,26 @@ if command_center_view == "Alpaca":
         sub_section("5.7 Activity log *")
         st.dataframe(
             pd.DataFrame(events_to_records(st.session_state["session_audit_events"])),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
         with st.expander("Saved activity log *", expanded=False):
             st.caption(f"Path: {audit_store.path}")
             durable_records = audit_store.read_recent(limit=50) if persist_audit_log else []
             if durable_records:
-                st.dataframe(pd.DataFrame(durable_records), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(durable_records), width="stretch", hide_index=True)
             else:
                 st.caption("No saved activity records found, or saving is turned off.")
         with st.expander("Detailed records *", expanded=False):
             st.dataframe(
                 pd.DataFrame(evidence_dashboard_records(current_evidence_records, st.session_state["tracked_alpaca_orders"])),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True,
             )
             st.markdown("#### Review history *")
-            st.dataframe(pd.DataFrame(approval_ledger_summary_records(current_approval_ledger_rows)), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(approval_ledger_summary_records(current_approval_ledger_rows)), width="stretch", hide_index=True)
             if current_approval_ledger_rows:
-                st.dataframe(pd.DataFrame(current_approval_ledger_rows), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(current_approval_ledger_rows), width="stretch", hide_index=True)
             if st.button("Export Records"):
                 evidence_package = build_evidence_package(
                     session_id=st.session_state["paper_session_id"],
@@ -4162,11 +4535,13 @@ if command_center_view == "Alpaca":
                 st.session_state["session_audit_events"].append(export_event)
                 if persist_audit_log:
                     audit_store.append(export_event)
-                st.dataframe(pd.DataFrame(evidence_package_records(evidence_package)), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(evidence_package_records(evidence_package)), width="stretch", hide_index=True)
                 st.success(f"Records exported to {output_path}")
     
         with st.expander("Live trading checklist *", expanded=False):
-            st.dataframe(pd.DataFrame(current_pre_live_readiness_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(current_pre_live_readiness_rows), width="stretch", hide_index=True)
             st.caption("This checklist is based on saved records. Some items stay blocked until the matching action is recorded.")
+
+
 
 
