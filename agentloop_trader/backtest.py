@@ -126,6 +126,7 @@ def _trade_record(
     shares: int,
     stop_price: float,
     account: float,
+    exit_rule: str = "Exit rule",
 ) -> dict:
     pnl = (exit_price - entry_price) * shares
     notional = entry_price * shares
@@ -144,9 +145,36 @@ def _trade_record(
         "risk_dollars": round(risk_dollars, 2),
         "risk_pct": round(risk_dollars / account * 100, 2) if account else 0,
         "stop": round(stop_price, 2),
+        "exit_rule": exit_rule,
         "pnl": round(pnl, 2),
         "pct_acct": round(pnl / account * 100, 2) if account else 0,
     }
+
+
+def _profit_protection_stop(
+    *,
+    entry_price: float,
+    initial_stop_price: float,
+    current_stop_price: float,
+    current_price: float,
+    current_atr: float | None,
+    high_since_entry: float,
+    strategy_exit_price: float | None,
+    breakeven_after_r: float = 1.0,
+    trail_after_r: float = 2.0,
+    trailing_atr_multiplier: float = 3.0,
+) -> tuple[str, float]:
+    initial_risk = entry_price - initial_stop_price
+    candidates = [("saved stop", current_stop_price), ("original stop", initial_stop_price)]
+    if strategy_exit_price is not None:
+        candidates.append(("strategy exit", strategy_exit_price))
+    if initial_risk > 0:
+        profit_r = (current_price - entry_price) / initial_risk
+        if profit_r >= breakeven_after_r:
+            candidates.append(("break-even stop", entry_price))
+        if profit_r >= trail_after_r and current_atr is not None:
+            candidates.append(("ATR trail", high_since_entry - trailing_atr_multiplier * current_atr))
+    return max(candidates, key=lambda item: item[1])
 
 
 def _market_arrays(seed: int | None, market_data=None):
@@ -324,6 +352,8 @@ def simulate_turtle_strategy(
     exposure_bars = 0
     in_trade = False
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
+    high_since_entry = 0.0
+    exit_rule = "Exit rule"
     balance = float(account)
     start = max(entry_w, exit_w, ma_w)
 
@@ -358,12 +388,24 @@ def simulate_turtle_strategy(
                     entry_price = p
                     stop_price = stop
                     initial_stop_price = stop
+                    high_since_entry = float(p)
                     shares = size
                     entry_bar = i
         else:
             exposure_bars += 1
             mark_to_market = balance + (p - entry_price) * shares
-            if p <= stop_price or p <= don_low:
+            high_value = float(highs[i]) if highs is not None else float(p)
+            high_since_entry = max(high_since_entry, high_value)
+            exit_rule, stop_price = _profit_protection_stop(
+                entry_price=float(entry_price),
+                initial_stop_price=float(initial_stop_price),
+                current_stop_price=float(stop_price),
+                current_price=float(p),
+                current_atr=float(atr) if atr is not None else None,
+                high_since_entry=float(high_since_entry),
+                strategy_exit_price=float(don_low),
+            )
+            if p <= stop_price:
                 pnl = (p - entry_price) * shares
                 balance += pnl
                 trade_log.append(_trade_record(
@@ -377,11 +419,11 @@ def simulate_turtle_strategy(
                     shares=int(shares),
                     stop_price=float(initial_stop_price),
                     account=float(account),
+                    exit_rule=exit_rule,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
                 continue
-            stop_price = max(stop_price, p - atr_mult * atr)
             equity_curve.append(mark_to_market)
             continue
 
@@ -522,6 +564,8 @@ def simulate_trend_pullback_strategy(
     exposure_bars = 0
     in_trade = False
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
+    high_since_entry = 0.0
+    exit_rule = "Exit rule"
     balance = float(account)
     start = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window)
     live_bar = n_bars - 1
@@ -569,12 +613,24 @@ def simulate_trend_pullback_strategy(
                     entry_price = p
                     stop_price = stop
                     initial_stop_price = stop
+                    high_since_entry = float(p)
                     shares = size
                     entry_bar = i
         else:
             exposure_bars += 1
             mark_to_market = balance + (p - entry_price) * shares
-            exit_hit = p <= stop_price or (exit_sma is not None and p < exit_sma)
+            high_value = float(highs[i]) if highs is not None else float(p)
+            high_since_entry = max(high_since_entry, high_value)
+            exit_rule, stop_price = _profit_protection_stop(
+                entry_price=float(entry_price),
+                initial_stop_price=float(initial_stop_price),
+                current_stop_price=float(stop_price),
+                current_price=float(p),
+                current_atr=float(atr) if atr is not None else None,
+                high_since_entry=float(high_since_entry),
+                strategy_exit_price=float(exit_sma) if exit_sma is not None else None,
+            )
+            exit_hit = p <= stop_price
             if exit_hit:
                 pnl = (p - entry_price) * shares
                 balance += pnl
@@ -589,11 +645,11 @@ def simulate_trend_pullback_strategy(
                     shares=int(shares),
                     stop_price=float(initial_stop_price),
                     account=float(account),
+                    exit_rule=exit_rule,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
                 continue
-            stop_price = max(stop_price, p - atr_mult * atr)
             equity_curve.append(mark_to_market)
             continue
         equity_curve.append(balance)
@@ -727,6 +783,8 @@ def simulate_trendline_breakout_strategy(
     exposure_bars = 0
     in_trade = False
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
+    high_since_entry = 0.0
+    exit_rule = "Exit rule"
     balance = float(account)
     start = max(trendline_w, exit_w, ma_w, 14)
     live_bar = n_bars - 1
@@ -764,12 +822,24 @@ def simulate_trendline_breakout_strategy(
                     entry_price = p
                     stop_price = stop
                     initial_stop_price = stop
+                    high_since_entry = float(p)
                     shares = size
                     entry_bar = i
         else:
             exposure_bars += 1
             mark_to_market = balance + (p - entry_price) * shares
-            if p <= stop_price or p <= exit_level:
+            high_value = float(highs[i]) if highs is not None else float(p)
+            high_since_entry = max(high_since_entry, high_value)
+            exit_rule, stop_price = _profit_protection_stop(
+                entry_price=float(entry_price),
+                initial_stop_price=float(initial_stop_price),
+                current_stop_price=float(stop_price),
+                current_price=float(p),
+                current_atr=float(atr) if atr is not None else None,
+                high_since_entry=float(high_since_entry),
+                strategy_exit_price=float(exit_level),
+            )
+            if p <= stop_price:
                 pnl = (p - entry_price) * shares
                 balance += pnl
                 trade_log.append(_trade_record(
@@ -783,11 +853,11 @@ def simulate_trendline_breakout_strategy(
                     shares=int(shares),
                     stop_price=float(initial_stop_price),
                     account=float(account),
+                    exit_rule=exit_rule,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
                 continue
-            stop_price = max(stop_price, p - atr_mult * atr)
             equity_curve.append(mark_to_market)
             continue
         equity_curve.append(balance)
@@ -846,6 +916,8 @@ def simulate_trendline_retest_strategy(
     retest_seen = False
     breakout_line: tuple[float, float, int] | None = None
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
+    high_since_entry = 0.0
+    exit_rule = "Exit rule"
     balance = float(account)
     start = max(trendline_w, exit_w, ma_w, momentum_w, 14)
     live_bar = n_bars - 1
@@ -897,12 +969,24 @@ def simulate_trendline_retest_strategy(
                         entry_price = p
                         stop_price = stop
                         initial_stop_price = stop
+                        high_since_entry = float(p)
                         shares = size
                         entry_bar = i
         else:
             exposure_bars += 1
             mark_to_market = balance + (p - entry_price) * shares
-            if p <= stop_price or p <= exit_level:
+            high_value = float(highs[i]) if highs is not None else float(p)
+            high_since_entry = max(high_since_entry, high_value)
+            exit_rule, stop_price = _profit_protection_stop(
+                entry_price=float(entry_price),
+                initial_stop_price=float(initial_stop_price),
+                current_stop_price=float(stop_price),
+                current_price=float(p),
+                current_atr=float(atr) if atr is not None else None,
+                high_since_entry=float(high_since_entry),
+                strategy_exit_price=float(exit_level),
+            )
+            if p <= stop_price:
                 pnl = (p - entry_price) * shares
                 balance += pnl
                 trade_log.append(_trade_record(
@@ -916,11 +1000,11 @@ def simulate_trendline_retest_strategy(
                     shares=int(shares),
                     stop_price=float(initial_stop_price),
                     account=float(account),
+                    exit_rule=exit_rule,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
                 continue
-            stop_price = max(stop_price, p - atr_mult * atr)
             equity_curve.append(mark_to_market)
             continue
         equity_curve.append(balance)

@@ -670,6 +670,18 @@ def first_available_number(*values) -> float | None:
     return None
 
 
+def parse_saved_time(value) -> pd.Timestamp | None:
+    if value in (None, ""):
+        return None
+    try:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("America/Los_Angeles")
+        return timestamp
+    except Exception:
+        return None
+
+
 def resize_trade_intent_for_account(intent: TradeIntent | None, account_equity: float, risk_pct_dec: float) -> TradeIntent | None:
     if intent is None or intent.entry_price is None or intent.stop_loss is None or intent.side != "buy":
         return intent
@@ -730,6 +742,10 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "Stop loss at entry", "Value": money_or_missing(settings.get("entry_stop_loss"))},
         {"Field": "Entry rule level", "Value": money_or_missing(settings.get("entry_rule_level"))},
         {"Field": "Exit rule level at entry", "Value": money_or_missing(settings.get("exit_rule_level_at_entry"))},
+        {"Field": "Profit protection", "Value": "On" if settings.get("profit_protection_enabled", True) else "Off"},
+        {"Field": "Move stop to break-even after", "Value": f"+{settings.get('breakeven_after_r', 1.0)}R"},
+        {"Field": "Start ATR trail after", "Value": f"+{settings.get('trail_after_r', 2.0)}R"},
+        {"Field": "Trailing ATR multiplier", "Value": str(settings.get("trailing_atr_multiplier", 3.0))},
         {"Field": "Planned order type", "Value": str(settings.get("planned_order_type", "Not recorded"))},
         {"Field": "Planned limit price", "Value": money_or_missing(settings.get("planned_limit_price"))},
         {"Field": "Planned quantity", "Value": str(settings.get("planned_quantity", "Not recorded"))},
@@ -808,11 +824,47 @@ def daily_position_rows(positions: list[dict], settings_by_symbol: dict[str, dic
                 "Unrealized P&L": money_or_missing(position.get("Unrealized P&L")),
                 "Auto Exit": "On" if settings.get("auto_exit_enabled", False) else "Off",
                 "Exit Price": money_or_missing(trigger),
+                "Exit Rule": str(exit_details.get("trigger_source", "Not set")).title(),
                 "Room Before Exit": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not set",
                 "Next Action": position_next_action(position, settings, exit_details),
             }
         )
     return rows
+
+
+def position_management_summary_records(position: dict, settings: dict, exit_details: dict) -> list[dict]:
+    current_price = position_current_price(position)
+    trigger = optional_float(exit_details.get("trigger_price"))
+    distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
+    profit_r = optional_float(exit_details.get("profit_r"))
+    return [
+        {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
+        {"Area": "Position", "Item": "Shares", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current shares held at Alpaca."},
+        {"Area": "Position", "Item": "Current price", "Status / Value": money_or_missing(current_price), "Plain English": "Estimated from Alpaca market value."},
+        {"Area": "Position", "Item": "Average entry", "Status / Value": money_or_missing(position.get("Average Entry")), "Plain English": "Average entry price reported by Alpaca."},
+        {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "On" if settings.get("auto_exit_enabled", True) else "Off", "Plain English": "Whether the app may sell this position automatically."},
+        {"Area": "Exit plan", "Item": "Price interval", "Status / Value": str(settings.get("interval", "Not saved")), "Plain English": "Bars used to calculate ATR and exit levels."},
+        {"Area": "Exit plan", "Item": "Strategy exit", "Status / Value": money_or_missing(exit_details.get("strategy_exit_price")), "Plain English": "Exit line from the saved strategy settings."},
+        {"Area": "Exit plan", "Item": "Original stop", "Status / Value": money_or_missing(exit_details.get("original_stop_price")), "Plain English": "Initial protective stop from the saved entry."},
+        {"Area": "Profit protection", "Item": "Profit in R", "Status / Value": f"{profit_r:.2f}R" if profit_r is not None else "Not available", "Plain English": "Profit compared with original trade risk."},
+        {"Area": "Profit protection", "Item": "ATR trail", "Status / Value": money_or_missing(exit_details.get("trailing_stop_price")), "Plain English": "Highest high since entry minus the trailing ATR distance."},
+        {"Area": "Profit protection", "Item": "Break-even stop", "Status / Value": money_or_missing(exit_details.get("breakeven_stop_price")), "Plain English": "Turns on after the saved profit threshold."},
+        {"Area": "Automation", "Item": "Active sell trigger", "Status / Value": money_or_missing(trigger), "Plain English": f"Sell if price reaches this level or lower. Source: {exit_details.get('trigger_source', 'exit rule')}."},
+        {"Area": "Automation", "Item": "Room before exit", "Status / Value": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not available", "Plain English": "How far current price is above the active sell trigger."},
+        {"Area": "Automation", "Item": "Current action", "Status / Value": "Exit now" if exit_details.get("ready") else "Hold", "Plain English": str(exit_details.get("reason", ""))},
+    ]
+
+
+def alpaca_daily_summary_records() -> list[dict]:
+    status = next((str(row.get("Value", "")) for row in alpaca_account_records if str(row.get("Field", "")).lower() == "status"), "")
+    return [
+        {"Item": "Connection", "Value": "Connected" if alpaca_status.connected else "Not connected", "Plain English": f"Account status: {status or 'unknown'}."},
+        {"Item": "Paper account value", "Value": money_or_missing(account_record_value(alpaca_account_records, "Portfolio Value")), "Plain English": "Value reported by Alpaca paper."},
+        {"Item": "Buying power", "Value": money_or_missing(account_record_value(alpaca_account_records, "Buying Power")), "Plain English": "Paper buying power reported by Alpaca."},
+        {"Item": "Open positions", "Value": len(alpaca_positions), "Plain English": "Current Alpaca paper positions."},
+        {"Item": "Orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders), "Plain English": "Open paper orders not filled or canceled yet."},
+        {"Item": "Automation", "Value": active_automation_level, "Plain English": "Current app automation setting."},
+    ]
 
 
 def automation_status_text() -> tuple[str, str, str]:
@@ -1102,7 +1154,13 @@ def saved_buy_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> di
         and str(order.get("side", "")).strip().lower() == "buy"
         and order.get("strategy_settings")
     ]
-    return dict(matching_buys[-1].get("strategy_settings", {})) if matching_buys else None
+    if not matching_buys:
+        return None
+    latest = matching_buys[-1]
+    settings = dict(latest.get("strategy_settings", {}))
+    settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
+    settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
+    return settings
 
 
 def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
@@ -1117,7 +1175,10 @@ def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> d
     if not matching_buys:
         return None
     latest = matching_buys[-1]
-    return dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
+    settings = dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
+    settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
+    settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
+    return settings
 
 
 def update_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict], exit_settings: dict) -> list[dict]:
@@ -1468,10 +1529,10 @@ elif paper_buy_order_style == "Custom limit price":
         step=0.01,
         format="%.2f",
         help="The order will not buy above this exact price. Leave at 0.00 to block sending until you type a price.",
-    )
-reset_paper_broker = st.sidebar.button("Reset paper account")
+)
+reset_paper_broker = False
 
-st.sidebar.markdown("### 1. Ticker and Price Data")
+st.sidebar.markdown("### Ticker and price data")
 data_source = st.sidebar.radio(
     "Prices to use",
     ["Synthetic", "Ticker (Alpaca)", "Ticker (yfinance)"],
@@ -1514,7 +1575,7 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
         st.stop()
 st.session_state["last_loaded_symbol"] = ticker
 
-st.sidebar.markdown("### 2. Strategy and Backtest")
+st.sidebar.markdown("### Strategy settings")
 account = st.sidebar.number_input(
     "Simulator account size ($)",
     min_value=1000,
@@ -1600,7 +1661,7 @@ momentum_w = st.sidebar.slider(
     help="SMA pullback and trendline retest strategies. The app looks for price to turn back up before buying.",
 )
 
-st.sidebar.markdown("### 3. Risk Limits")
+st.sidebar.markdown("### Risk limits")
 max_risk_limit = st.sidebar.slider(
     "Max risk per trade (%)",
     0.25,
@@ -1649,7 +1710,7 @@ max_open_positions = st.sidebar.slider(
     step=1,
     help="Maximum number of positions the app can have open or tracked at the same time.",
 )
-st.sidebar.markdown("### Research Loops")
+st.sidebar.markdown("### Research options")
 run_walk_forward = st.sidebar.checkbox(
     "Test on newer price data",
     value=True,
@@ -1664,7 +1725,7 @@ run_parameter_loop = st.sidebar.checkbox(
 max_parameter_candidates = st.sidebar.slider("Settings to compare", 4, 16, 8, step=4)
 
 st.sidebar.subheader(
-    "Research Inputs",
+    "Setup quality checks",
     help=(
         "These switches decide which quality checks appear in the research table. "
         "Trend, the selected strategy rule, and risk approval are always checked."
@@ -1718,7 +1779,11 @@ setup_inputs = {
     ),
 }
 
-with st.sidebar.expander("Files and saved records", expanded=False):
+with st.sidebar.expander("Files, records, and simulator reset", expanded=False):
+    reset_paper_broker = st.button(
+        "Reset local simulator account",
+        help="Resets only the in-app simulator cash, simulated positions, and local session records. It does not touch Alpaca.",
+    )
     persist_audit_log = st.checkbox("Save activity log", value=True)
     audit_log_path = st.text_input("Activity log file", value="audit_logs/agentloop_audit.jsonl")
     broker_state_path = st.text_input("Alpaca order file", value="broker_state/alpaca_paper_orders.json")
@@ -1988,6 +2053,11 @@ current_strategy_settings = {
     "allow_add_to_existing_position": allow_add_to_existing_position,
     "max_auto_buys_per_session": max_auto_buys_per_session,
     "reentry_cooldown_minutes": reentry_cooldown_minutes,
+    "profit_protection_enabled": True,
+    "breakeven_after_r": 1.0,
+    "trail_after_r": 2.0,
+    "trailing_atr_multiplier": 3.0,
+    "confirm_exit_on_bar_close": True,
 }
 current_exit_settings = dict(current_strategy_settings)
 current_exit_settings["auto_exit_enabled"] = True
@@ -2074,6 +2144,10 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         current_price = optional_float(saved_live.get("last_p"))
         strategy_exit_price = optional_float(saved_live.get("exit_level"))
         current_atr = optional_float(saved_live.get("last_atr"))
+        profit_protection_enabled = bool(settings.get("profit_protection_enabled", True))
+        breakeven_after_r = float(settings.get("breakeven_after_r", 1.0))
+        trail_after_r = float(settings.get("trail_after_r", 2.0))
+        trailing_atr_multiplier = float(settings.get("trailing_atr_multiplier", 3.0))
         matching_position = next(
             (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == symbol),
             {},
@@ -2085,14 +2159,66 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             settings.get("entry_reference_price"),
             current_price,
         )
-        atr_stop_price = (
+        original_stop_price = first_available_number(
+            settings.get("entry_stop_loss"),
             entry_reference_price - saved_atr_mult * current_atr
             if entry_reference_price is not None and current_atr is not None
+            else None,
+        )
+        initial_risk = first_available_number(
+            settings.get("entry_stop_distance"),
+            entry_reference_price - original_stop_price
+            if entry_reference_price is not None and original_stop_price is not None
+            else None,
+        )
+        if initial_risk is not None and initial_risk <= 0:
+            initial_risk = None
+        profit_r = (
+            (current_price - entry_reference_price) / initial_risk
+            if current_price is not None and entry_reference_price is not None and initial_risk
             else None
         )
+        entry_time = parse_saved_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
+        high_data = data
+        if entry_time is not None and not data.empty:
+            index = data.index
+            if getattr(index, "tz", None) is None:
+                entry_compare = entry_time.tz_convert("America/Los_Angeles").tz_localize(None)
+            else:
+                entry_compare = entry_time.tz_convert(index.tz)
+            since_entry = data.loc[index >= entry_compare]
+            if not since_entry.empty:
+                high_data = since_entry
+        current_high_since_entry = optional_float(high_data["High"].max()) if "High" in high_data.columns and not high_data.empty else None
+        saved_high_since_entry = optional_float(settings.get("highest_high_since_entry"))
+        highest_high_since_entry = max(
+            [value for value in [current_high_since_entry, saved_high_since_entry, entry_reference_price] if value is not None],
+            default=None,
+        )
+        breakeven_stop_price = (
+            entry_reference_price
+            if profit_protection_enabled
+            and profit_r is not None
+            and profit_r >= breakeven_after_r
+            and entry_reference_price is not None
+            else None
+        )
+        trailing_stop_price = (
+            highest_high_since_entry - trailing_atr_multiplier * current_atr
+            if profit_protection_enabled
+            and profit_r is not None
+            and profit_r >= trail_after_r
+            and highest_high_since_entry is not None
+            and current_atr is not None
+            else None
+        )
+        saved_trigger_price = optional_float(settings.get("last_exit_trigger_price"))
         trigger_candidates = [
             ("strategy exit", strategy_exit_price),
-            ("ATR stop", atr_stop_price),
+            ("original stop", original_stop_price),
+            ("break-even stop", breakeven_stop_price),
+            ("ATR trail", trailing_stop_price),
+            ("saved trigger", saved_trigger_price),
         ]
         usable_triggers = [(label, price) for label, price in trigger_candidates if price is not None]
         trigger_source, trigger_price = max(usable_triggers, key=lambda item: item[1]) if usable_triggers else ("exit rule", None)
@@ -2100,20 +2226,36 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         reason = (
             f"Exit now because {symbol} is at or below the {trigger_source} at ${trigger_price:,.2f}."
             if ready and trigger_price
-            else f"Hold. Auto exit will trigger if {symbol} falls to ${trigger_price:,.2f} or lower. This uses the closer of the strategy exit and ATR stop."
+            else f"Hold. Auto exit will trigger if {symbol} falls to ${trigger_price:,.2f} or lower. This uses the highest active protection level."
             if trigger_price
             else str(saved_live.get("exit_reason", "Strategy exit rule is not triggered."))
         )
+        state_changed = False
+        if highest_high_since_entry is not None and highest_high_since_entry > (saved_high_since_entry or 0):
+            state_changed = True
+        if trigger_price is not None and trigger_price > (saved_trigger_price or 0):
+            state_changed = True
         return {
             "ready": ready,
             "reason": reason,
             "trigger_price": trigger_price,
             "strategy_exit_price": strategy_exit_price,
-            "atr_stop_price": atr_stop_price,
+            "atr_stop_price": original_stop_price,
+            "original_stop_price": original_stop_price,
+            "breakeven_stop_price": breakeven_stop_price,
+            "trailing_stop_price": trailing_stop_price,
+            "highest_high_since_entry": highest_high_since_entry,
+            "profit_r": profit_r,
+            "initial_risk": initial_risk,
+            "current_atr": current_atr,
+            "state_changed": state_changed,
             "trigger_source": trigger_source,
             "interval": saved_interval,
             "exit_window": saved_exit_w,
             "atr_multiplier": saved_atr_mult,
+            "trailing_atr_multiplier": trailing_atr_multiplier,
+            "breakeven_after_r": breakeven_after_r,
+            "trail_after_r": trail_after_r,
         }
     except Exception as exc:
         return {"ready": False, "reason": f"Could not check saved exit rule: {exc}", "trigger_price": None}
@@ -2122,6 +2264,34 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
 def evaluate_exit_rule_from_settings(settings: dict | None) -> tuple[bool, str]:
     details = evaluate_exit_rule_details_from_settings(settings)
     return bool(details["ready"]), str(details["reason"])
+
+
+def refresh_trailing_state_for_open_positions() -> bool:
+    updated_orders = st.session_state.get("tracked_alpaca_orders", [])
+    changed = False
+    for position in alpaca_positions:
+        symbol = str(position.get("Symbol", "")).strip().upper()
+        settings = saved_exit_settings_for_symbol(symbol, updated_orders)
+        if not settings:
+            continue
+        details = evaluate_exit_rule_details_from_settings(settings)
+        if not details.get("state_changed"):
+            continue
+        refreshed_settings = dict(settings)
+        high = optional_float(details.get("highest_high_since_entry"))
+        trigger = optional_float(details.get("trigger_price"))
+        if high is not None:
+            refreshed_settings["highest_high_since_entry"] = high
+        if trigger is not None:
+            refreshed_settings["last_exit_trigger_price"] = trigger
+            refreshed_settings["last_exit_trigger_source"] = details.get("trigger_source", "")
+        refreshed_settings["last_exit_checked_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
+        updated_orders = update_exit_settings_for_symbol(symbol, updated_orders, refreshed_settings)
+        changed = True
+    if changed:
+        broker_state_store.replace_all(updated_orders)
+        st.session_state["tracked_alpaca_orders"] = updated_orders
+    return changed
 
 
 parameter_candidates = []
@@ -2205,6 +2375,9 @@ if intent is not None:
             "planned_limit_price": intent.limit_price,
             "planned_quantity": intent.quantity,
             "planned_entry_price": intent.entry_price,
+            "highest_high_since_entry": entry_reference_price,
+            "last_exit_trigger_price": intent.stop_loss,
+            "last_exit_trigger_source": "original stop",
             "sizing_account_source": paper_order_account_source,
             "sizing_account_equity": paper_order_risk_equity,
             "sizing_available_cash": paper_order_available_cash,
@@ -2319,6 +2492,9 @@ duplicate_alpaca_reasons = duplicate_exposure_reasons(
 open_order_reasons = open_order_exposure_reasons(intent, alpaca_orders)
 duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_hash, tracked_alpaca_orders)
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
+if alpaca_positions and tracked_alpaca_orders:
+    if refresh_trailing_state_for_open_positions():
+        tracked_alpaca_orders = st.session_state.get("tracked_alpaca_orders", [])
 cancelable_alpaca_orders = cancelable_alpaca_order_records(alpaca_orders)
 managed_cancelable_alpaca_orders = enriched_cancelable_order_records(cancelable_alpaca_orders, tracked_alpaca_orders, alpaca_orders)
 waiting_limit_buy_rows = waiting_limit_buy_order_records(
@@ -2922,6 +3098,7 @@ def render_open_positions_panel() -> None:
     selected_exit_trigger_price = selected_exit_details.get("trigger_price")
     selected_strategy_exit_price = selected_exit_details.get("strategy_exit_price")
     selected_atr_stop_price = selected_exit_details.get("atr_stop_price")
+    selected_trailing_stop_price = selected_exit_details.get("trailing_stop_price")
     selected_exit_interval = str(selected_exit_details.get("interval") or selected_exit_settings.get("interval", interval))
     selected_exit_window = int(selected_exit_details.get("exit_window") or selected_exit_settings.get("exit_window", exit_w))
 
@@ -2946,59 +3123,47 @@ def render_open_positions_panel() -> None:
     )
     if selected_exit_trigger_price:
         st.info(f"Auto exit: sell {selected_position_symbol} if price is at or below ${float(selected_exit_trigger_price):,.2f}.")
-        st.caption(
-            f"Exit trigger uses the closer downside level: strategy exit {money_or_missing(selected_strategy_exit_price)} "
-            f"or ATR stop {money_or_missing(selected_atr_stop_price)}."
-        )
     if selected_exit_ready:
         st.warning(selected_exit_reason)
-    else:
-        st.info(selected_exit_reason)
-    st.markdown("#### Daily position plan")
+    st.markdown("#### Position plan")
     st.dataframe(
         pd.DataFrame(
-            position_exit_plan_records(
+            position_management_summary_records(
+                selected_position,
                 selected_exit_settings,
-                exit_ready=selected_exit_ready,
-                exit_reason=selected_exit_reason,
-                exit_trigger_price=selected_exit_trigger_price,
+                selected_exit_details,
             )
         ),
         width="stretch",
         hide_index=True,
     )
-    quick_cols = st.columns(3)
-    if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
-        quick_settings = dict(selected_exit_settings)
-        quick_settings["symbol"] = selected_position_symbol
-        quick_settings["atr_stop_multiplier"] = max(0.5, float(quick_settings.get("atr_stop_multiplier", atr_mult)) - 0.25)
-        updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-        broker_state_store.replace_all(updated_orders)
-        st.session_state["tracked_alpaca_orders"] = updated_orders
-        st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_tightened", message="ATR stop tightened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-        st.rerun()
-    if quick_cols[1].button("Loosen ATR Stop", key=f"loosen_exit_{selected_position_symbol}"):
-        quick_settings = dict(selected_exit_settings)
-        quick_settings["symbol"] = selected_position_symbol
-        quick_settings["atr_stop_multiplier"] = min(5.0, float(quick_settings.get("atr_stop_multiplier", atr_mult)) + 0.25)
-        updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-        broker_state_store.replace_all(updated_orders)
-        st.session_state["tracked_alpaca_orders"] = updated_orders
-        st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_loosened", message="ATR stop loosened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-        st.rerun()
-    if quick_cols[2].button("Use Current Sidebar Exit Settings", key=f"use_current_exit_{selected_position_symbol}"):
-        quick_settings = {**current_exit_settings, "symbol": selected_position_symbol, "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", True))}
-        updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-        broker_state_store.replace_all(updated_orders)
-        st.session_state["tracked_alpaca_orders"] = updated_orders
-        st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-        st.rerun()
-    st.markdown("#### Exit risk")
-    st.dataframe(
-        pd.DataFrame(combined_position_risk_records(selected_position, selected_exit_trigger_price)),
-        width="stretch",
-        hide_index=True,
-    )
+    with st.expander("Quick exit changes", expanded=False):
+        quick_cols = st.columns(3)
+        if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
+            quick_settings = dict(selected_exit_settings)
+            quick_settings["symbol"] = selected_position_symbol
+            quick_settings["atr_stop_multiplier"] = max(0.5, float(quick_settings.get("atr_stop_multiplier", atr_mult)) - 0.25)
+            updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+            broker_state_store.replace_all(updated_orders)
+            st.session_state["tracked_alpaca_orders"] = updated_orders
+            st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_tightened", message="ATR stop tightened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+            st.rerun()
+        if quick_cols[1].button("Loosen ATR Stop", key=f"loosen_exit_{selected_position_symbol}"):
+            quick_settings = dict(selected_exit_settings)
+            quick_settings["symbol"] = selected_position_symbol
+            quick_settings["atr_stop_multiplier"] = min(5.0, float(quick_settings.get("atr_stop_multiplier", atr_mult)) + 0.25)
+            updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+            broker_state_store.replace_all(updated_orders)
+            st.session_state["tracked_alpaca_orders"] = updated_orders
+            st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_loosened", message="ATR stop loosened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+            st.rerun()
+        if quick_cols[2].button("Use Current Sidebar Exit Settings", key=f"use_current_exit_{selected_position_symbol}"):
+            quick_settings = {**current_exit_settings, "symbol": selected_position_symbol, "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", True))}
+            updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+            broker_state_store.replace_all(updated_orders)
+            st.session_state["tracked_alpaca_orders"] = updated_orders
+            st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+            st.rerun()
     if show_portfolio_evidence:
         with st.expander("Saved exit rule details *", expanded=False):
             st.dataframe(
@@ -3010,6 +3175,12 @@ def render_open_positions_panel() -> None:
                         selected_exit_trigger_price,
                     )
                 ),
+                width="stretch",
+                hide_index=True,
+            )
+            st.markdown("#### Exit risk *")
+            st.dataframe(
+                pd.DataFrame(combined_position_risk_records(selected_position, selected_exit_trigger_price)),
                 width="stretch",
                 hide_index=True,
             )
@@ -3069,6 +3240,41 @@ def render_open_positions_panel() -> None:
             step=50,
             key=f"exit_trend_filter_{selected_position_symbol}",
         )
+        st.markdown("#### Profit protection")
+        profit_protection_enabled = st.checkbox(
+            "Protect profits with ATR trail",
+            value=bool(selected_exit_settings.get("profit_protection_enabled", True)),
+            key=f"profit_protection_enabled_{selected_position_symbol}",
+            help="After the position has enough profit, the app can trail from the highest price since entry.",
+        )
+        protection_cols = st.columns(3)
+        edited_breakeven_after_r = protection_cols[0].slider(
+            "Move stop to break-even after",
+            0.5,
+            3.0,
+            float(selected_exit_settings.get("breakeven_after_r", 1.0)),
+            step=0.5,
+            key=f"breakeven_after_r_{selected_position_symbol}",
+            help="1R means the trade is up by the amount originally risked.",
+        )
+        edited_trail_after_r = protection_cols[1].slider(
+            "Start ATR trail after",
+            1.0,
+            5.0,
+            float(selected_exit_settings.get("trail_after_r", 2.0)),
+            step=0.5,
+            key=f"trail_after_r_{selected_position_symbol}",
+            help="The ATR trail starts only after this much profit.",
+        )
+        edited_trailing_atr_multiplier = protection_cols[2].slider(
+            "Trailing ATR distance",
+            1.0,
+            5.0,
+            float(selected_exit_settings.get("trailing_atr_multiplier", 3.0)),
+            step=0.1,
+            key=f"trailing_atr_multiplier_{selected_position_symbol}",
+            help="Higher numbers give profitable trades more room before the trail sells.",
+        )
         pullback_cols = st.columns(2)
         edited_pullback_length = pullback_cols[0].slider(
             "Pullback average",
@@ -3100,7 +3306,13 @@ def render_open_positions_panel() -> None:
             "pullback_average_length": edited_pullback_length,
             "momentum_turn_length": edited_momentum_length,
             "auto_exit_enabled": exit_auto_enabled,
+            "profit_protection_enabled": profit_protection_enabled,
+            "breakeven_after_r": edited_breakeven_after_r,
+            "trail_after_r": edited_trail_after_r,
+            "trailing_atr_multiplier": edited_trailing_atr_multiplier,
         }
+        edited_exit_settings.pop("last_exit_trigger_price", None)
+        edited_exit_settings.pop("last_exit_trigger_source", None)
         updated_orders = update_exit_settings_for_symbol(
             selected_position_symbol,
             st.session_state["tracked_alpaca_orders"],
@@ -3122,20 +3334,20 @@ def render_open_positions_panel() -> None:
             audit_store.append(settings_event)
         st.rerun()
 
-    with st.expander("Saved entry settings", expanded=False):
+    with st.expander("Saved entry plan", expanded=False):
         if selected_entry_settings:
-            st.markdown("#### Entry snapshot")
             st.dataframe(
                 pd.DataFrame(entry_snapshot_records(selected_entry_settings)),
                 width="stretch",
                 hide_index=True,
             )
-            st.markdown("#### All saved entry settings")
-            st.dataframe(
-                pd.DataFrame([{"Setting": plain_setting_name(key), "Value": str(value)} for key, value in selected_entry_settings.items()]),
-                width="stretch",
-                hide_index=True,
-            )
+            if show_portfolio_evidence:
+                with st.expander("Raw saved entry settings *", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame([{"Setting": plain_setting_name(key), "Value": str(value)} for key, value in selected_entry_settings.items()]),
+                        width="stretch",
+                        hide_index=True,
+                    )
         else:
             st.caption("No saved entry settings found for this position.")
 
@@ -3347,6 +3559,7 @@ if command_center_view == "New Trade":
             "Risk $": t.get("risk_dollars", ""),
             "Risk %": t.get("risk_pct", ""),
             "Stop $": t["stop"],
+            "Exit Rule": str(t.get("exit_rule", "Exit rule")).title(),
             "P&L $": t["pnl"],
             "% Account": t["pct_acct"],
         } for t in trade_log]).set_index("#")
@@ -3529,14 +3742,8 @@ if command_center_view == "Alpaca":
             hide_index=True,
         )
     sub_section("4.1 Account status", "Current Alpaca paper connection, positions, and orders.")
-    with st.expander("Account details" + (" *" if show_portfolio_evidence else ""), expanded=False):
-        broker_summary_rows = [
-            {"Item": "Alpaca connected", "Value": plain_yes_no(alpaca_status.connected)},
-            {"Item": "Paper orders enabled", "Value": plain_yes_no(enable_alpaca_paper_orders)},
-            {"Item": "Open Alpaca positions", "Value": len(alpaca_positions)},
-            {"Item": "Alpaca orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders)},
-        ]
-        st.dataframe(pd.DataFrame(broker_summary_rows), width="stretch", hide_index=True)
+    st.dataframe(pd.DataFrame(alpaca_daily_summary_records()), width="stretch", hide_index=True)
+    with st.expander("Account, positions, and orders" + (" *" if show_portfolio_evidence else ""), expanded=False):
         if show_portfolio_evidence:
             st.markdown("#### Broker details *")
             st.dataframe(
