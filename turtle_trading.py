@@ -298,6 +298,30 @@ def count_waiting_alpaca_orders(order_rows: list[dict]) -> int:
     return sum(str(row.get("Status", "")).strip().lower() in waiting_statuses for row in order_rows)
 
 
+ACTIVE_ALPACA_ORDER_STATUSES = {
+    "accepted",
+    "new",
+    "pending_new",
+    "partially_filled",
+    "pending_cancel",
+    "pending_replace",
+    "held",
+}
+
+
+def local_open_buy_order_reasons(symbol: str, tracked_orders: list[dict]) -> list[str]:
+    clean_symbol = str(symbol).strip().upper()
+    if not clean_symbol:
+        return []
+    for order in tracked_orders:
+        order_symbol = str(order.get("symbol", order.get("Symbol", ""))).strip().upper()
+        order_side = str(order.get("side", order.get("Side", ""))).strip().lower()
+        order_status = str(order.get("status", order.get("Status", ""))).strip().lower()
+        if order_symbol == clean_symbol and order_side == "buy" and order_status in ACTIVE_ALPACA_ORDER_STATUSES:
+            return [f"The app already tracks an open {clean_symbol} buy order."]
+    return []
+
+
 def round_alpaca_price(price: float) -> float:
     return round(float(price), 4 if float(price) < 1 else 2)
 
@@ -306,9 +330,40 @@ def optional_float(value) -> float | None:
     try:
         if value is None or value == "":
             return None
+        if isinstance(value, str):
+            value = value.replace("$", "").replace(",", "").strip()
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def account_record_value(records: list[dict], field_name: str) -> float | None:
+    target = field_name.strip().lower()
+    for record in records:
+        if str(record.get("Field", "")).strip().lower() == target:
+            return optional_float(record.get("Value"))
+    return None
+
+
+def first_available_number(*values) -> float | None:
+    for value in values:
+        number = optional_float(value)
+        if number is not None:
+            return number
+    return None
+
+
+def resize_trade_intent_for_account(intent: TradeIntent | None, account_equity: float, risk_pct_dec: float) -> TradeIntent | None:
+    if intent is None or intent.entry_price is None or intent.stop_loss is None or intent.side != "buy":
+        return intent
+    risk_per_share = abs(float(intent.entry_price) - float(intent.stop_loss))
+    if risk_per_share <= 0:
+        return intent
+    account_risk_dollars = max(0.0, float(account_equity)) * float(risk_pct_dec)
+    resized_quantity = int(account_risk_dollars // risk_per_share)
+    if resized_quantity <= 0 or resized_quantity == intent.quantity:
+        return intent
+    return replace(intent, quantity=resized_quantity)
 
 
 def money_or_missing(value) -> str:
@@ -328,6 +383,9 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "Strategy", "Value": str(settings.get("strategy_label", settings.get("strategy_type", "Not recorded")))},
         {"Field": "Price interval", "Value": str(settings.get("interval", "Not recorded"))},
         {"Field": "History used", "Value": str(settings.get("history", "Not recorded"))},
+        {"Field": "Sizing account", "Value": str(settings.get("sizing_account_source", "Not recorded"))},
+        {"Field": "Sizing account value", "Value": money_or_missing(settings.get("sizing_account_equity"))},
+        {"Field": "Sizing cash available", "Value": money_or_missing(settings.get("sizing_available_cash"))},
         {"Field": "Reference price at entry", "Value": money_or_missing(settings.get("entry_reference_price"))},
         {"Field": "ATR at entry", "Value": money_or_missing(settings.get("entry_atr"))},
         {"Field": "ATR percent at entry", "Value": pct_or_missing(settings.get("entry_atr_pct"))},
@@ -443,6 +501,60 @@ def update_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict], exi
 
 def alpaca_order_row_id(row: dict) -> str:
     return str(row.get("Alpaca Order ID") or row.get("Broker Order ID") or row.get("Order ID") or "").strip()
+
+
+def tracked_order_state_signature(orders: list[dict]) -> tuple[tuple[str, str, str, str, str], ...]:
+    return tuple(
+        (
+            str(order.get("broker_order_id", order.get("Broker Order ID", ""))).strip(),
+            str(order.get("status", order.get("Status", ""))).strip().lower(),
+            str(order.get("lifecycle_status", "")).strip().lower(),
+            str(order.get("filled_quantity", order.get("Filled Qty", ""))).strip(),
+            str(order.get("average_fill_price", order.get("Avg Fill", ""))).strip(),
+        )
+        for order in orders
+    )
+
+
+def active_tracked_preview_hashes(orders: list[dict]) -> set[str]:
+    return {
+        str(order.get("preview_hash", "")).strip()
+        for order in orders
+        if str(order.get("preview_hash", "")).strip()
+        and str(order.get("status", order.get("Status", ""))).strip().lower() in ACTIVE_ALPACA_ORDER_STATUSES
+    }
+
+
+def sync_auto_entry_sent_hashes_with_open_orders() -> None:
+    active_hashes = active_tracked_preview_hashes(st.session_state.get("tracked_alpaca_orders", []))
+    st.session_state["auto_entry_sent_hashes"] = [
+        preview_hash
+        for preview_hash in st.session_state.get("auto_entry_sent_hashes", [])
+        if preview_hash in active_hashes
+    ]
+
+
+def refresh_tracked_alpaca_orders_from_broker() -> tuple[list[dict], bool]:
+    tracked_orders = st.session_state.get("tracked_alpaca_orders", [])
+    if not alpaca_status.connected or not tracked_orders:
+        return tracked_orders, False
+    tracked_refresh_rows = alpaca_adapter.refreshed_tracked_order_records(tracked_orders)
+    lifecycle_alpaca_orders = {alpaca_order_row_id(row): row for row in alpaca_orders if alpaca_order_row_id(row)}
+    for row in tracked_refresh_rows:
+        row_id = alpaca_order_row_id(row)
+        if row_id:
+            lifecycle_alpaca_orders[row_id] = row
+    lifecycle_order_rows = list(lifecycle_alpaca_orders.values())
+    if not lifecycle_order_rows:
+        return tracked_orders, False
+    before = tracked_order_state_signature(tracked_orders)
+    refreshed_orders = refresh_tracked_alpaca_orders(tracked_orders, lifecycle_order_rows)
+    changed = tracked_order_state_signature(refreshed_orders) != before
+    if changed:
+        broker_state_store.replace_all(refreshed_orders)
+        st.session_state["tracked_alpaca_orders"] = refreshed_orders
+        sync_auto_entry_sent_hashes_with_open_orders()
+    return refreshed_orders, changed
 
 
 def show_blockers(title: str, blockers: list[str]) -> None:
@@ -622,6 +734,33 @@ paper_buy_order_style = st.sidebar.selectbox(
     index=0,
     help="Limit orders control the maximum buy price. Market orders prioritize immediate fills.",
 )
+allow_limit_buys_outside_market_hours = st.sidebar.checkbox(
+    "Allow limit buys outside market hours",
+    value=False,
+    disabled=paper_buy_order_style == "Market",
+    help=(
+        "Allows automatic paper BUY limit orders while the regular market is closed. "
+        "Market orders still wait for regular market hours."
+    ),
+)
+with st.sidebar.expander("Advanced safety", expanded=False):
+    allowed_symbols_text = st.text_input(
+        "Allowed symbols",
+        value="",
+        help=(
+            "Optional whitelist for paper orders. Leave blank to allow the ticker you typed. "
+            "Use commas to allow only specific tickers, such as AAPL, MSFT, NVDA."
+        ),
+    )
+    allow_add_to_existing_position = st.checkbox(
+        "Allow adding to an existing paper position",
+        value=False,
+        help=(
+            "When this is on, a new BUY can add shares to an Alpaca paper position you already hold. "
+            "Risk limits, cash, concentration, and open-order checks still apply."
+        ),
+    )
+allowed_symbols = tuple(s.strip().upper() for s in allowed_symbols_text.split(",") if s.strip())
 paper_buy_limit_offset_pct = 0.0
 if paper_buy_order_style == "Limit above current price":
     paper_buy_limit_offset_pct = st.sidebar.number_input(
@@ -645,7 +784,7 @@ period = "synthetic"
 
 if data_source == "Ticker (yfinance)":
     ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
-    interval = st.sidebar.selectbox("Interval", ["1d", "4h", "1h", "30m", "15m", "5m", "1m"], index=0)
+    interval = st.sidebar.selectbox("Interval", ["1d", "4h", "1h", "30m", "15m", "5m", "1m"], index=2)
     if interval == "1d":
         period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"], 5
     elif interval in ("4h", "1h"):
@@ -672,7 +811,7 @@ account = st.sidebar.number_input(
     "Simulator account size ($)",
     min_value=1000,
     max_value=10_000_000,
-    value=50000,
+    value=100000,
     step=1000,
     help="Used by the local simulator and strategy sizing. Alpaca account balance is read separately from Alpaca.",
 )
@@ -685,7 +824,7 @@ strategy_options = {
 strategy_label = st.sidebar.selectbox(
     "Strategy type",
     list(strategy_options.keys()),
-    index=0,
+    index=3,
     help="Choose the rule set that creates trade ideas. Channel breakout uses prior highs. Pullback uses moving averages. Trendline strategies use descending resistance lines from swing highs.",
 )
 strategy_type = strategy_options[strategy_label]
@@ -729,7 +868,7 @@ ma_w = st.sidebar.slider(
     "Trend filter length (bars)",
     50,
     300,
-    200,
+    50,
     step=50,
     help="The moving average used to decide whether the ticker is in an uptrend. Higher is slower and stricter; lower reacts faster.",
 )
@@ -766,7 +905,7 @@ max_notional_limit = st.sidebar.slider(
     "Max position notional (%)",
     5.0,
     100.0,
-    25.0,
+    5.0,
     step=5.0,
     help="Hard cap on position size as a percent of account value. Example: 25% on a $100,000 account allows up to $25,000 in one order.",
 )
@@ -774,7 +913,7 @@ max_portfolio_exposure = st.sidebar.slider(
     "Max portfolio exposure (%)",
     10.0,
     100.0,
-    75.0,
+    80.0,
     step=5.0,
     help="Hard cap on total open exposure across all tracked positions and orders. This keeps the app from putting too much of the account to work at once.",
 )
@@ -782,7 +921,7 @@ max_symbol_concentration = st.sidebar.slider(
     "Max symbol concentration (%)",
     5.0,
     100.0,
-    35.0,
+    10.0,
     step=5.0,
     help="Hard cap on exposure to one ticker. This prevents one symbol from becoming too large relative to the account.",
 )
@@ -798,29 +937,10 @@ max_open_positions = st.sidebar.slider(
     "Max open positions",
     1,
     20,
-    5,
+    20,
     step=1,
     help="Maximum number of positions the app can have open or tracked at the same time.",
 )
-with st.sidebar.expander("Advanced safety", expanded=False):
-    allowed_symbols_text = st.text_input(
-        "Allowed symbols",
-        value="",
-        help=(
-            "Optional whitelist for paper orders. Leave blank to allow the ticker you typed. "
-            "Use commas to allow only specific tickers, such as AAPL, MSFT, NVDA."
-        ),
-    )
-    allow_add_to_existing_position = st.checkbox(
-        "Allow adding to an existing paper position",
-        value=False,
-        help=(
-            "When this is on, a new BUY can add shares to an Alpaca paper position you already hold. "
-            "Risk limits, cash, concentration, and open-order checks still apply."
-        ),
-    )
-allowed_symbols = tuple(s.strip().upper() for s in allowed_symbols_text.split(",") if s.strip())
-
 st.sidebar.markdown("### Research Loops")
 run_walk_forward = st.sidebar.checkbox(
     "Test on newer price data",
@@ -966,11 +1086,30 @@ broker_statuses = [paper_adapter.status(), alpaca_adapter.status()]
 alpaca_status = broker_statuses[1]
 alpaca_positions = alpaca_adapter.position_records() if alpaca_status.connected else []
 alpaca_orders = alpaca_adapter.order_records() if alpaca_status.connected else []
+alpaca_account_records = alpaca_adapter.account_records() if alpaca_status.connected else []
 alpaca_state_health = broker_state_health(alpaca_status.connected, alpaca_positions, alpaca_orders)
 paper_positions_notional = sum(position.market_value for position in paper_broker.positions.values())
 alpaca_positions_notional = sum(float(row.get("Market Value") or 0) for row in alpaca_positions)
 paper_equity = paper_broker.cash + paper_positions_notional
 session_pnl = paper_equity - st.session_state["paper_starting_cash"]
+alpaca_account_equity = first_available_number(
+    account_record_value(alpaca_account_records, "Portfolio Value"),
+    account_record_value(alpaca_account_records, "Equity"),
+)
+alpaca_account_cash = first_available_number(
+    account_record_value(alpaca_account_records, "Cash"),
+    account_record_value(alpaca_account_records, "Buying Power"),
+)
+use_alpaca_account_for_paper_risk = bool(enable_alpaca_paper_orders and alpaca_status.connected and alpaca_account_equity)
+paper_order_risk_equity = float(alpaca_account_equity) if use_alpaca_account_for_paper_risk else float(account)
+paper_order_available_cash = (
+    float(alpaca_account_cash)
+    if use_alpaca_account_for_paper_risk and alpaca_account_cash is not None
+    else float(paper_broker.cash)
+)
+paper_order_portfolio_notional = alpaca_positions_notional if use_alpaca_account_for_paper_risk else paper_positions_notional + alpaca_positions_notional
+paper_order_session_pnl = 0.0 if use_alpaca_account_for_paper_risk else session_pnl
+paper_order_account_source = "Alpaca paper account" if use_alpaca_account_for_paper_risk else "Simulator account"
 effective_kill_switch = kill_switch
 risk_limits = RiskLimits(
     allowed_symbols=allowed_symbols,
@@ -1126,6 +1265,7 @@ current_strategy_settings = {
     "momentum_turn_length": momentum_w,
     "paper_buy_order_type": paper_buy_order_style,
     "paper_buy_limit_offset_pct": paper_buy_limit_offset_pct,
+    "allow_limit_buys_outside_market_hours": allow_limit_buys_outside_market_hours,
     "automation_refresh_seconds": automation_refresh_seconds,
     "allow_add_to_existing_position": allow_add_to_existing_position,
 }
@@ -1264,8 +1404,8 @@ current_run_manifest = build_run_manifest(
     strategy_config=current_strategy_config,
     risk_limits=risk_limits,
     alpaca_config=alpaca_adapter.config,
-    account_equity=account,
-    paper_cash=paper_broker.cash,
+    account_equity=paper_order_risk_equity,
+    paper_cash=paper_order_available_cash,
 )
 current_manifest_record = run_manifest_record(current_run_manifest)
 intent = apply_paper_buy_order_settings(
@@ -1274,22 +1414,21 @@ intent = apply_paper_buy_order_settings(
     paper_buy_limit_offset_pct,
     float(live.get("last_p", 0) or 0),
 )
+intent = resize_trade_intent_for_account(intent, paper_order_risk_equity, risk_dec)
 intent_symbol = intent.symbol_clean if intent else ""
 alpaca_position_symbols = {str(row.get("Symbol", "")).strip().upper() for row in alpaca_positions}
-symbol_current_notional = (
-    paper_broker.positions[intent_symbol].market_value
-    if intent_symbol in paper_broker.positions
-    else 0.0
-)
+symbol_current_notional = 0.0
+if not use_alpaca_account_for_paper_risk and intent_symbol in paper_broker.positions:
+    symbol_current_notional += paper_broker.positions[intent_symbol].market_value
 symbol_current_notional += sum(float(row.get("Market Value") or 0) for row in alpaca_positions if str(row.get("Symbol", "")).strip().upper() == intent_symbol)
 raw_intent_quantity = intent.quantity if intent else None
 intent = constrain_trade_intent_to_limits(
     intent,
-    account_equity=account,
+    account_equity=paper_order_risk_equity,
     limits=risk_limits,
-    current_portfolio_notional=paper_positions_notional + alpaca_positions_notional,
+    current_portfolio_notional=paper_order_portfolio_notional,
     symbol_current_notional=symbol_current_notional,
-    available_cash=paper_broker.cash,
+    available_cash=paper_order_available_cash,
 )
 live["trade_intent"] = intent
 if intent is not None:
@@ -1311,20 +1450,28 @@ if intent is not None:
             "planned_limit_price": intent.limit_price,
             "planned_quantity": intent.quantity,
             "planned_entry_price": intent.entry_price,
+            "sizing_account_source": paper_order_account_source,
+            "sizing_account_equity": paper_order_risk_equity,
+            "sizing_available_cash": paper_order_available_cash,
         }
     )
     current_exit_settings.update(current_strategy_settings)
     current_exit_settings["auto_exit_enabled"] = True
+trade_open_position_symbols = (
+    alpaca_position_symbols
+    if use_alpaca_account_for_paper_risk
+    else set(paper_broker.positions.keys()) | alpaca_position_symbols
+)
 risk_check = check_trade_intent(
     intent,
-    account_equity=account,
+    account_equity=paper_order_risk_equity,
     limits=risk_limits,
-    open_positions=set(paper_broker.positions.keys()) | alpaca_position_symbols,
-    open_position_count=len(set(paper_broker.positions.keys()) | alpaca_position_symbols),
-    current_portfolio_notional=paper_positions_notional + alpaca_positions_notional,
+    open_positions=trade_open_position_symbols,
+    open_position_count=len(trade_open_position_symbols),
+    current_portfolio_notional=paper_order_portfolio_notional,
     symbol_current_notional=symbol_current_notional,
-    session_pnl=session_pnl,
-    available_cash=paper_broker.cash,
+    session_pnl=paper_order_session_pnl,
+    available_cash=paper_order_available_cash,
 )
 execution_decision = decide_execution(execution_mode, risk_check)
 preflight_check = build_preflight_check(
@@ -1419,6 +1566,14 @@ duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_has
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
 cancelable_alpaca_orders = cancelable_alpaca_order_records(alpaca_orders)
 current_market_advisory = market_session_advisory()
+regular_market_open = bool(current_market_advisory.get("Open", False))
+limit_buy_allowed_outside_market = (
+    allow_limit_buys_outside_market_hours
+    and intent is not None
+    and intent.side == "buy"
+    and intent.order_type == "limit"
+)
+auto_buy_session_allows_order = regular_market_open or limit_buy_allowed_outside_market
 first_exit_preview = next((preview for preview in exit_previews if preview.valid), None)
 first_exit_symbol = str(first_exit_preview.order.get("symbol", "")).strip().upper() if first_exit_preview else ""
 saved_exit_settings = saved_exit_settings_for_symbol(first_exit_symbol, tracked_alpaca_orders) if first_exit_symbol else None
@@ -1500,7 +1655,7 @@ auto_entry_status = auto_entry_decision(
     paper_orders_enabled=enable_alpaca_paper_orders,
     kill_switch_enabled=effective_kill_switch,
     broker_state_stale=alpaca_state_health.stale,
-    market_open=bool(current_market_advisory.get("Open", False)),
+    market_open=auto_buy_session_allows_order,
     intent_present=intent is not None,
     risk_approved=risk_check.approved,
     preflight_ready=preflight_check.ready,
@@ -1519,7 +1674,7 @@ auto_exit_status = auto_exit_decision(
     paper_orders_enabled=enable_alpaca_paper_orders,
     kill_switch_enabled=effective_kill_switch,
     broker_state_stale=alpaca_state_health.stale,
-    market_open=bool(current_market_advisory.get("Open", False)),
+    market_open=regular_market_open,
     strategy_exit_ready=managed_exit_ready,
     strategy_exit_reason=managed_exit_reason,
     exit_preview_records=exit_preview_rows_for_auto,
@@ -1593,6 +1748,11 @@ def run_paper_automation_once() -> None:
     automation_checked_at = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["last_automation_checked_at"] = automation_checked_at
     record_automation_decisions(automation_checked_at)
+    _, broker_order_state_changed = refresh_tracked_alpaca_orders_from_broker()
+    if broker_order_state_changed:
+        st.session_state["last_automation_action"] = "Alpaca orders refreshed"
+        st.session_state["last_automation_blocked_reason"] = "Order status changed at Alpaca. Automation will re-check with fresh order state."
+        st.rerun()
 
     if auto_exit_status.ready:
         auto_exit_preview = next((preview for preview in exit_previews if preview.preview_hash == auto_exit_status.preview_hash), None)
@@ -1686,6 +1846,20 @@ def run_paper_automation_once() -> None:
         try:
             if intent is None:
                 raise ValueError("Automatic buy could not find a current trade idea.")
+            live_sent_hashes = active_tracked_preview_hashes(st.session_state.get("tracked_alpaca_orders", []))
+            if auto_entry_status.preview_hash in live_sent_hashes:
+                st.session_state["last_automation_action"] = "Paper buy skipped"
+                st.session_state["last_automation_blocked_reason"] = "This exact paper buy is already open at Alpaca."
+                return
+            local_buy_reasons = local_open_buy_order_reasons(
+                intent.symbol_clean,
+                st.session_state.get("tracked_alpaca_orders", []),
+            )
+            if local_buy_reasons:
+                st.session_state["last_automation_action"] = "Paper buy skipped"
+                st.session_state["last_automation_blocked_reason"] = "; ".join(local_buy_reasons)
+                return
+            st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
             alpaca_auto_entry_order = alpaca_adapter.submit_order(
                 intent,
                 execution_decision,
@@ -1714,7 +1888,6 @@ def run_paper_automation_once() -> None:
                 )
                 broker_state_store.replace_all(updated_orders)
                 st.session_state["tracked_alpaca_orders"] = updated_orders
-            st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
             order_type = "limit" if intent.order_type == "limit" else "market"
             st.session_state["last_automation_action"] = f"Paper buy {order_type} sent: {intent.quantity} {intent.symbol_clean}"
             st.session_state["last_automation_blocked_reason"] = ""
@@ -1740,7 +1913,8 @@ def run_paper_automation_once() -> None:
             if persist_audit_log:
                 audit_store.append(auto_entry_submit_event)
         except Exception as exc:
-            st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
+            if auto_entry_status.preview_hash not in st.session_state["auto_entry_sent_hashes"]:
+                st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
             st.session_state["last_automation_action"] = "Paper buy blocked"
             st.session_state["last_automation_blocked_reason"] = str(exc)
             auto_entry_block_event = AuditEvent(
@@ -1776,6 +1950,8 @@ def render_automation_status() -> None:
         st.success(f"Auto exits can sell {auto_exit_status.quantity} {auto_exit_status.symbol} in Alpaca paper.")
     elif auto_entry_status.ready:
         st.success(f"Auto entries and exits can buy {auto_entry_status.quantity} {auto_entry_status.symbol} in Alpaca paper.")
+        if limit_buy_allowed_outside_market and not regular_market_open:
+            st.info("Market is closed. The app can send a paper limit buy because outside-hours limit buys are enabled. The order may wait at Alpaca before it fills.")
     else:
         visible_status = auto_entry_status.status if active_automation_level == "Auto entries and exits" else auto_exit_status.status
         visible_reasons = auto_entry_status.reasons if active_automation_level == "Auto entries and exits" else auto_exit_status.reasons
@@ -2066,6 +2242,10 @@ elif command_center_view == "New Trade":
         metric_card(proposal_cols[1], "Quantity", f"{intent.quantity:,}", intent.order_type)
         metric_card(proposal_cols[2], "Buy near", f"${intent.entry_price:,.2f}", "Strategy price")
         metric_card(proposal_cols[3], "Stop loss", f"${intent.stop_loss:,.2f}", "Risk rule")
+        st.caption(
+            f"Order sizing uses {paper_order_account_source}: "
+            f"${paper_order_risk_equity:,.2f} account value and ${paper_order_available_cash:,.2f} available cash."
+        )
         st.caption(intent.rationale)
         with st.expander("Trade idea details", expanded=False):
             st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), use_container_width=True, hide_index=True)
@@ -2400,7 +2580,7 @@ if command_center_view == "Alpaca":
             st.dataframe(pd.DataFrame(alpaca_config_validation_records(alpaca_adapter.config)), use_container_width=True, hide_index=True)
         alpaca_tabs = st.tabs(["Alpaca account", "Alpaca positions", "Alpaca orders"])
         with alpaca_tabs[0]:
-            account_records = alpaca_adapter.account_records()
+            account_records = alpaca_account_records
             if account_records:
                 st.dataframe(pd.DataFrame(account_records), use_container_width=True, hide_index=True)
             else:
@@ -3277,9 +3457,9 @@ if command_center_view == "Alpaca":
                 daily_risk_records(
                     local_order_records=order_records,
                     tracked_alpaca_orders=st.session_state["tracked_alpaca_orders"],
-                    account_equity=account,
-                    session_pnl=session_pnl,
-                    portfolio_exposure=paper_positions_notional + alpaca_positions_notional,
+                    account_equity=paper_order_risk_equity,
+                    session_pnl=paper_order_session_pnl,
+                    portfolio_exposure=paper_order_portfolio_notional,
                     limits=risk_limits,
                 )
             ),
