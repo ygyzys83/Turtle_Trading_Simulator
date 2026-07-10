@@ -101,6 +101,84 @@ def alpaca_paper_activity_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     ]
 
 
+def paper_trading_review_records(
+    snapshot: PaperSessionSnapshot,
+    alpaca_position_count: int = 0,
+    alpaca_account_value: float | None = None,
+) -> list[dict]:
+    event_types = [record.get("event_type", "") for record in snapshot.audit_records]
+    buy_count = event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")
+    exit_count = event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")
+    cancel_count = event_types.count("alpaca_paper_cancel_submitted")
+    blocked_count = sum(1 for event_type in event_types if "blocked" in event_type or "rejected" in event_type)
+    waiting_orders = [
+        order for order in snapshot.tracked_alpaca_orders
+        if _enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"}
+    ]
+    account_value = _money(alpaca_account_value) if alpaca_account_value is not None else "Not connected"
+    if blocked_count:
+        next_step = "Review blocked orders before changing automation."
+    elif waiting_orders:
+        next_step = "Watch or cancel waiting limit orders."
+    elif alpaca_position_count:
+        next_step = "Let saved exit settings manage open positions."
+    else:
+        next_step = "Find the next clean setup or review today."
+    return [
+        {"Area": "Account", "Read": account_value, "Plain English": "Current Alpaca paper account value when connected."},
+        {"Area": "Open positions", "Read": alpaca_position_count, "Plain English": "Current Alpaca paper positions being managed."},
+        {"Area": "Waiting orders", "Read": len(waiting_orders), "Plain English": "Limit orders still waiting at Alpaca."},
+        {"Area": "Paper buys sent", "Read": buy_count, "Plain English": "Manual and automatic paper buys recorded this session."},
+        {"Area": "Paper exits sent", "Read": exit_count, "Plain English": "Manual and automatic paper exits recorded this session."},
+        {"Area": "Paper cancels sent", "Read": cancel_count, "Plain English": "Paper order cancels recorded this session."},
+        {"Area": "Issues to review", "Read": blocked_count, "Plain English": "Blocked or rejected order events recorded this session."},
+        {"Area": "Next step", "Read": next_step, "Plain English": "The useful action from here."},
+    ]
+
+
+def paper_testing_progress_records(
+    audit_records: list[dict],
+    tracked_alpaca_orders: list[dict],
+    target_days: int = 10,
+) -> list[dict]:
+    paper_event_types = {
+        "alpaca_paper_order_submitted",
+        "auto_paper_entry_submitted",
+        "alpaca_paper_exit_submitted",
+        "auto_paper_exit_submitted",
+        "alpaca_paper_cancel_submitted",
+    }
+    paper_records = [record for record in audit_records if record.get("event_type") in paper_event_types]
+    active_dates = sorted(
+        {
+            str(record.get("created_at", ""))[:10]
+            for record in paper_records
+            if str(record.get("created_at", ""))[:10]
+        }
+    )
+    event_types = [record.get("event_type", "") for record in audit_records]
+    buy_count = event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")
+    exit_count = event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")
+    blocked_count = sum(1 for event_type in event_types if "blocked" in event_type or "rejected" in event_type)
+    filled_orders = [
+        order for order in tracked_alpaca_orders
+        if _enum_value(order.get("status")) == "filled"
+    ]
+    ready_for_review = len(active_dates) >= target_days and buy_count > 0 and exit_count > 0 and blocked_count == 0
+    return [
+        {"Check": "Paper trading days", "Read": f"{len(active_dates)}/{target_days}", "Plain English": "Days with recorded paper order activity."},
+        {"Check": "Paper buys tested", "Read": buy_count, "Plain English": "Paper buy orders sent through Alpaca."},
+        {"Check": "Paper exits tested", "Read": exit_count, "Plain English": "Paper exit orders sent through Alpaca."},
+        {"Check": "Filled paper orders", "Read": len(filled_orders), "Plain English": "Saved Alpaca paper orders marked filled."},
+        {"Check": "Issues to review", "Read": blocked_count, "Plain English": "Blocked or rejected order records to inspect."},
+        {
+            "Check": "Testing status",
+            "Read": "Ready to review live setup" if ready_for_review else "Keep paper testing",
+            "Plain English": "Review live setup only after enough paper days, at least one buy, at least one exit, and no unresolved issues.",
+        },
+    ]
+
+
 def _enum_value(value: Any) -> str:
     text = str(value or "").strip()
     if "." in text:

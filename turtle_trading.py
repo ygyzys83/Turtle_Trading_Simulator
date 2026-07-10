@@ -145,6 +145,8 @@ from agentloop_trader.session_journal import (
     alpaca_paper_activity_records,
     new_session_id,
     paper_performance_records,
+    paper_testing_progress_records,
+    paper_trading_review_records,
     session_summary_records,
     session_timeline_records,
 )
@@ -916,6 +918,25 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
         {"Area": "Last automation check", "Read": st.session_state.get("last_automation_checked_at", "Not checked yet"), "Plain English": f"Checks every {automation_refresh_seconds} seconds while automation is on."},
         {"Area": "Last automation action", "Read": st.session_state.get("last_automation_action", "None"), "Plain English": st.session_state.get("last_automation_blocked_reason", "") or "No recent action."},
     ]
+
+
+def open_positions_next_step(position_settings_by_symbol: dict[str, dict]) -> str:
+    if not alpaca_positions:
+        return "No open Alpaca positions. Use New Trade when you want to research the next setup."
+    unmanaged = [
+        str(position.get("Symbol", "")).strip().upper()
+        for position in alpaca_positions
+        if not position_settings_by_symbol.get(str(position.get("Symbol", "")).strip().upper())
+    ]
+    if auto_exit_status.ready:
+        return f"Ready to sell {auto_exit_status.quantity} {auto_exit_status.symbol} if automation is enabled."
+    if unmanaged:
+        return f"Save exit settings for {', '.join(unmanaged)}."
+    if count_waiting_alpaca_orders(alpaca_orders):
+        return "Review waiting Alpaca orders before adding new exposure."
+    if active_automation_level == "Auto exits only":
+        return "Auto exits are watching saved position exit rules."
+    return "Positions have saved exit settings. Turn on Auto exits if you want the app to manage sells."
 
 
 def live_trading_setup_records() -> list[dict]:
@@ -3135,6 +3156,26 @@ if automation_timer_enabled:
     automation_timer_tick()
 
 
+position_records = paper_broker.position_records()
+order_records = paper_broker.order_records()
+session_audit_records = [JsonlAuditStore.event_to_record(event) for event in st.session_state["session_audit_events"]]
+current_evidence_records = session_audit_records
+if persist_audit_log:
+    current_evidence_records = audit_store.read_recent(limit=500) or session_audit_records
+session_snapshot = PaperSessionSnapshot(
+    session_id=st.session_state["paper_session_id"],
+    started_at=st.session_state["paper_session_started_at"],
+    mode=mode_label,
+    paper_cash=paper_broker.cash,
+    paper_equity=paper_equity,
+    session_pnl=session_pnl,
+    local_orders=order_records,
+    local_positions=position_records,
+    tracked_alpaca_orders=st.session_state["tracked_alpaca_orders"],
+    audit_records=session_audit_records,
+)
+
+
 def render_automation_status() -> None:
     sub_section("4.3 Automation status")
     status_label, status_detail, status_kind = automation_status_text()
@@ -3229,6 +3270,7 @@ def render_open_positions_panel() -> None:
     metric_card(position_summary_cols[1], "Managed", managed_count, "Have saved exit settings")
     metric_card(position_summary_cols[2], "Auto Exit On", auto_exit_on_count, "Position-level setting")
     metric_card(position_summary_cols[3], "Waiting Orders", count_waiting_alpaca_orders(alpaca_orders), "Alpaca paper")
+    st.info(open_positions_next_step(position_settings_by_symbol))
     st.markdown("#### Automation readiness")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("Open positions")), width="stretch", hide_index=True)
 
@@ -3527,7 +3569,7 @@ render_daily_automation_panel()
 
 command_center_view = st.radio(
     "Command center page",
-    ["Open Positions", "New Trade", "Alpaca"],
+    ["Open Positions", "New Trade", "Alpaca", "Paper Review"],
     horizontal=True,
     label_visibility="collapsed",
 )
@@ -3717,6 +3759,48 @@ elif command_center_view == "Alpaca":
                 hide_index=True,
             )
             st.caption("These checks are local only. The lock file does not enable live trading.")
+elif command_center_view == "Paper Review":
+    sub_section("1.4 Paper review", "Review paper trading progress, account activity, and what needs attention.")
+    st.markdown("#### Daily paper review")
+    st.dataframe(
+        pd.DataFrame(
+            paper_trading_review_records(
+                session_snapshot,
+                alpaca_position_count=len(alpaca_positions),
+                alpaca_account_value=alpaca_account_equity,
+            )
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    st.markdown("#### Paper testing progress")
+    st.dataframe(
+        pd.DataFrame(
+            paper_testing_progress_records(
+                current_evidence_records,
+                st.session_state["tracked_alpaca_orders"],
+                target_days=10,
+            )
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+    if st.button("Save Paper Performance Review", key="save_daily_paper_review"):
+        performance_event = AuditEvent(
+            event_type="paper_performance_reviewed",
+            message="Paper trading review was saved by the user.",
+            payload={"session_id": st.session_state["paper_session_id"]},
+        )
+        st.session_state["session_audit_events"].append(performance_event)
+        if persist_audit_log:
+            audit_store.append(performance_event)
+        st.rerun()
+    with st.expander("Recent paper activity", expanded=False):
+        timeline_rows = session_timeline_records(session_audit_records, limit=25)
+        if timeline_rows:
+            st.dataframe(pd.DataFrame(timeline_rows), width="stretch", hide_index=True)
+        else:
+            st.caption("No paper activity recorded in this app session yet.")
     
 if command_center_view == "New Trade":
     page_section("2. Backtest", "Review the chart and past simulated results for the selected strategy settings.")
@@ -4744,8 +4828,6 @@ if command_center_view == "Alpaca":
             st.dataframe(pd.DataFrame(automation_evidence_records(recent_automation_snapshots)), width="stretch", hide_index=True)
         st.caption("This check records what automation sees. It does not submit, exit, or cancel broker orders.")
     
-    position_records = paper_broker.position_records()
-    order_records = paper_broker.order_records()
     if show_portfolio_evidence:
         st.markdown("#### Practice decision log *")
         shadow_disabled = intent is None or execution_mode != "shadow"
@@ -4788,29 +4870,12 @@ if command_center_view == "Alpaca":
                 st.dataframe(pd.DataFrame(order_records), width="stretch", hide_index=True)
             else:
                 st.caption("No paper orders submitted.")
-    
-    session_audit_records = [JsonlAuditStore.event_to_record(event) for event in st.session_state["session_audit_events"]]
-    session_snapshot = PaperSessionSnapshot(
-        session_id=st.session_state["paper_session_id"],
-        started_at=st.session_state["paper_session_started_at"],
-        mode=mode_label,
-        paper_cash=paper_broker.cash,
-        paper_equity=paper_equity,
-        session_pnl=session_pnl,
-        local_orders=order_records,
-        local_positions=position_records,
-        tracked_alpaca_orders=st.session_state["tracked_alpaca_orders"],
-        audit_records=session_audit_records,
-    )
     current_risk_halt_rows = risk_halt_records(
         monitoring_result=monitoring_result,
         broker_connected=alpaca_status.connected,
         broker_state_stale=alpaca_state_health.stale,
         automation_ready_rows=readiness_rows,
     )
-    current_evidence_records = session_audit_records
-    if persist_audit_log:
-        current_evidence_records = audit_store.read_recent(limit=500) or session_audit_records
     recent_automation_records = automation_store.read_recent(limit=100)
     if show_portfolio_evidence:
         page_section("5. Saved records *", "Detailed session records, local simulator results, Alpaca paper history, and export tools.")
@@ -4836,7 +4901,7 @@ if command_center_view == "Alpaca":
     
         sub_section("5.3 Local simulator results *")
         st.dataframe(pd.DataFrame(paper_performance_records(session_snapshot)), width="stretch", hide_index=True)
-        if st.button("Save Paper Performance Review"):
+        if st.button("Save Paper Performance Review", key="save_records_paper_review"):
             performance_event = AuditEvent(
                 event_type="paper_performance_reviewed",
                 message="Local simulator performance was reviewed by the user.",

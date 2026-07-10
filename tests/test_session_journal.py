@@ -3,6 +3,8 @@ from agentloop_trader.session_journal import (
     alpaca_paper_activity_records,
     new_session_id,
     paper_performance_records,
+    paper_testing_progress_records,
+    paper_trading_review_records,
     session_summary_records,
     session_timeline_records,
 )
@@ -104,3 +106,36 @@ def test_alpaca_paper_activity_records_report_saved_broker_history():
     assert metrics["Saved Alpaca orders"] == 3
     assert metrics["Filled Alpaca shares"] == "40"
     assert metrics["Alpaca orders waiting to fill"] == 1
+
+
+def test_paper_trading_review_records_surface_next_step_and_account_value():
+    rows = paper_trading_review_records(_snapshot(), alpaca_position_count=1, alpaca_account_value=100_250.50)
+    reads = {row["Area"]: row["Read"] for row in rows}
+
+    assert reads["Account"] == "$100,250.50"
+    assert reads["Open positions"] == 1
+    assert reads["Waiting orders"] == 1
+    assert reads["Paper buys sent"] == 1
+    assert reads["Paper exits sent"] == 1
+    assert "Watch or cancel" in reads["Next step"]
+
+
+def test_paper_testing_progress_records_track_days_and_status():
+    audit_records = [
+        {
+            "created_at": f"2026-07-{day:02d}T16:00:00-07:00",
+            "event_type": "alpaca_paper_order_submitted" if day == 1 else "alpaca_paper_exit_submitted",
+            "message": "paper event",
+            "payload": {},
+        }
+        for day in range(1, 11)
+    ]
+    tracked_orders = [{"status": "filled"}]
+
+    rows = paper_testing_progress_records(audit_records, tracked_orders, target_days=10)
+    reads = {row["Check"]: row["Read"] for row in rows}
+
+    assert reads["Paper trading days"] == "10/10"
+    assert reads["Paper buys tested"] == 1
+    assert reads["Paper exits tested"] == 9
+    assert reads["Testing status"] == "Ready to review live setup"
