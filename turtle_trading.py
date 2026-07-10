@@ -2,7 +2,7 @@
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
-from dataclasses import replace
+from dataclasses import asdict, replace
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
@@ -32,6 +32,14 @@ from agentloop_trader.automation import (
     paper_automation_dry_run,
     strategy_settings_match,
     strategy_settings_match_reason,
+)
+from agentloop_trader.automation_runtime import (
+    AutomationControl,
+    AutomationControlStore,
+    WorkerStatusStore,
+    start_worker_process,
+    worker_status_is_active,
+    worker_status_records,
 )
 from agentloop_trader.backtest import (
     simulate_trendline_breakout_strategy,
@@ -83,6 +91,8 @@ from agentloop_trader.evidence import (
     write_evidence_package,
 )
 from agentloop_trader.execution import PaperBroker
+from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
+from agentloop_trader.market_data import build_company_research_context
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
 from agentloop_trader.monitoring import (
     broker_heartbeat_records,
@@ -140,6 +150,7 @@ from agentloop_trader.safety import (
     production_readiness_checks,
     write_live_mode_lockfile,
 )
+from agentloop_trader.scanner import DEFAULT_SCAN_SYMBOLS, ScannerCandidateStore, scan_universe, scanner_records
 from agentloop_trader.session_journal import (
     PaperSessionSnapshot,
     alpaca_paper_activity_records,
@@ -1485,6 +1496,32 @@ kill_switch = st.sidebar.checkbox(
     value=False,
     help="Immediate hard stop. When this is on, the app blocks new paper orders and automation actions.",
 )
+sidebar_worker_status_store = WorkerStatusStore()
+sidebar_worker_status = sidebar_worker_status_store.read()
+sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
+if "background_worker_enabled" not in st.session_state:
+    st.session_state["background_worker_enabled"] = sidebar_worker_active
+if "worker_stop_pending" not in st.session_state:
+    st.session_state["worker_stop_pending"] = False
+if not sidebar_worker_active:
+    st.session_state["worker_stop_pending"] = False
+if kill_switch:
+    st.session_state["background_worker_enabled"] = False
+st.sidebar.markdown("### Background Automation")
+worker_status_text = "Running" if sidebar_worker_active else "Stopped"
+st.sidebar.caption(f"Worker: {worker_status_text}. {sidebar_worker_status.last_action or 'No recent action.'}")
+worker_control_cols = st.sidebar.columns(2)
+if worker_control_cols[0].button("Start Worker", disabled=kill_switch or sidebar_worker_active):
+    st.session_state["background_worker_enabled"] = True
+    st.session_state["worker_stop_pending"] = False
+    st.session_state["start_background_worker_requested"] = True
+    st.session_state["stop_background_worker_requested"] = False
+if worker_control_cols[1].button("Stop Worker", disabled=not sidebar_worker_active):
+    st.session_state["background_worker_enabled"] = False
+    st.session_state["worker_stop_pending"] = True
+    st.session_state["stop_background_worker_requested"] = True
+    st.session_state["start_background_worker_requested"] = False
+
 st.sidebar.markdown("### Navigation")
 workspace_mode = st.sidebar.radio(
     "Workspace",
@@ -1568,6 +1605,7 @@ automation_refresh_seconds = st.sidebar.selectbox(
     format_func=lambda seconds: f"{seconds} seconds",
     help="How often the app checks for automatic paper buys or sells while automation is on.",
 )
+background_worker_enabled = bool(st.session_state.get("background_worker_enabled", False))
 paper_buy_order_style = st.sidebar.selectbox(
     "Paper buy price",
     ["Limit below current price", "Limit at current price", "Limit above current price", "Custom limit price", "Market"],
@@ -2213,6 +2251,78 @@ current_strategy_settings = {
 }
 current_exit_settings = dict(current_strategy_settings)
 current_exit_settings["auto_exit_enabled"] = True
+
+automation_control_store = AutomationControlStore()
+automation_worker_status_store = WorkerStatusStore()
+start_worker_requested = bool(st.session_state.pop("start_background_worker_requested", False))
+stop_worker_requested = bool(st.session_state.pop("stop_background_worker_requested", False))
+if start_worker_requested:
+    background_worker_enabled = True
+if stop_worker_requested:
+    background_worker_enabled = False
+worker_stop_requested = bool(st.session_state.get("worker_stop_pending", False) or stop_worker_requested)
+automation_control = AutomationControl(
+    enabled=bool(background_worker_enabled and active_automation_level != "Manual review only"),
+    stop_requested=worker_stop_requested,
+    mode=active_automation_level,
+    paper_orders_enabled=bool(enable_alpaca_paper_orders and execution_mode == "paper"),
+    kill_switch_enabled=bool(effective_kill_switch),
+    full_automation_enabled=bool(full_automation_enabled),
+    allow_duplicate_positions=bool(allow_add_to_existing_position),
+    allow_limit_buys_outside_market_hours=bool(allow_limit_buys_outside_market_hours),
+    auto_cancel_limit_buys=bool(auto_cancel_stale_limit_orders),
+    stale_limit_order_minutes=int(stale_limit_order_minutes),
+    refresh_seconds=int(automation_refresh_seconds),
+    symbol=ticker,
+    price_data_source=data_source,
+    history=period,
+    interval=interval,
+    strategy_settings=current_strategy_settings,
+    risk_limits=asdict(risk_limits),
+    order_style=paper_buy_order_style,
+    limit_adjustment_pct=float(paper_buy_limit_adjustment_pct),
+    custom_limit_price=float(paper_buy_custom_limit_price),
+    account_size=float(paper_order_risk_equity),
+    broker_state_path=broker_state_path,
+    audit_log_path=audit_log_path,
+)
+automation_control_store.write(automation_control)
+if start_worker_requested:
+    try:
+        worker_pid = start_worker_process(Path.cwd())
+        automation_worker_status_store.write(
+            replace(
+                automation_worker_status_store.read(),
+                running=True,
+                pid=worker_pid,
+                state="Starting",
+                last_checked_at=datetime.now().astimezone().isoformat(),
+                last_action="Started from the Streamlit sidebar.",
+                last_error="",
+            )
+        )
+    except Exception as exc:
+        automation_worker_status_store.write(
+            replace(
+                automation_worker_status_store.read(),
+                running=False,
+                state="Start failed",
+                last_checked_at=datetime.now().astimezone().isoformat(),
+                last_action="Could not start background worker.",
+                last_error=str(exc),
+            )
+        )
+elif stop_worker_requested:
+    automation_worker_status_store.write(
+        replace(
+            automation_worker_status_store.read(),
+            state="Stopping",
+            last_checked_at=datetime.now().astimezone().isoformat(),
+            last_action="Stop requested from the Streamlit sidebar.",
+            last_error="",
+        )
+    )
+automation_worker_status = automation_worker_status_store.read()
 
 
 def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
@@ -3143,7 +3253,7 @@ def run_paper_automation_once() -> None:
                 audit_store.append(auto_entry_block_event)
 
 
-automation_timer_enabled = active_automation_level != "Manual review only"
+automation_timer_enabled = active_automation_level != "Manual review only" and not background_worker_enabled
 if automation_timer_enabled:
     @st.fragment(run_every=f"{automation_refresh_seconds}s")
     def automation_timer_tick() -> None:
@@ -3216,6 +3326,12 @@ def render_automation_status() -> None:
         f"Next check: every {automation_refresh_seconds} seconds while automation is on. "
         f"Last action: {runtime_state.last_action}."
     )
+    if background_worker_enabled:
+        st.info(
+            "Background worker mode is on. Use Start Worker and Stop Worker under the Kill Switch. "
+            "The in-page timer is paused while the worker is enabled."
+        )
+        st.dataframe(pd.DataFrame(worker_status_records(automation_worker_status)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         st.markdown("#### Automation runtime *")
         st.dataframe(pd.DataFrame(automation_runtime_records(runtime_state)), width="stretch", hide_index=True)
@@ -3569,15 +3685,83 @@ render_daily_automation_panel()
 
 command_center_view = st.radio(
     "Command center page",
-    ["Open Positions", "New Trade", "Alpaca", "Paper Review"],
+    ["Open Positions", "Ideas", "New Trade", "Alpaca", "Paper Review"],
     horizontal=True,
     label_visibility="collapsed",
 )
 if command_center_view == "Open Positions":
     sub_section("1.1 Open positions", "Manage each Alpaca paper position and its own exit settings.")
     render_open_positions_panel()
+elif command_center_view == "Ideas":
+    sub_section("1.2 Ideas", "Scan tickers, compare strategy fit, and create a simple research read.")
+    scanner_store = ScannerCandidateStore()
+    default_scan_text = ", ".join(DEFAULT_SCAN_SYMBOLS)
+    scan_symbols_text = st.text_input("Tickers to scan", value=default_scan_text)
+    scan_source = data_source if data_source in {"Ticker (Alpaca)", "Ticker (yfinance)"} else "Ticker (Alpaca)"
+    st.caption(f"Scanner uses {scan_source}, {period if period != 'synthetic' else '1y'}, {interval if interval != '1d' or data_source != 'Synthetic' else '1h'}.")
+
+    if st.button("Scan Tickers", type="primary"):
+        scan_symbols = [item.strip().upper() for item in scan_symbols_text.split(",") if item.strip()]
+        scan_period = period if period != "synthetic" else "1y"
+        scan_interval = interval if data_source != "Synthetic" else "1h"
+
+        def scan_fetch(symbol: str) -> pd.DataFrame:
+            return fetch_price_data_for_source(symbol, scan_period, scan_interval, scan_source)
+
+        with st.spinner("Scanning tickers..."):
+            candidates, scan_errors = scan_universe(
+                scan_symbols,
+                scan_fetch,
+                current_strategy_settings | {"history": scan_period, "interval": scan_interval, "price_data_source": scan_source},
+                float(paper_order_risk_equity),
+                risk_limits,
+                max_symbols=30,
+            )
+        scanner_store.save(candidates, scan_errors)
+        st.session_state["selected_scan_symbol"] = candidates[0].symbol if candidates else ""
+        st.rerun()
+
+    saved_candidates, saved_scan_errors = scanner_store.read()
+    if saved_candidates:
+        st.markdown("#### Current ideas")
+        st.dataframe(pd.DataFrame(scanner_records(saved_candidates)), width="stretch", hide_index=True)
+        selected_scan_symbol = st.selectbox(
+            "Research one ticker",
+            [candidate.symbol for candidate in saved_candidates],
+            index=max(0, [candidate.symbol for candidate in saved_candidates].index(st.session_state.get("selected_scan_symbol", saved_candidates[0].symbol))) if st.session_state.get("selected_scan_symbol") in [candidate.symbol for candidate in saved_candidates] else 0,
+        )
+        selected_candidate = next(candidate for candidate in saved_candidates if candidate.symbol == selected_scan_symbol)
+        research_provider = st.selectbox("Research writer", ["Built-in", "Ollama", "Gemini"], index=0)
+        if st.button("Analyze Selected Ticker"):
+            config = LLMResearchConfig.from_env(research_provider.lower().replace("built-in", "deterministic"))
+            with st.spinner("Building research read..."):
+                context = build_company_research_context(selected_candidate.symbol, alpaca_config.api_key, alpaca_config.api_secret)
+                result = analyze_candidate(selected_candidate, context, config)
+            st.session_state["latest_llm_research"] = asdict(result)
+            st.session_state["latest_company_context"] = {
+                "Ticker": context.symbol,
+                "Event risk": context.event_risk,
+                "Event detail": context.event_detail,
+                "News": context.news_status,
+                "Fundamentals": context.fundamentals_status,
+                "Headlines": " | ".join(item.headline for item in context.headlines[:5]) or "None loaded",
+            }
+            st.rerun()
+        if st.session_state.get("latest_llm_research"):
+            st.markdown("#### Research read")
+            latest_result = LLMResearchResult(**st.session_state["latest_llm_research"])
+            st.dataframe(pd.DataFrame(llm_research_records(latest_result)), width="stretch", hide_index=True)
+            if st.session_state.get("latest_company_context"):
+                st.markdown("#### Company context")
+                st.dataframe(pd.DataFrame([{"Item": key, "Value": value} for key, value in st.session_state["latest_company_context"].items()]), width="stretch", hide_index=True)
+            st.caption("This research read cannot send orders. Open the ticker in New Trade before placing a paper buy.")
+    else:
+        st.info("No ideas scanned yet. Enter tickers above and click Scan Tickers.")
+    if saved_scan_errors and show_portfolio_evidence:
+        with st.expander("Scanner errors *", expanded=False):
+            st.dataframe(pd.DataFrame(saved_scan_errors), width="stretch", hide_index=True)
 elif command_center_view == "New Trade":
-    sub_section("1.2 New trade", "Research the ticker, review the setup, and decide whether to send a paper buy.")
+    sub_section("1.3 New trade", "Research the ticker, review the setup, and decide whether to send a paper buy.")
     desk_cols = st.columns(4)
     metric_card(desk_cols[0], "Final Answer", final_answer, final_detail)
     metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
@@ -3673,7 +3857,7 @@ elif command_center_view == "New Trade":
                 hide_index=True,
             )
 elif command_center_view == "Alpaca":
-    sub_section("1.3 Alpaca account", "Check broker connection, paper account status, and current Alpaca counts.")
+    sub_section("1.4 Alpaca account", "Check broker connection, paper account status, and current Alpaca counts.")
     risk_broker_rows = [
         {"Item": "Alpaca connected", "Value": plain_yes_no(alpaca_status.connected)},
         {"Item": "Use Alpaca paper account", "Value": plain_yes_no(enable_alpaca_paper_orders)},
@@ -3760,7 +3944,7 @@ elif command_center_view == "Alpaca":
             )
             st.caption("These checks are local only. The lock file does not enable live trading.")
 elif command_center_view == "Paper Review":
-    sub_section("1.4 Paper review", "Review paper trading progress, account activity, and what needs attention.")
+    sub_section("1.5 Paper review", "Review paper trading progress, account activity, and what needs attention.")
     st.markdown("#### Daily paper review")
     st.dataframe(
         pd.DataFrame(
