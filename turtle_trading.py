@@ -1500,6 +1500,7 @@ kill_switch = st.sidebar.checkbox(
 sidebar_worker_status_store = WorkerStatusStore()
 sidebar_worker_status = sidebar_worker_status_store.read()
 sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
+sidebar_control_store = AutomationControlStore()
 if "background_worker_enabled" not in st.session_state:
     st.session_state["background_worker_enabled"] = sidebar_worker_active
 if "worker_stop_pending" not in st.session_state:
@@ -1522,6 +1523,17 @@ if worker_control_cols[1].button("Stop Worker", disabled=not sidebar_worker_acti
     st.session_state["worker_stop_pending"] = True
     st.session_state["stop_background_worker_requested"] = True
     st.session_state["start_background_worker_requested"] = False
+    existing_control = sidebar_control_store.read()
+    sidebar_control_store.write(replace(existing_control, enabled=False, stop_requested=True))
+    sidebar_worker_status_store.write(
+        replace(
+            sidebar_worker_status_store.read(),
+            state="Stopping",
+            last_checked_at=datetime.now().astimezone().isoformat(),
+            last_action="Stop requested from the Streamlit sidebar.",
+            last_error="",
+        )
+    )
 
 st.sidebar.markdown("### Navigation")
 workspace_mode = st.sidebar.radio(
@@ -2255,13 +2267,18 @@ current_exit_settings["auto_exit_enabled"] = True
 
 automation_control_store = AutomationControlStore()
 automation_worker_status_store = WorkerStatusStore()
+previous_automation_control = automation_control_store.read()
 start_worker_requested = bool(st.session_state.pop("start_background_worker_requested", False))
 stop_worker_requested = bool(st.session_state.pop("stop_background_worker_requested", False))
 if start_worker_requested:
     background_worker_enabled = True
 if stop_worker_requested:
     background_worker_enabled = False
-worker_stop_requested = bool(st.session_state.get("worker_stop_pending", False) or stop_worker_requested)
+worker_stop_requested = bool(
+    st.session_state.get("worker_stop_pending", False)
+    or stop_worker_requested
+    or (previous_automation_control.stop_requested and sidebar_worker_active and not start_worker_requested)
+)
 automation_control = AutomationControl(
     enabled=bool(background_worker_enabled and active_automation_level != "Manual review only"),
     stop_requested=worker_stop_requested,
@@ -2442,7 +2459,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             else None
         )
         entry_time = parse_saved_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
-        high_data = data
+        high_data = data.tail(1)
         if entry_time is not None and not data.empty:
             index = data.index
             if getattr(index, "tz", None) is None:

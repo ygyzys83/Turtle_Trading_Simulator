@@ -492,9 +492,9 @@ def build_alpaca_order_preview(
 
 
 def alpaca_preview_records(preview: AlpacaOrderPreview) -> list[dict]:
-    rows = [{"Field": _display_order_field(key), "Value": value} for key, value in preview.order.items()]
+    rows = [{"Field": _display_order_field(key), "Value": str(value)} for key, value in preview.order.items()]
     rows.append({"Field": "Review ID", "Value": preview.preview_hash})
-    rows.append({"Field": "Ready To Send", "Value": preview.valid})
+    rows.append({"Field": "Ready To Send", "Value": "Yes" if preview.valid else "No"})
     return rows
 
 
@@ -533,9 +533,9 @@ def build_alpaca_cancel_preview(order_record: dict | None, config: AlpacaConfig)
 
 
 def alpaca_cancel_preview_records(preview: AlpacaCancelPreview) -> list[dict]:
-    rows = [{"Field": _display_order_field(key), "Value": value} for key, value in preview.cancel.items()]
+    rows = [{"Field": _display_order_field(key), "Value": str(value)} for key, value in preview.cancel.items()]
     rows.append({"Field": "Review ID", "Value": preview.preview_hash})
-    rows.append({"Field": "Ready To Cancel", "Value": preview.valid})
+    rows.append({"Field": "Ready To Cancel", "Value": "Yes" if preview.valid else "No"})
     return rows
 
 

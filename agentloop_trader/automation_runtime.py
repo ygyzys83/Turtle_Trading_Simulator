@@ -185,11 +185,11 @@ class WorkerLock:
 def worker_status_records(status: WorkerStatus) -> list[dict[str, Any]]:
     return [
         {"Item": "Background worker", "Value": "Running" if status.running else "Not running"},
-        {"Item": "State", "Value": status.state},
+        {"Item": "State", "Value": str(status.state)},
         {"Item": "Last check", "Value": status.last_checked_at or "Not checked yet"},
         {"Item": "Last action", "Value": status.last_action or "None"},
-        {"Item": "Orders sent", "Value": status.orders_sent},
-        {"Item": "Cancels sent", "Value": status.cancels_sent},
-        {"Item": "Exits sent", "Value": status.exits_sent},
+        {"Item": "Orders sent", "Value": str(status.orders_sent)},
+        {"Item": "Cancels sent", "Value": str(status.cancels_sent)},
+        {"Item": "Exits sent", "Value": str(status.exits_sent)},
         {"Item": "Last error", "Value": status.last_error or ""},
     ]

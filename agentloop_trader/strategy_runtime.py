@@ -196,7 +196,7 @@ def evaluate_exit_settings(
             initial_risk = None
         profit_r = (current_price - entry) / initial_risk if current_price is not None and entry is not None and initial_risk else None
 
-        high_data = data
+        high_data = data.tail(1)
         entry_time = _parse_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
         if entry_time is not None and not data.empty:
             compare = entry_time.tz_convert(data.index.tz) if getattr(data.index, "tz", None) else entry_time.tz_localize(None)

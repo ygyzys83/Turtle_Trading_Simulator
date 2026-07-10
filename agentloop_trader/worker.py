@@ -170,7 +170,7 @@ def _send_exits(
     fetch_bars: Callable[[str, str, str, str], Any],
     audit_store: JsonlAuditStore,
 ) -> tuple[int, list[dict], str]:
-    if control.mode not in {"Auto exits", "Auto entries and exits"}:
+    if control.mode not in {"Auto exits only", "Auto exits", "Auto entries and exits"}:
         return 0, tracked_orders, "Auto exits are off."
     if not control.paper_orders_enabled or control.kill_switch_enabled:
         return 0, tracked_orders, "Auto exits are blocked by account switch or Kill Switch."
@@ -206,12 +206,32 @@ def _send_exits(
         if not preview.valid or blockers:
             continue
         order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
-        updated.append(_track_broker_order(order, preview.preview_hash, settings))
+        tracked_exit = _track_broker_order(order, preview.preview_hash, settings)
+        updated.append(tracked_exit)
         sent += 1
         audit_store.append(AuditEvent(
             event_type="worker_paper_exit_sent",
             message="Background worker sent an Alpaca paper exit.",
-            payload={"symbol": symbol, "quantity": intent.quantity, "review_id": preview.preview_hash, "reason": details.get("reason")},
+            payload={
+                "symbol": symbol,
+                "quantity": intent.quantity,
+                "review_id": preview.preview_hash,
+                "broker_order_id": tracked_exit.get("broker_order_id", ""),
+                "reason": details.get("reason"),
+                "exit_details": {
+                    "current_price": details.get("current_price"),
+                    "trigger_price": details.get("trigger_price"),
+                    "trigger_source": details.get("trigger_source"),
+                    "strategy_exit_price": details.get("strategy_exit_price"),
+                    "original_stop_price": details.get("original_stop_price"),
+                    "breakeven_stop_price": details.get("breakeven_stop_price"),
+                    "trailing_stop_price": details.get("trailing_stop_price"),
+                    "highest_high_since_entry": details.get("highest_high_since_entry"),
+                    "profit_r": details.get("profit_r"),
+                    "current_atr": details.get("current_atr"),
+                    "interval": details.get("interval"),
+                },
+            },
         ))
     return sent, updated, f"Sent {sent} auto exit order(s)." if sent else "No auto exits were ready."
 
@@ -327,6 +347,7 @@ def run_once(
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
         fetch_bars = _fetcher(control, adapter.config)
         exit_count, tracked, exit_action = _send_exits(control, adapter, positions, orders, tracked, fetch_bars, audit_store)
+        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, adapter.order_records()))
         positions = adapter.position_records()
         orders = adapter.order_records()
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
@@ -387,12 +408,21 @@ def run_loop(control_path: str | Path, status_path: str | Path, once: bool = Fal
             status_store.write(status)
             if once:
                 break
-            time.sleep(max(5, int(control.refresh_seconds or 15)))
+            if _stop_requested_during_wait(control_store, max(5, int(control.refresh_seconds or 15))):
+                continue
     finally:
         lock.release()
         final = status_store.read()
         status_store.write(replace(final, running=False, state="Stopped"))
     return 0
+
+
+def _stop_requested_during_wait(control_store: AutomationControlStore, seconds: int) -> bool:
+    for _ in range(max(1, int(seconds))):
+        time.sleep(1)
+        if control_store.read().stop_requested:
+            return True
+    return False
 
 
 def main() -> int:

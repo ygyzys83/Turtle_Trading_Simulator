@@ -327,9 +327,9 @@ def auto_entry_decision(
 def auto_entry_decision_records(decision: AutoEntryDecision) -> list[dict]:
     return [
         {"Field": "Status", "Value": decision.status},
-        {"Field": "Ready To Send", "Value": decision.ready},
+        {"Field": "Ready To Send", "Value": "Yes" if decision.ready else "No"},
         {"Field": "Symbol", "Value": decision.symbol},
-        {"Field": "Quantity", "Value": decision.quantity},
+        {"Field": "Quantity", "Value": str(decision.quantity)},
         {"Field": "Review ID", "Value": decision.preview_hash},
         {"Field": "Reason", "Value": "; ".join(decision.reasons)},
     ]
@@ -338,9 +338,9 @@ def auto_entry_decision_records(decision: AutoEntryDecision) -> list[dict]:
 def auto_exit_decision_records(decision: AutoExitDecision) -> list[dict]:
     return [
         {"Field": "Status", "Value": decision.status},
-        {"Field": "Ready To Send", "Value": decision.ready},
+        {"Field": "Ready To Send", "Value": "Yes" if decision.ready else "No"},
         {"Field": "Symbol", "Value": decision.symbol},
-        {"Field": "Quantity", "Value": decision.quantity},
+        {"Field": "Quantity", "Value": str(decision.quantity)},
         {"Field": "Review ID", "Value": decision.preview_hash},
         {"Field": "Reason", "Value": "; ".join(decision.reasons)},
     ]
