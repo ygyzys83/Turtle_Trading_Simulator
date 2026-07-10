@@ -55,7 +55,7 @@ def pre_live_readiness_report(
         ("Automation check saved", automation_dry_run_recorded, "An automation check was saved locally."),
         ("Paper performance reviewed", performance_reviewed, "Paper account performance was reviewed."),
         ("Stop trading tested", emergency_disable_tested, "The stop trading button was tested."),
-        ("Live orders blocked", live_mode_blocked, "Live orders are still unavailable."),
+        ("Live orders locked", live_mode_blocked, "Live order wiring stays unavailable until live settings are explicitly configured."),
     ]
     return [
         {
@@ -78,7 +78,7 @@ def live_mode_lockfile_records(path: str | Path | None = None) -> list[dict]:
             "Passed": exists,
             "Detail": "Lock file exists; live trading stays locked." if exists else "Lock file is missing; live trading stays blocked.",
         },
-        {"Check": "Live orders blocked", "Passed": True, "Detail": "Current code still blocks Alpaca live orders."},
+        {"Check": "Live order wiring locked", "Passed": exists, "Detail": "Live order wiring is locked until live settings are configured and reviewed." if exists else "No lock file exists; live order wiring still requires environment confirmation."},
     ]
 
 

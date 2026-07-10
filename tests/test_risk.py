@@ -46,6 +46,27 @@ def test_backtest_only_mode_never_executes_even_when_risk_approved():
     assert not decision.requires_manual_approval
 
 
+def test_live_with_approval_allows_manual_broker_gate_after_risk_passes():
+    intent = TradeIntent(
+        symbol="AAPL",
+        side="buy",
+        quantity=10,
+        entry_price=100,
+        stop_loss=95,
+    )
+    risk = check_trade_intent(
+        intent,
+        account_equity=50_000,
+        limits=RiskLimits(allowed_symbols=("AAPL",)),
+    )
+    decision = decide_execution("live_with_approval", risk)
+
+    assert risk.approved
+    assert decision.approved_for_execution
+    assert decision.requires_manual_approval
+    assert "manual approval" in decision.reason.lower()
+
+
 def test_preflight_and_execution_preserve_specific_risk_rejection_reason():
     intent = TradeIntent(
         symbol="AAPL",

@@ -30,7 +30,7 @@ def test_production_readiness_checks_require_shadow_and_manual_live_before_unatt
     assert "Manual live approval tested" in names
 
 
-def test_alpaca_live_submission_is_still_blocked_by_safety_invariant():
+def test_alpaca_live_submission_requires_explicit_live_confirmation():
     adapter = AlpacaBrokerAdapterStub(
         AlpacaConfig(api_key="key", api_secret="secret", paper=False),
         trading_client=FakeAlpacaClient(),
@@ -43,9 +43,9 @@ def test_alpaca_live_submission_is_still_blocked_by_safety_invariant():
     try:
         adapter.submit_order(intent, decision)
     except RuntimeError as exc:
-        assert "live order submission is blocked" in str(exc)
+        assert "live order submission is not enabled" in str(exc)
         return
-    raise AssertionError("Live Alpaca submission must remain blocked.")
+    raise AssertionError("Live Alpaca submission must require live confirmation.")
 
 
 def test_pre_live_readiness_report_is_evidence_based():
@@ -64,7 +64,7 @@ def test_pre_live_readiness_report_is_evidence_based():
     assert checks["Paper cancel sent"]["Passed"]
     assert checks["Paper exit sent"]["Status"] == "blocked"
     assert checks["Automation check saved"]["Passed"]
-    assert checks["Live orders blocked"]["Passed"]
+    assert checks["Live orders locked"]["Passed"]
 
 
 def test_broker_state_simulation_records_include_disconnect_and_kill_switch():
@@ -87,7 +87,7 @@ def test_live_mode_lockfile_records_require_local_lockfile():
     assert not missing["Live trading locked"]["Passed"]
     assert written_path.name == "LIVE_TRADING_LOCKED.txt"
     assert present["Live trading locked"]["Passed"]
-    assert present["Live orders blocked"]["Passed"]
+    assert present["Live order wiring locked"]["Passed"]
 
 
 def test_deployment_readiness_records_block_missing_lockfile():

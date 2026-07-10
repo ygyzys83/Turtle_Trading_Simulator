@@ -258,12 +258,21 @@ def decide_execution(mode: ExecutionMode, risk_check: RiskCheckResult) -> Execut
             risk_check=risk_check,
         )
 
-    if mode in {"shadow", "live_with_approval"}:
+    if mode == "shadow":
         return ExecutionDecision(
             mode=mode,
             approved_for_execution=False,
             requires_manual_approval=True,
             reason="Risk rules passed, but this mode needs your approval.",
+            risk_check=risk_check,
+        )
+
+    if mode == "live_with_approval":
+        return ExecutionDecision(
+            mode=mode,
+            approved_for_execution=True,
+            requires_manual_approval=True,
+            reason="Risk rules passed; manual approval is required before a live order.",
             risk_check=risk_check,
         )
 

@@ -347,7 +347,7 @@ def test_alpaca_cancel_preview_blocks_live_mode():
     preview = build_alpaca_cancel_preview(record, AlpacaConfig(api_key="key", api_secret="secret", paper=False))
 
     assert not preview.valid
-    assert "Alpaca live order cancellation is blocked. Use paper mode only." in preview.blocked_reasons
+    assert "Alpaca live order cancellation is not enabled. Configure the live endpoint and confirmation first." in preview.blocked_reasons
 
 
 def test_alpaca_cancel_preview_hash_canonicalizes_sdk_enum_values():
@@ -407,7 +407,7 @@ def test_alpaca_adapter_cancels_paper_order_when_all_gates_enabled():
     assert client.canceled_orders == ["order-123456"]
 
 
-def test_alpaca_adapter_blocks_live_cancel_even_with_gate_enabled():
+def test_alpaca_adapter_blocks_live_cancel_without_live_confirmation():
     adapter = AlpacaBrokerAdapterStub(
         AlpacaConfig(api_key="key", api_secret="secret", paper=False),
         trading_client=FakeAlpacaClient(order_status="accepted"),
@@ -417,12 +417,12 @@ def test_alpaca_adapter_blocks_live_cancel_even_with_gate_enabled():
     try:
         adapter.cancel_order("order-123456")
     except RuntimeError as exc:
-        assert "live order cancellation is blocked" in str(exc)
+        assert "live order cancellation is not enabled" in str(exc)
         return
     raise AssertionError("Expected live Alpaca order cancellation to be blocked.")
 
 
-def test_alpaca_adapter_blocks_live_order_submission_even_with_gate_enabled():
+def test_alpaca_adapter_blocks_live_order_submission_without_live_confirmation():
     adapter = AlpacaBrokerAdapterStub(
         AlpacaConfig(api_key="key", api_secret="secret", paper=False),
         trading_client=FakeAlpacaClient(),
@@ -433,17 +433,77 @@ def test_alpaca_adapter_blocks_live_order_submission_even_with_gate_enabled():
     try:
         adapter.submit_order(intent, decision)
     except RuntimeError as exc:
-        assert "live order submission is blocked" in str(exc)
+        assert "live order submission is not enabled" in str(exc)
         return
     raise AssertionError("Expected live Alpaca order submission to be blocked.")
+
+
+def test_alpaca_adapter_submits_live_order_when_live_wiring_is_enabled():
+    client = FakeAlpacaClient()
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(
+            api_key="key",
+            api_secret="secret",
+            base_url="https://api.alpaca.markets/v2",
+            paper=False,
+            live_trading_enabled=True,
+            live_confirmation="I_UNDERSTAND_LIVE_TRADING",
+        ),
+        trading_client=client,
+        allow_order_submission=True,
+    )
+    intent, decision = _approved_intent_and_decision()
+    live_decision = ExecutionDecision(
+        mode="live_with_approval",
+        approved_for_execution=True,
+        requires_manual_approval=True,
+        reason="Manual live approval.",
+        risk_check=decision.risk_check,
+    )
+
+    preview = build_alpaca_order_preview(intent, live_decision, adapter.config)
+    order = adapter.submit_order(intent, live_decision, expected_preview_hash=preview.preview_hash)
+
+    assert preview.valid
+    assert adapter.status().can_submit_orders
+    assert order.status == "accepted"
+    assert client.submitted_orders
+
+
+def test_alpaca_adapter_cancels_live_order_when_live_wiring_is_enabled():
+    client = FakeAlpacaClient(order_status="accepted")
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(
+            api_key="key",
+            api_secret="secret",
+            base_url="https://api.alpaca.markets/v2",
+            paper=False,
+            live_trading_enabled=True,
+            live_confirmation="I_UNDERSTAND_LIVE_TRADING",
+        ),
+        trading_client=client,
+        allow_order_submission=True,
+    )
+    order_record = adapter.tracked_order_record("order-123456", preview_hash="")
+    preview = build_alpaca_cancel_preview(order_record, adapter.config)
+
+    result = adapter.cancel_order("order-123456", expected_cancel_hash=preview.preview_hash)
+
+    assert preview.valid
+    assert result.status == "canceled"
+    assert client.canceled_orders == ["order-123456"]
 
 
 def test_alpaca_config_can_load_environment_variable_names():
     old_key = os.environ.get("APCA_API_KEY_ID")
     old_secret = os.environ.get("APCA_API_SECRET_KEY")
+    old_live_enabled = os.environ.get("ALPACA_LIVE_TRADING_ENABLED")
+    old_live_confirmation = os.environ.get("ALPACA_LIVE_CONFIRMATION")
     try:
         os.environ["APCA_API_KEY_ID"] = "key"
         os.environ["APCA_API_SECRET_KEY"] = "secret"
+        os.environ["ALPACA_LIVE_TRADING_ENABLED"] = "true"
+        os.environ["ALPACA_LIVE_CONFIRMATION"] = "I_UNDERSTAND_LIVE_TRADING"
         config = AlpacaConfig.from_env()
     finally:
         if old_key is None:
@@ -454,8 +514,18 @@ def test_alpaca_config_can_load_environment_variable_names():
             os.environ.pop("APCA_API_SECRET_KEY", None)
         else:
             os.environ["APCA_API_SECRET_KEY"] = old_secret
+        if old_live_enabled is None:
+            os.environ.pop("ALPACA_LIVE_TRADING_ENABLED", None)
+        else:
+            os.environ["ALPACA_LIVE_TRADING_ENABLED"] = old_live_enabled
+        if old_live_confirmation is None:
+            os.environ.pop("ALPACA_LIVE_CONFIRMATION", None)
+        else:
+            os.environ["ALPACA_LIVE_CONFIRMATION"] = old_live_confirmation
 
     assert config.has_credentials
+    assert config.live_trading_enabled
+    assert config.live_confirmation == "I_UNDERSTAND_LIVE_TRADING"
 
 
 def test_alpaca_config_loads_dotenv_file_without_overriding_existing_env():
@@ -526,7 +596,7 @@ def test_broker_status_records_are_display_ready():
     records = broker_status_records(statuses)
 
     assert records[0]["Broker"] == "PaperBroker"
-    assert records[1]["Broker"] == "AlpacaPaperAdapter"
+    assert records[1]["Broker"] == "AlpacaAdapter"
 
 
 def test_alpaca_config_validation_records_accept_paper_v2_config():
@@ -543,11 +613,11 @@ def test_alpaca_config_validation_records_accept_paper_v2_config():
     assert checks["API keys found"]["Passed"]
     assert checks["Using paper account"]["Passed"]
     assert checks["Paper account URL"]["Passed"]
-    assert checks["Live account URL blocked"]["Passed"]
+    assert checks["Live account URL"]["Passed"]
     assert checks["Alpaca URL includes /v2"]["Passed"]
 
 
-def test_alpaca_config_validation_records_reject_live_endpoint():
+def test_alpaca_config_validation_records_describe_live_setup():
     records = alpaca_config_validation_records(
         AlpacaConfig(
             api_key="key",
@@ -559,5 +629,7 @@ def test_alpaca_config_validation_records_reject_live_endpoint():
     checks = {row["Check"]: row for row in records}
 
     assert not checks["Using paper account"]["Passed"]
-    assert not checks["Paper account URL"]["Passed"]
-    assert not checks["Live account URL blocked"]["Passed"]
+    assert checks["Paper account URL"]["Passed"]
+    assert checks["Live account URL"]["Passed"]
+    assert not checks["Live env switch"]["Passed"]
+    assert not checks["Live confirmation"]["Passed"]

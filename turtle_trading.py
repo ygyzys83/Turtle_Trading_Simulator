@@ -7,6 +7,7 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+import hashlib
 import json
 
 from agentloop_trader.audit import build_audit_events, events_to_records
@@ -103,6 +104,17 @@ from agentloop_trader.parameter_loop import (
     evaluate_parameter_candidates,
     recommend_candidate,
     recommendation_summary,
+)
+from agentloop_trader.research_agent import (
+    build_research_agent_report,
+    research_agent_records,
+    strategy_fit_records,
+)
+from agentloop_trader.research_memory import (
+    ResearchSnapshotStore,
+    build_research_snapshot,
+    compare_research_snapshots,
+    research_snapshot_records,
 )
 from agentloop_trader.risk import (
     build_preflight_check,
@@ -859,10 +871,10 @@ def alpaca_daily_summary_records() -> list[dict]:
     status = next((str(row.get("Value", "")) for row in alpaca_account_records if str(row.get("Field", "")).lower() == "status"), "")
     return [
         {"Item": "Connection", "Value": "Connected" if alpaca_status.connected else "Not connected", "Plain English": f"Account status: {status or 'unknown'}."},
-        {"Item": "Paper account value", "Value": money_or_missing(account_record_value(alpaca_account_records, "Portfolio Value")), "Plain English": "Value reported by Alpaca paper."},
-        {"Item": "Buying power", "Value": money_or_missing(account_record_value(alpaca_account_records, "Buying Power")), "Plain English": "Paper buying power reported by Alpaca."},
-        {"Item": "Open positions", "Value": len(alpaca_positions), "Plain English": "Current Alpaca paper positions."},
-        {"Item": "Orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders), "Plain English": "Open paper orders not filled or canceled yet."},
+        {"Item": f"{alpaca_account_label.title()} value", "Value": money_or_missing(account_record_value(alpaca_account_records, "Portfolio Value")), "Plain English": f"Value reported by {alpaca_account_label}."},
+        {"Item": "Buying power", "Value": money_or_missing(account_record_value(alpaca_account_records, "Buying Power")), "Plain English": f"Buying power reported by {alpaca_account_label}."},
+        {"Item": "Open positions", "Value": len(alpaca_positions), "Plain English": f"Current {alpaca_account_label} positions."},
+        {"Item": "Orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders), "Plain English": "Open Alpaca orders not filled or canceled yet."},
         {"Item": "Automation", "Value": active_automation_level, "Plain English": "Current app automation setting."},
     ]
 
@@ -878,6 +890,69 @@ def automation_status_text() -> tuple[str, str, str]:
     visible_reasons = auto_entry_status.reasons if active_automation_level == "Auto entries and exits" else auto_exit_status.reasons
     detail = "; ".join(visible_reasons) if visible_reasons else "No automation action is ready."
     return visible_status, detail, "warn"
+
+
+def daily_automation_readiness_records(context: str) -> list[dict]:
+    if effective_kill_switch:
+        read = "Blocked"
+        detail = "Kill Switch is on. No paper orders can be sent."
+    elif auto_exit_status.ready:
+        read = "Ready to sell"
+        detail = f"The app can sell {auto_exit_status.quantity} {auto_exit_status.symbol} if automation is enabled."
+    elif auto_entry_status.ready:
+        read = "Ready to buy"
+        detail = f"The app can buy {auto_entry_status.quantity} {auto_entry_status.symbol} if automation is enabled."
+    elif active_automation_level == "Manual review only":
+        read = "Watching only"
+        detail = "Automation is off. The app will show ideas, but you click orders manually."
+    else:
+        visible_reasons = auto_entry_status.reasons if active_automation_level == "Auto entries and exits" else auto_exit_status.reasons
+        read = "Blocked" if visible_reasons else "Watching only"
+        detail = visible_reasons[0] if visible_reasons else "Automation is on, but no buy or sell action is ready."
+    watched = "Open positions" if active_automation_level == "Auto exits only" else f"{ticker} buys and open positions" if active_automation_level == "Auto entries and exits" else "No automatic orders"
+    return [
+        {"Area": context, "Read": read, "Plain English": detail},
+        {"Area": "Automation mode", "Read": automation_level_label, "Plain English": f"Currently watching: {watched}."},
+        {"Area": "Last automation check", "Read": st.session_state.get("last_automation_checked_at", "Not checked yet"), "Plain English": f"Checks every {automation_refresh_seconds} seconds while automation is on."},
+        {"Area": "Last automation action", "Read": st.session_state.get("last_automation_action", "None"), "Plain English": st.session_state.get("last_automation_blocked_reason", "") or "No recent action."},
+    ]
+
+
+def live_trading_setup_records() -> list[dict]:
+    config = alpaca_adapter.config
+    live_mode_selected = execution_mode in {"live_with_approval", "automated_live"}
+    return [
+        {
+            "Check": "Order mode",
+            "Read": mode_label,
+            "Plain English": "Choose Live with approval before sending any real order.",
+        },
+        {
+            "Check": "Alpaca account",
+            "Read": config.account_mode.title(),
+            "Plain English": "Live orders require ALPACA_PAPER=false and the live Alpaca endpoint.",
+        },
+        {
+            "Check": "Live env switch",
+            "Read": "On" if config.live_trading_enabled else "Off",
+            "Plain English": "Set ALPACA_LIVE_TRADING_ENABLED=true when you are ready to test manual live orders.",
+        },
+        {
+            "Check": "Live confirmation",
+            "Read": "Set" if config.live_confirmation == "I_UNDERSTAND_LIVE_TRADING" else "Missing",
+            "Plain English": "Set ALPACA_LIVE_CONFIRMATION=I_UNDERSTAND_LIVE_TRADING before live order buttons can send.",
+        },
+        {
+            "Check": "Sidebar live orders",
+            "Read": "On" if enable_alpaca_live_orders else "Off",
+            "Plain English": "This checkbox appears only when a live order mode is selected.",
+        },
+        {
+            "Check": "Ready for manual live order",
+            "Read": "Yes" if live_mode_selected and config.live_order_enabled and enable_alpaca_live_orders and alpaca_status.can_submit_orders else "No",
+            "Plain English": "All live switches must be on, Alpaca must be connected, and the Kill Switch must be off.",
+        },
+    ]
 
 
 def apply_paper_buy_order_settings(
@@ -1039,54 +1114,6 @@ def strategy_decision_detail() -> str:
     return no_buy_reason(live)
 
 
-def research_summary_records() -> list[dict]:
-    rows_by_name = {str(row.get("Read", "")): row for row in setup_scorecard_rows}
-    required = required_setup_reads(strategy_type)
-    required_rows = [row for row in setup_scorecard_rows if str(row.get("Read", "")) in required]
-    passed_required = sum(
-        1
-        for row in required_rows
-        if str(row.get("Status", "")).lower() in {"good", "yes", "passed", "triggered", "found"}
-    )
-    overall = rows_by_name.get("Overall", {})
-    volume = rows_by_name.get("Volume", {})
-    volatility = rows_by_name.get("Volatility", {})
-    liquidity = rows_by_name.get("Liquidity", {})
-    rsi = rows_by_name.get("RSI condition", {})
-    return [
-        {
-            "Research Area": "Final read",
-            "Status": final_answer,
-            "Plain English": strategy_decision_detail(),
-        },
-        {
-            "Research Area": "Setup quality",
-            "Status": overall.get("Status", "Unknown"),
-            "Plain English": overall.get("Plain English", "Overall setup grade."),
-        },
-        {
-            "Research Area": "Required strategy rules",
-            "Status": f"{passed_required}/{len(required_rows)} passed" if required_rows else "Unknown",
-            "Plain English": "These rules create or block the BUY idea.",
-        },
-        {
-            "Research Area": "Risk approval",
-            "Status": "Passed" if risk_check.approved and preflight_check.ready else "Blocked",
-            "Plain English": "Risk and preflight checks must pass before paper orders can be sent.",
-        },
-        {
-            "Research Area": "Volume / liquidity",
-            "Status": f"{volume.get('Status', 'Unknown')} / {liquidity.get('Status', 'Unknown')}",
-            "Plain English": "Checks whether the setup has enough trading activity for cleaner fills.",
-        },
-        {
-            "Research Area": "Volatility / RSI",
-            "Status": f"{volatility.get('Status', 'Unknown')} / {rsi.get('Status', 'Unknown')}",
-            "Plain English": "Shows whether price movement is normal or stretched.",
-        },
-    ]
-
-
 def decision_ticket_records() -> list[dict]:
     if intent is None:
         return [
@@ -1111,30 +1138,6 @@ def decision_ticket_records() -> list[dict]:
         {"Item": "Account risk", "Value": pct_or_missing(risk_pct_account)},
         {"Item": "Next action", "Value": operator_state["Next Action"]},
     ]
-
-
-def research_card_records() -> list[dict]:
-    rows_by_name = {str(row.get("Read", "")): row for row in setup_scorecard_rows}
-    keys = [
-        "Overall",
-        "Trend",
-        "Breakout strength",
-        "Pullback",
-        "Momentum turn",
-        "Volume",
-        "Volatility",
-        "Liquidity",
-        "RSI condition",
-        "Market condition",
-        "Event risk",
-        "Risk approval",
-    ]
-    rows = []
-    for key in keys:
-        source = rows_by_name.get(key)
-        if source:
-            rows.append({"Research Area": key, "Read": source.get("Status", ""), "Plain English": source.get("Plain English", "")})
-    return rows
 
 
 def required_setup_reads(selected_strategy_type: str) -> set[str]:
@@ -1453,6 +1456,8 @@ def build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, se
     return fig
 
 
+alpaca_config = AlpacaConfig.from_env()
+
 st.sidebar.markdown("### Kill Switch")
 kill_switch = st.sidebar.checkbox(
     "Enabled",
@@ -1506,8 +1511,8 @@ mode_options = {
     "Backtest only - no orders are sent": "backtest_only",
     "Paper trading - send orders to Alpaca paper": "paper",
     "Practice mode - record decisions only": "shadow",
-    "Live with approval - blocked for now": "live_with_approval",
-    "Automated live - blocked for now": "automated_live",
+    "Live with approval - real orders": "live_with_approval",
+    "Automated live - setup only": "automated_live",
 }
 mode_label = st.sidebar.selectbox(
     "Order mode",
@@ -1515,11 +1520,26 @@ mode_label = st.sidebar.selectbox(
     index=0,
     help=(
         "Backtest only uses the chart and simulator. Paper trading can send orders to Alpaca paper. "
-        "Practice mode records decisions without sending broker orders. Live modes are shown for planning and remain blocked."
+        "Practice mode records decisions without sending broker orders. Live with approval can send real orders only after live credentials and confirmation are configured. Automated live is visible for setup but does not auto-submit yet."
     ),
 )
 execution_mode = mode_options[mode_label]
 enable_alpaca_paper_orders = st.sidebar.checkbox("Use Alpaca paper account", value=False)
+enable_alpaca_live_orders = False
+if execution_mode in {"live_with_approval", "automated_live"}:
+    enable_alpaca_live_orders = st.sidebar.checkbox(
+        "Enable Live Orders",
+        value=False,
+        disabled=kill_switch,
+        help="Allows live Alpaca order buttons only when the live endpoint, live env switch, and live confirmation are configured. The Kill Switch turns this off.",
+    )
+    if execution_mode == "automated_live":
+        st.sidebar.caption("Automated live is configured here, but automatic live submission is still off. Use live with approval first.")
+alpaca_order_submission_enabled = (
+    bool(enable_alpaca_paper_orders)
+    if alpaca_config.paper
+    else bool(enable_alpaca_live_orders and execution_mode == "live_with_approval" and not kill_switch)
+)
 automation_refresh_seconds = st.sidebar.selectbox(
     "Check automation every",
     [5, 15, 30, 60],
@@ -1881,6 +1901,7 @@ with st.sidebar.expander("Files, records, and simulator reset", expanded=False):
     audit_log_path = st.text_input("Activity log file", value="audit_logs/agentloop_audit.jsonl")
     broker_state_path = st.text_input("Alpaca order file", value="broker_state/alpaca_paper_orders.json")
     automation_dry_run_path = st.text_input("Automation check file", value="automation_logs/paper_automation_dry_runs.jsonl")
+    research_snapshot_path = st.text_input("Research loop file", value="automation_logs/research_snapshots.jsonl")
     run_manifest_path = st.text_input("Run summary file", value="audit_logs/run_manifests.jsonl")
     evidence_export_path = st.text_input("Records export file", value="audit_logs/latest_evidence_package.json")
     live_lockfile_path = st.text_input("Live trading lock file", value="live_mode/LIVE_TRADING_LOCKED.txt")
@@ -1947,15 +1968,30 @@ st.session_state.setdefault("tracked_alpaca_orders", [])
 st.session_state.setdefault("simulated_alpaca_positions", [])
 audit_store = JsonlAuditStore(audit_log_path)
 automation_store = AutomationDryRunStore(automation_dry_run_path)
+research_snapshot_store = ResearchSnapshotStore(research_snapshot_path)
 manifest_store = RunManifestStore(run_manifest_path)
 broker_state_store = BrokerStateStore(broker_state_path)
 if not st.session_state["tracked_alpaca_orders"]:
     st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
 paper_broker: PaperBroker = st.session_state["paper_broker"]
 paper_adapter = PaperBrokerAdapter(paper_broker)
-alpaca_adapter = AlpacaBrokerAdapterStub(allow_order_submission=enable_alpaca_paper_orders)
+alpaca_adapter = AlpacaBrokerAdapterStub(
+    config=alpaca_config,
+    allow_order_submission=alpaca_order_submission_enabled,
+)
 broker_statuses = [paper_adapter.status(), alpaca_adapter.status()]
 alpaca_status = broker_statuses[1]
+alpaca_account_mode = alpaca_adapter.config.account_mode
+alpaca_account_label = "Alpaca paper" if alpaca_adapter.config.paper else "Alpaca live"
+alpaca_order_noun = "paper" if alpaca_adapter.config.paper else "live"
+alpaca_mode_matches_order_mode = (
+    (execution_mode == "paper" and alpaca_adapter.config.paper)
+    or (execution_mode == "live_with_approval" and not alpaca_adapter.config.paper)
+)
+alpaca_manual_order_mode = execution_mode in {"paper", "live_with_approval"}
+alpaca_orders_enabled_for_mode = (
+    enable_alpaca_paper_orders if alpaca_adapter.config.paper else enable_alpaca_live_orders
+)
 alpaca_positions = alpaca_adapter.position_records() if alpaca_status.connected else []
 alpaca_orders = alpaca_adapter.order_records() if alpaca_status.connected else []
 alpaca_account_records = alpaca_adapter.account_records() if alpaca_status.connected else []
@@ -2570,7 +2606,7 @@ status_rows = compact_status_records(
     broker_connected=alpaca_status.connected,
     broker_state_stale=alpaca_state_health.stale,
     kill_switch_enabled=effective_kill_switch,
-    live_writes_blocked=True,
+    live_writes_blocked=not (not alpaca_adapter.config.paper and alpaca_status.can_submit_orders),
 )
 status_cols = st.columns(len(status_rows))
 for col, row in zip(status_cols, status_rows):
@@ -2665,6 +2701,39 @@ else:
     final_answer = "WAIT"
     final_detail = strategy_decision_detail()
 answer_color = {"TRADE": "#3B6D11", "WAIT": "#8A6D1D", "BLOCK": "#A32D2D"}[final_answer]
+research_agent_report = build_research_agent_report(
+    ticker=ticker,
+    selected_strategy=strategy_label,
+    strategy_results=strategy_results,
+    setup_rows=setup_scorecard_rows,
+    final_read=final_answer,
+    decision_detail=final_detail,
+    next_action=operator_state["Next Action"],
+)
+research_snapshot_key = hashlib.sha256(
+    json.dumps(
+        {
+            "ticker": ticker,
+            "strategy": strategy_label,
+            "settings": current_strategy_settings,
+            "final_read": final_answer,
+            "best_strategy": research_agent_report.best_strategy,
+            "next_action": operator_state["Next Action"],
+        },
+        sort_keys=True,
+        default=str,
+    ).encode("utf-8")
+).hexdigest()[:16]
+previous_research_snapshot = research_snapshot_store.latest_for_ticker(ticker, exclude_settings_key=research_snapshot_key)
+current_research_snapshot = build_research_snapshot(
+    research_agent_report,
+    selected_strategy=strategy_label,
+    settings_key=research_snapshot_key,
+)
+if st.session_state.get("last_research_snapshot_key") != research_snapshot_key:
+    research_snapshot_store.append(current_research_snapshot)
+    st.session_state["last_research_snapshot_key"] = research_snapshot_key
+research_loop_rows = compare_research_snapshots(previous_research_snapshot, current_research_snapshot)
 
 exit_preview_rows_for_auto = exit_preview_records(exit_previews)
 exit_blockers_by_hash_for_auto = {
@@ -3067,7 +3136,7 @@ if automation_timer_enabled:
 
 
 def render_automation_status() -> None:
-    sub_section("4.4 Automation")
+    sub_section("4.3 Automation status")
     status_label, status_detail, status_kind = automation_status_text()
     if status_kind == "ok":
         st.success(f"{status_label}: {status_detail}")
@@ -3134,10 +3203,14 @@ def render_daily_automation_panel() -> None:
             else "Unfilled limit buys stay open until you cancel them or Alpaca expires them."
         )
         st.caption(limit_cancel_text)
-    st.markdown("#### Automation watch")
-    st.dataframe(pd.DataFrame(automation_watch_records()), width="stretch", hide_index=True)
     recent_actions = recent_automation_event_records()
-    if recent_actions:
+    if show_portfolio_evidence:
+        with st.expander("Automation watch details *", expanded=False):
+            st.dataframe(pd.DataFrame(automation_watch_records()), width="stretch", hide_index=True)
+            if recent_actions:
+                st.markdown("#### Last 5 automation actions *")
+                st.dataframe(pd.DataFrame(recent_actions), width="stretch", hide_index=True)
+    elif recent_actions:
         with st.expander("Last 5 automation actions", expanded=False):
             st.dataframe(pd.DataFrame(recent_actions), width="stretch", hide_index=True)
 
@@ -3156,12 +3229,14 @@ def render_open_positions_panel() -> None:
     metric_card(position_summary_cols[1], "Managed", managed_count, "Have saved exit settings")
     metric_card(position_summary_cols[2], "Auto Exit On", auto_exit_on_count, "Position-level setting")
     metric_card(position_summary_cols[3], "Waiting Orders", count_waiting_alpaca_orders(alpaca_orders), "Alpaca paper")
+    st.markdown("#### Automation readiness")
+    st.dataframe(pd.DataFrame(daily_automation_readiness_records("Open positions")), width="stretch", hide_index=True)
 
     if not alpaca_positions:
         st.info("No Alpaca paper positions are open. When a position exists, this tab becomes the daily management panel for its exit settings and automation status.")
         return
 
-    st.markdown("#### Positions being managed")
+    st.markdown("#### Position manager")
     st.dataframe(pd.DataFrame(daily_position_rows(alpaca_positions, position_settings_by_symbol)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         with st.expander("Position management details *", expanded=False):
@@ -3480,15 +3555,19 @@ elif command_center_view == "New Trade":
             next_action=operator_state["Next Action"],
         )
     )
-    st.markdown("#### Trade read")
-    st.dataframe(pd.DataFrame(trade_read_records()), width="stretch", hide_index=True)
-    st.caption("Required for BUY rows must pass before the app can create a BUY. Quality checks help you judge the setup.")
-    st.markdown("#### Research summary")
-    st.dataframe(pd.DataFrame(research_summary_records()), width="stretch", hide_index=True)
-    with st.expander("Strategy use cases", expanded=False):
-        st.dataframe(pd.DataFrame(strategy_use_case_records(strategy_label)), width="stretch", hide_index=True)
+    st.markdown("#### Research agent read")
+    st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
+    st.info(research_agent_report.best_strategy_reason)
+    st.markdown("#### Research loop")
+    st.dataframe(pd.DataFrame(research_loop_rows), width="stretch", hide_index=True)
+    st.markdown("#### Automation readiness")
+    st.dataframe(pd.DataFrame(daily_automation_readiness_records("New trade")), width="stretch", hide_index=True)
+    with st.expander("Compare the four strategies", expanded=False):
+        st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         with st.expander("Detailed setup evidence *", expanded=False):
+            st.markdown("#### Trade read *")
+            st.dataframe(pd.DataFrame(trade_read_records()), width="stretch", hide_index=True)
             st.markdown("#### Decision ticket *")
             st.dataframe(pd.DataFrame(decision_ticket_records()), width="stretch", hide_index=True)
             st.markdown("#### Setup quality details *")
@@ -3497,6 +3576,10 @@ elif command_center_view == "New Trade":
             st.dataframe(pd.DataFrame(buy_requirement_records(live)), width="stretch", hide_index=True)
             st.markdown("#### Quality input definitions *")
             st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), width="stretch", hide_index=True)
+            st.markdown("#### Strategy use cases *")
+            st.dataframe(pd.DataFrame(strategy_use_case_records(strategy_label)), width="stretch", hide_index=True)
+            st.markdown("#### Saved research reads *")
+            st.dataframe(pd.DataFrame(research_snapshot_records(research_snapshot_store.read_recent(limit=20))), width="stretch", hide_index=True)
     if intent is None:
         st.info("No trade right now. The strategy is waiting.")
     else:
@@ -3565,10 +3648,13 @@ elif command_center_view == "Alpaca":
 
     if show_portfolio_evidence:
         with st.expander("Safety summary *", expanded=False):
-            st.markdown("- Alpaca is the target broker, but live orders are still disabled.")
+            st.markdown("- Alpaca is the target broker. Paper remains the default workflow.")
             st.markdown("- Paper orders require paper mode, passed risk checks, a connected paper account, and the paper account switch.")
+            st.markdown("- Live orders require live mode, live Alpaca configuration, the live sidebar switch, passed risk checks, and the Kill Switch off.")
             st.markdown("- The app cannot let the agent change risk rules, credentials, order code, or the Kill Switch.")
-            st.markdown("- Live automation stays blocked while paper trading is being tested.")
+            st.markdown("- Automated live submission stays off until manual live order testing is complete.")
+            st.markdown("#### Live setup *")
+            st.dataframe(pd.DataFrame(live_trading_setup_records()), width="stretch", hide_index=True)
             st.dataframe(pd.DataFrame(production_readiness_checks()), width="stretch", hide_index=True)
             st.dataframe(pd.DataFrame(immutable_boundary_records()), width="stretch", hide_index=True)
             st.markdown("#### Broker failure examples")
@@ -3930,12 +4016,14 @@ if command_center_view == "Alpaca":
         else:
             st.caption(alert)
     
-    sub_section("4.3 Paper order actions", "Send a paper buy, sell an open paper position, or cancel a waiting paper order.")
+    render_automation_status()
+
+    sub_section("4.4 Alpaca order actions", "Send a buy, sell an open position, or cancel a waiting order for the configured Alpaca account.")
     if waiting_limit_buy_rows:
         st.markdown("#### Waiting limit buys")
         st.dataframe(pd.DataFrame(waiting_limit_buy_rows), width="stretch", hide_index=True)
         if auto_cancel_stale_limit_orders:
-            st.caption(f"Auto-cancel is on: an unfilled paper BUY limit order is canceled after {stale_limit_order_label}.")
+            st.caption(f"Auto-cancel is on: an unfilled BUY limit order is canceled after {stale_limit_order_label}.")
         else:
             st.caption("Auto-cancel is off: waiting limit buys stay open until you cancel them or Alpaca expires them.")
     if auto_cancel_stale_limit_orders or waiting_limit_buy_rows:
@@ -3952,8 +4040,8 @@ if command_center_view == "Alpaca":
                     width="stretch",
                     hide_index=True,
                 )
-    can_submit = intent is not None and execution_mode == "paper"
-    submit_disabled = intent is None or not preflight_check.ready or execution_mode != "paper"
+    can_submit = intent is not None and alpaca_manual_order_mode
+    submit_disabled = intent is None or not preflight_check.ready or not alpaca_manual_order_mode
     if show_portfolio_evidence:
         with st.expander("Local simulator order *", expanded=False):
             if st.button("Submit Local Simulator Order", disabled=submit_disabled):
@@ -3980,9 +4068,10 @@ if command_center_view == "Alpaca":
     alpaca_base_disabled = (
         intent is None
         or not preflight_check.ready
-        or execution_mode != "paper"
+        or not alpaca_manual_order_mode
+        or not alpaca_mode_matches_order_mode
         or not alpaca_status.connected
-        or not enable_alpaca_paper_orders
+        or not alpaca_orders_enabled_for_mode
         or not alpaca_preview.valid
         or alpaca_state_health.stale
         or bool(duplicate_alpaca_reasons)
@@ -3990,7 +4079,7 @@ if command_center_view == "Alpaca":
         or duplicate_preview_submitted
     )
     if intent is not None:
-        st.markdown("#### Manual paper buy")
+        st.markdown(f"#### Manual {alpaca_order_noun} buy")
         st.dataframe(
             pd.DataFrame(
                 paper_buy_price_records(
@@ -4012,25 +4101,28 @@ if command_center_view == "Alpaca":
                 if alpaca_preview.order.get("limit_price")
                 else " market"
             )
-            st.info(f"Ready: buy {alpaca_preview.order.get('quantity', '')} {alpaca_preview.order.get('symbol', '')} with a{limit_note} order in Alpaca paper.")
+            st.info(f"Ready: buy {alpaca_preview.order.get('quantity', '')} {alpaca_preview.order.get('symbol', '')} with a{limit_note} order in {alpaca_account_label}.")
         if alpaca_preview.blocked_reasons:
             show_blockers("Order blocked", alpaca_preview.blocked_reasons)
+        if not alpaca_mode_matches_order_mode:
+            st.warning(f"Order mode and Alpaca account do not match. Current Alpaca account is {alpaca_account_mode}.")
         if duplicate_alpaca_reasons:
             show_blockers("Order blocked", duplicate_alpaca_reasons)
         if open_order_reasons:
             show_blockers("Order blocked", open_order_reasons)
         if duplicate_preview_submitted:
-            st.warning("This paper order is already tracked in the app.")
+            st.warning("This order is already tracked in the app.")
         if alpaca_state_health.stale:
             st.warning("Refresh Alpaca positions and orders before sending this.")
         elif not duplicate_alpaca_reasons and not open_order_reasons and not duplicate_preview_submitted:
-            st.success("Paper buy is ready to send.")
+            st.success(f"{alpaca_account_label.title()} buy is ready to send.")
     
     alpaca_submit_disabled = (
         alpaca_base_disabled
         or not alpaca_status.can_submit_orders
     )
-    if st.button("Send Paper Buy to Alpaca", disabled=alpaca_submit_disabled):
+    buy_button_label = "Send Paper Buy to Alpaca" if alpaca_adapter.config.paper else "Send Live Buy to Alpaca"
+    if st.button(buy_button_label, disabled=alpaca_submit_disabled):
         try:
             alpaca_order = alpaca_adapter.submit_order(
                 intent,
@@ -4038,8 +4130,8 @@ if command_center_view == "Alpaca":
                 expected_preview_hash=alpaca_preview.preview_hash,
             )
             alpaca_event = AuditEvent(
-                event_type="alpaca_paper_order_submitted",
-                message="Alpaca paper order submitted through the gated adapter.",
+                event_type=f"alpaca_{alpaca_order_noun}_order_submitted",
+                message=f"Alpaca {alpaca_order_noun} order submitted through the gated adapter.",
                 payload={
                     "symbol": intent.symbol_clean,
                     "side": intent.side,
@@ -4079,20 +4171,20 @@ if command_center_view == "Alpaca":
             st.session_state["session_audit_events"].append(alpaca_event)
             if persist_audit_log:
                 audit_store.append(alpaca_event)
-            st.success("Paper buy order sent to Alpaca.")
+            st.success(f"{alpaca_account_label.title()} buy order sent to Alpaca.")
         except Exception as exc:
             alpaca_event = AuditEvent(
-                event_type="alpaca_paper_order_blocked",
+                event_type=f"alpaca_{alpaca_order_noun}_order_blocked",
                 message=str(exc),
                 payload={"symbol": intent.symbol_clean if intent else None, "preview_hash": alpaca_preview.preview_hash},
             )
             st.session_state["session_audit_events"].append(alpaca_event)
             if persist_audit_log:
                 audit_store.append(alpaca_event)
-            st.error(f"Paper buy order blocked: {exc}")
+            st.error(f"{alpaca_account_label.title()} buy order blocked: {exc}")
     
     if show_portfolio_evidence and tracked_alpaca_orders:
-        st.markdown("#### Paper orders saved in the app *")
+        st.markdown("#### Alpaca orders saved in the app *")
         tracked_rows = [
             alpaca_adapter.tracked_order_record(
                 item.get("broker_order_id", ""),
@@ -4116,7 +4208,7 @@ if command_center_view == "Alpaca":
             refreshed_order_state
         )
         if show_portfolio_evidence:
-            st.markdown("#### Paper order history *")
+            st.markdown("#### Alpaca order history *")
             st.dataframe(pd.DataFrame(lifecycle_summary), width="stretch", hide_index=True)
             st.dataframe(pd.DataFrame(lifecycle_rows), width="stretch", hide_index=True)
     
@@ -4272,9 +4364,6 @@ if command_center_view == "Alpaca":
                     audit_store.append(exit_sim_event)
                 st.rerun()
             st.caption("These practice tools update local records only. They never submit, cancel, or exit Alpaca orders.")
-    
-    render_automation_status()
-
     if exit_previews:
         st.markdown("#### Sell paper position")
         exit_options = [
@@ -4304,17 +4393,17 @@ if command_center_view == "Alpaca":
                 quantity=int(float(alpaca_exit_preview.order.get("quantity", 0))),
                 order_type="market",
                 time_in_force="day",
-                rationale="Exit order generated from existing Alpaca paper position.",
+                rationale=f"Exit order generated from existing {alpaca_account_label} position.",
                 source_signals=["alpaca_position_exit_preview"],
             )
             if selected_exit_position is not None
             else None
         )
         exit_decision = ExecutionDecision(
-            mode="paper",
+            mode="paper" if alpaca_adapter.config.paper else "live_with_approval",
             approved_for_execution=True,
-            requires_manual_approval=False,
-            reason="Paper exit passed the exit checks.",
+            requires_manual_approval=not alpaca_adapter.config.paper,
+            reason=f"{alpaca_account_label.title()} exit passed the exit checks.",
             risk_check=RiskCheckResult(approved=True, rejected_reasons=[], checks={"exit_position": True}),
         )
         exit_position_blockers = exit_position_reasons(alpaca_exit_preview, alpaca_positions)
@@ -4328,13 +4417,14 @@ if command_center_view == "Alpaca":
         if alpaca_state_health.stale:
             st.warning("Refresh Alpaca positions and orders before sending this exit.")
         elif not exit_position_blockers and not duplicate_exit_reasons and alpaca_exit_preview.valid:
-            st.success("Paper exit is ready to send.")
+            st.success(f"{alpaca_account_label.title()} exit is ready to send.")
     
         exit_base_disabled = (
             selected_exit_intent is None
-            or execution_mode != "paper"
+            or not alpaca_manual_order_mode
+            or not alpaca_mode_matches_order_mode
             or not alpaca_status.connected
-            or not enable_alpaca_paper_orders
+            or not alpaca_orders_enabled_for_mode
             or alpaca_state_health.stale
             or not alpaca_exit_preview.valid
             or bool(exit_position_blockers)
@@ -4344,7 +4434,8 @@ if command_center_view == "Alpaca":
             exit_base_disabled
             or not alpaca_status.can_submit_orders
         )
-        if st.button("Send Paper Exit to Alpaca", disabled=alpaca_exit_submit_disabled):
+        exit_button_label = "Send Paper Exit to Alpaca" if alpaca_adapter.config.paper else "Send Live Exit to Alpaca"
+        if st.button(exit_button_label, disabled=alpaca_exit_submit_disabled):
             try:
                 alpaca_exit_order = alpaca_adapter.submit_order(
                     selected_exit_intent,
@@ -4352,8 +4443,8 @@ if command_center_view == "Alpaca":
                     expected_preview_hash=alpaca_exit_preview.preview_hash,
                 )
                 exit_event = AuditEvent(
-                    event_type="alpaca_paper_exit_submitted",
-                    message="Alpaca paper exit submitted through the gated adapter.",
+                    event_type=f"alpaca_{alpaca_order_noun}_exit_submitted",
+                    message=f"Alpaca {alpaca_order_noun} exit submitted through the gated adapter.",
                     payload={
                         "symbol": exit_symbol,
                         "side": "sell",
@@ -4378,21 +4469,21 @@ if command_center_view == "Alpaca":
                 st.session_state["session_audit_events"].append(exit_event)
                 if persist_audit_log:
                     audit_store.append(exit_event)
-                st.success("Paper exit sent to Alpaca.")
+                st.success(f"{alpaca_account_label.title()} exit sent to Alpaca.")
             except Exception as exc:
                 exit_event = AuditEvent(
-                    event_type="alpaca_paper_exit_blocked",
+                    event_type=f"alpaca_{alpaca_order_noun}_exit_blocked",
                     message=str(exc),
                     payload={"symbol": exit_symbol, "preview_hash": alpaca_exit_preview.preview_hash},
                 )
                 st.session_state["session_audit_events"].append(exit_event)
                 if persist_audit_log:
                     audit_store.append(exit_event)
-                st.error(f"Paper exit blocked: {exc}")
-        st.caption("This contacts Alpaca paper only.")
+                st.error(f"{alpaca_account_label.title()} exit blocked: {exc}")
+        st.caption(f"This contacts {alpaca_account_label} only.")
     
     if managed_cancelable_alpaca_orders:
-        st.markdown("#### Cancel paper order")
+        st.markdown(f"#### Cancel {alpaca_order_noun} order")
         cancel_options = [
             f"{row['Symbol']} {row['Side']} {row['Quantity']} {row['Status']} ({row['Order ID']})"
             for row in managed_cancelable_alpaca_orders
@@ -4413,12 +4504,13 @@ if command_center_view == "Alpaca":
     
         selected_cancel_order_id = selected_cancel_order.get("Alpaca Order ID") or selected_cancel_order.get("Broker Order ID", "")
         if alpaca_cancel_preview.valid and not alpaca_state_health.stale:
-            st.success("Paper cancel is ready to send.")
+            st.success(f"{alpaca_account_label.title()} cancel is ready to send.")
     
         cancel_base_disabled = (
-            execution_mode != "paper"
+            not alpaca_manual_order_mode
+            or not alpaca_mode_matches_order_mode
             or not alpaca_status.connected
-            or not enable_alpaca_paper_orders
+            or not alpaca_orders_enabled_for_mode
             or alpaca_state_health.stale
             or not alpaca_cancel_preview.valid
         )
@@ -4426,15 +4518,16 @@ if command_center_view == "Alpaca":
             cancel_base_disabled
             or not alpaca_status.can_submit_orders
         )
-        if st.button("Send Paper Cancel to Alpaca", disabled=alpaca_cancel_submit_disabled):
+        cancel_button_label = "Send Paper Cancel to Alpaca" if alpaca_adapter.config.paper else "Send Live Cancel to Alpaca"
+        if st.button(cancel_button_label, disabled=alpaca_cancel_submit_disabled):
             try:
                 cancel_result = alpaca_adapter.cancel_order(
                     selected_cancel_order_id,
                     expected_cancel_hash=alpaca_cancel_preview.preview_hash,
                 )
                 cancel_event = AuditEvent(
-                    event_type="alpaca_paper_cancel_submitted",
-                    message="Alpaca paper order cancel submitted through the gated adapter.",
+                    event_type=f"alpaca_{alpaca_order_noun}_cancel_submitted",
+                    message=f"Alpaca {alpaca_order_noun} order cancel submitted through the gated adapter.",
                     payload={
                         "broker_order_id": selected_cancel_order_id,
                         "cancel_preview_hash": alpaca_cancel_preview.preview_hash,
@@ -4455,10 +4548,10 @@ if command_center_view == "Alpaca":
                 st.session_state["session_audit_events"].append(cancel_event)
                 if persist_audit_log:
                     audit_store.append(cancel_event)
-                st.success("Paper cancel sent to Alpaca.")
+                st.success(f"{alpaca_account_label.title()} cancel sent to Alpaca.")
             except Exception as exc:
                 cancel_event = AuditEvent(
-                    event_type="alpaca_paper_cancel_blocked",
+                    event_type=f"alpaca_{alpaca_order_noun}_cancel_blocked",
                     message=str(exc),
                     payload={
                         "broker_order_id": selected_cancel_order_id,
@@ -4468,7 +4561,7 @@ if command_center_view == "Alpaca":
                 st.session_state["session_audit_events"].append(cancel_event)
                 if persist_audit_log:
                     audit_store.append(cancel_event)
-                st.error(f"Paper cancel blocked: {exc}")
+                st.error(f"{alpaca_account_label.title()} cancel blocked: {exc}")
         st.caption("This contacts Alpaca paper only.")
     
     if intent is not None and execution_mode != "paper":
@@ -4793,7 +4886,7 @@ if command_center_view == "Alpaca":
         ),
         performance_reviewed="paper_performance_reviewed" in readiness_event_types,
         emergency_disable_tested="session_disabled" in readiness_event_types,
-        live_mode_blocked=True,
+        live_mode_blocked=not (not alpaca_adapter.config.paper and alpaca_status.can_submit_orders),
     )
     current_approval_ledger_rows = approval_ledger_records(current_evidence_records)
     

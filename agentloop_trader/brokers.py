@@ -108,6 +108,8 @@ class AlpacaConfig:
     api_secret: str | None
     base_url: str = DEFAULT_ALPACA_PAPER_BASE_URL
     paper: bool = True
+    live_trading_enabled: bool = False
+    live_confirmation: str = ""
 
     @classmethod
     def from_env(cls) -> "AlpacaConfig":
@@ -117,11 +119,25 @@ class AlpacaConfig:
             api_secret=os.getenv("APCA_API_SECRET_KEY") or os.getenv("ALPACA_API_SECRET_KEY"),
             base_url=os.getenv("APCA_API_BASE_URL") or os.getenv("ALPACA_API_BASE_URL") or DEFAULT_ALPACA_PAPER_BASE_URL,
             paper=(os.getenv("ALPACA_PAPER", "true").strip().lower() != "false"),
+            live_trading_enabled=(os.getenv("ALPACA_LIVE_TRADING_ENABLED", "false").strip().lower() == "true"),
+            live_confirmation=os.getenv("ALPACA_LIVE_CONFIRMATION", "").strip(),
         )
 
     @property
     def has_credentials(self) -> bool:
         return bool(self.api_key and self.api_secret)
+
+    @property
+    def live_order_enabled(self) -> bool:
+        return (
+            not self.paper
+            and self.live_trading_enabled
+            and self.live_confirmation == "I_UNDERSTAND_LIVE_TRADING"
+        )
+
+    @property
+    def account_mode(self) -> str:
+        return "paper" if self.paper else "live"
 
 
 def alpaca_config_validation_records(config: AlpacaConfig) -> list[dict]:
@@ -130,9 +146,11 @@ def alpaca_config_validation_records(config: AlpacaConfig) -> list[dict]:
     live_endpoint = "api.alpaca.markets" in endpoint and not paper_endpoint
     return [
         {"Check": "API keys found", "Passed": config.has_credentials, "Detail": "API key and secret are set." if config.has_credentials else "API key or secret is missing."},
-        {"Check": "Using paper account", "Passed": config.paper, "Detail": "Alpaca paper mode is on." if config.paper else "Live mode is configured, but live orders remain blocked."},
-        {"Check": "Paper account URL", "Passed": paper_endpoint, "Detail": endpoint or "No Alpaca URL is set."},
-        {"Check": "Live account URL blocked", "Passed": not live_endpoint, "Detail": "Live account URL is not configured." if not live_endpoint else "Live account URL detected; live orders are still blocked."},
+        {"Check": "Using paper account", "Passed": config.paper, "Detail": "Alpaca paper mode is on." if config.paper else "Live mode is configured."},
+        {"Check": "Paper account URL", "Passed": paper_endpoint if config.paper else True, "Detail": endpoint or "No Alpaca URL is set."},
+        {"Check": "Live account URL", "Passed": live_endpoint if not config.paper else True, "Detail": endpoint or "No Alpaca URL is set."},
+        {"Check": "Live env switch", "Passed": config.paper or config.live_trading_enabled, "Detail": "Set ALPACA_LIVE_TRADING_ENABLED=true to allow live order wiring." if not config.paper and not config.live_trading_enabled else "Live env switch is set." if not config.paper else "Not needed for paper."},
+        {"Check": "Live confirmation", "Passed": config.paper or config.live_confirmation == "I_UNDERSTAND_LIVE_TRADING", "Detail": "Set ALPACA_LIVE_CONFIRMATION=I_UNDERSTAND_LIVE_TRADING to enable live order wiring." if not config.paper and config.live_confirmation != "I_UNDERSTAND_LIVE_TRADING" else "Live confirmation is set." if not config.paper else "Not needed for paper."},
         {"Check": "Alpaca URL includes /v2", "Passed": endpoint.endswith("/v2"), "Detail": endpoint or "No Alpaca URL is set."},
     ]
 
@@ -165,7 +183,7 @@ def _load_local_dotenv_fallback() -> None:
 
 
 class AlpacaBrokerAdapterStub:
-    name = "AlpacaPaperAdapter"
+    name = "AlpacaAdapter"
 
     def __init__(
         self,
@@ -183,7 +201,7 @@ class AlpacaBrokerAdapterStub:
             return BrokerStatus(
                 name=self.name,
                 connected=False,
-                mode="paper" if self.config.paper else "live",
+                mode=self.config.account_mode,
                 can_submit_orders=False,
                 message="Alpaca credentials not configured. Set paper credentials before enabling this adapter.",
             )
@@ -192,7 +210,7 @@ class AlpacaBrokerAdapterStub:
             return BrokerStatus(
                 name=self.name,
                 connected=False,
-                mode="paper" if self.config.paper else "live",
+                mode=self.config.account_mode,
                 can_submit_orders=False,
                 message=self._client_error or "Alpaca SDK client is unavailable.",
             )
@@ -202,18 +220,26 @@ class AlpacaBrokerAdapterStub:
             return BrokerStatus(
                 name=self.name,
                 connected=False,
-                mode="paper" if self.config.paper else "live",
+                mode=self.config.account_mode,
                 can_submit_orders=False,
                 message=f"Alpaca account read failed: {exc}",
             )
+        can_submit = self.allow_order_submission and (self.config.paper or self.config.live_order_enabled)
+        submit_message = (
+            "enabled for paper trading"
+            if self.config.paper and can_submit
+            else "enabled for live trading"
+            if can_submit
+            else "blocked"
+        )
         return BrokerStatus(
             name=self.name,
             connected=True,
-            mode="paper" if self.config.paper else "live",
-            can_submit_orders=self.config.paper and self.allow_order_submission,
+            mode=self.config.account_mode,
+            can_submit_orders=can_submit,
             message=(
                 f"Alpaca account connected; status={getattr(account, 'status', 'unknown')}. "
-                f"Order submission is {'enabled for paper trading' if self.config.paper and self.allow_order_submission else 'blocked'}."
+                f"Order submission is {submit_message}."
             ),
         )
 
@@ -223,10 +249,10 @@ class AlpacaBrokerAdapterStub:
             raise RuntimeError("; ".join(preview.blocked_reasons))
         if expected_preview_hash is not None and expected_preview_hash != preview.preview_hash:
             raise RuntimeError("Alpaca paper order preview changed. Re-arm the order before submitting.")
-        if not self.config.paper:
-            raise RuntimeError("Alpaca live order submission is blocked. Use paper mode only.")
+        if not self.config.paper and not self.config.live_order_enabled:
+            raise RuntimeError("Alpaca live order submission is not enabled. Configure the live endpoint and confirmation first.")
         if not self.allow_order_submission:
-            raise RuntimeError("Paper orders are turned off in the sidebar.")
+            raise RuntimeError("Alpaca order submission is turned off in the sidebar.")
         if not decision.approved_for_execution:
             raise RuntimeError(f"Order blocked: {decision.reason}")
         client = self._get_client()
@@ -247,10 +273,10 @@ class AlpacaBrokerAdapterStub:
             raise RuntimeError("; ".join(preview.blocked_reasons))
         if expected_cancel_hash is not None and expected_cancel_hash != preview.preview_hash:
             raise RuntimeError("Alpaca paper cancel preview changed. Re-arm the cancel before submitting.")
-        if not self.config.paper:
-            raise RuntimeError("Alpaca live order cancellation is blocked. Use paper mode only.")
+        if not self.config.paper and not self.config.live_order_enabled:
+            raise RuntimeError("Alpaca live order cancellation is not enabled. Configure the live endpoint and confirmation first.")
         if not self.allow_order_submission:
-            raise RuntimeError("Paper cancels are turned off in the sidebar.")
+            raise RuntimeError("Alpaca cancels are turned off in the sidebar.")
         client = self._get_client()
         if client is None:
             raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
@@ -433,7 +459,7 @@ def build_alpaca_order_preview(
     symbol = intent.symbol_clean if intent else ""
     order = {
         "broker": "alpaca",
-        "mode": "paper" if config.paper else "live",
+        "mode": config.account_mode,
         "symbol": symbol,
         "side": intent.side if intent else "",
         "quantity": intent.quantity if intent else 0,
@@ -446,8 +472,8 @@ def build_alpaca_order_preview(
         blocked.append("No trade intent is present.")
     if symbol == "SYNTH":
         blocked.append("Synthetic symbols cannot be sent to Alpaca.")
-    if not config.paper:
-        blocked.append("Alpaca live order submission is blocked. Use paper mode only.")
+    if not config.paper and not config.live_order_enabled:
+        blocked.append("Alpaca live order submission is not enabled. Configure the live endpoint and confirmation first.")
     if not decision.approved_for_execution:
         blocked.append(f"Execution decision blocked order: {decision.reason}")
     if intent is not None and intent.quantity <= 0:
@@ -479,7 +505,7 @@ def build_alpaca_cancel_preview(order_record: dict | None, config: AlpacaConfig)
     status = _enum_value(order_record.get("Status", ""))
     cancel = {
         "broker": "alpaca",
-        "mode": "paper" if config.paper else "live",
+        "mode": config.account_mode,
         "action": "cancel_order",
         "broker_order_id": broker_order_id,
         "symbol": str(order_record.get("Symbol", "")).strip().upper(),
@@ -490,8 +516,8 @@ def build_alpaca_cancel_preview(order_record: dict | None, config: AlpacaConfig)
     }
     if not broker_order_id:
         blocked.append("No Alpaca broker order ID is present.")
-    if not config.paper:
-        blocked.append("Alpaca live order cancellation is blocked. Use paper mode only.")
+    if not config.paper and not config.live_order_enabled:
+        blocked.append("Alpaca live order cancellation is not enabled. Configure the live endpoint and confirmation first.")
     open_statuses = {"accepted", "new", "pending_new", "partially_filled"}
     if status not in open_statuses:
         blocked.append(f"Only open Alpaca paper orders can be cancelled. Current status is {status or 'unknown'}.")
