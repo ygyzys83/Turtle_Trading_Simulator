@@ -1,4 +1,4 @@
-from agentloop_trader.llm_research import LLMResearchConfig, analyze_candidate
+from agentloop_trader.llm_research import LLMResearchConfig, analyze_candidate, llm_research_records
 from agentloop_trader.market_data import CompanyResearchContext
 from agentloop_trader.scanner import ScanCandidate
 
@@ -77,3 +77,14 @@ def test_llm_uses_deterministic_fallback_on_error():
     assert result.used_fallback is True
     assert result.provider == "deterministic"
     assert result.recommendation == "WATCH"
+
+
+def test_research_records_use_plain_reason_labels():
+    result = analyze_candidate(_candidate("WATCH"), _context(), LLMResearchConfig(provider="deterministic"))
+
+    labels = [row["Area"] for row in llm_research_records(result)]
+
+    assert "Reasons to trade" in labels
+    assert "Reasons to wait" in labels
+    assert "Supports" not in labels
+    assert "Concerns" not in labels

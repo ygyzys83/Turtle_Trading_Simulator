@@ -222,8 +222,8 @@ def llm_research_records(result: LLMResearchResult) -> list[dict[str, str]]:
         {"Area": "Best strategy", "Read": result.best_strategy, "Plain English": f"Source: {result.provider} / {result.model}."},
         {"Area": "Confidence", "Read": f"{result.confidence:.0f}%", "Plain English": "Research confidence only; it does not change order rules."},
         {"Area": "Event risk", "Read": result.event_risk, "Plain English": "Review recent news and confirm the earnings calendar separately."},
-        {"Area": "Supports", "Read": str(len(result.supporting_evidence)), "Plain English": "; ".join(result.supporting_evidence) or "None listed."},
-        {"Area": "Concerns", "Read": str(len(result.opposing_evidence)), "Plain English": "; ".join(result.opposing_evidence) or "None listed."},
+        {"Area": "Reasons to trade", "Read": str(len(result.supporting_evidence)), "Plain English": "; ".join(result.supporting_evidence) or "None listed."},
+        {"Area": "Reasons to wait", "Read": str(len(result.opposing_evidence)), "Plain English": "; ".join(result.opposing_evidence) or "None listed."},
         {"Area": "Invalidation", "Read": "Defined", "Plain English": result.invalidation},
         {"Area": "Next action", "Read": result.next_action, "Plain English": result.error if result.used_fallback else "The LLM cannot submit orders."},
     ]

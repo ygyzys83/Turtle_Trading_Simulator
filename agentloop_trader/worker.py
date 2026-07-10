@@ -281,6 +281,7 @@ def _send_entry(
         "price_data_source": control.price_data_source,
         "account_size": account_equity,
         "entry_reference_price": intent.entry_price,
+        "entry_stop_atr_multiplier": settings.get("atr_stop_multiplier"),
         "entry_stop_loss": intent.stop_loss,
         "entry_stop_distance": abs(float(intent.entry_price or 0) - float(intent.stop_loss or 0)),
         "planned_order_type": intent.order_type,
