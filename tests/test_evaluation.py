@@ -64,3 +64,23 @@ def test_walk_forward_rejects_insufficient_history():
         return
 
     raise AssertionError("Expected ValueError for insufficient walk-forward history.")
+
+
+def test_walk_forward_runs_the_selected_strategy_type():
+    for strategy_type in ("breakout", "pullback", "trendline", "trendline_retest"):
+        result = evaluate_walk_forward(
+            account=50_000,
+            entry_w=20,
+            exit_w=10,
+            atr_mult=2.0,
+            risk_pct_dec=0.01,
+            ma_w=50,
+            seed=42,
+            train_fraction=0.65,
+            strategy_type=strategy_type,
+            pullback_w=20,
+            momentum_w=5,
+        )
+
+        assert result.train_stats["final_equity"] > 0
+        assert result.oos_stats["final_equity"] > 0

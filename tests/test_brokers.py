@@ -164,6 +164,7 @@ def test_alpaca_adapter_submits_paper_order_when_all_gates_enabled():
 
     assert order.status == "accepted"
     assert client.submitted_orders
+    assert str(_order_field(client.submitted_orders[0], "client_order_id")).startswith("agentloop-")
 
 
 def test_alpaca_adapter_submits_limit_order_when_intent_uses_limit_price():
@@ -438,6 +439,52 @@ def test_alpaca_adapter_blocks_live_order_submission_without_live_confirmation()
     raise AssertionError("Expected live Alpaca order submission to be blocked.")
 
 
+def test_alpaca_preview_blocks_paper_decision_from_live_account():
+    intent, decision = _approved_intent_and_decision()
+    config = AlpacaConfig(
+        api_key="key", api_secret="secret", paper=False,
+        live_trading_enabled=True, live_confirmation="I_UNDERSTAND_LIVE_TRADING",
+    )
+
+    preview = build_alpaca_order_preview(intent, decision, config)
+
+    assert not preview.valid
+    assert "Paper order mode cannot send to an Alpaca live account." in preview.blocked_reasons
+
+
+def test_alpaca_adapter_blocks_submission_when_account_is_trading_blocked():
+    client = FakeAlpacaClient()
+    original_get_account = client.get_account
+
+    def blocked_account():
+        account = original_get_account()
+        account.trading_blocked = True
+        return account
+
+    client.get_account = blocked_account
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        trading_client=client,
+        allow_order_submission=True,
+    )
+
+    status = adapter.status()
+
+    assert not status.can_submit_orders
+    assert "blocked by Alpaca account status" in status.message
+
+
+def test_alpaca_adapter_reads_broker_market_clock():
+    client = FakeAlpacaClient()
+    client.get_clock = lambda: SimpleNamespace(is_open=True)
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        trading_client=client,
+    )
+
+    assert adapter.market_is_open() is True
+
+
 def test_alpaca_adapter_submits_live_order_when_live_wiring_is_enabled():
     client = FakeAlpacaClient()
     adapter = AlpacaBrokerAdapterStub(
@@ -633,3 +680,29 @@ def test_alpaca_config_validation_records_describe_live_setup():
     assert checks["Live account URL"]["Passed"]
     assert not checks["Live env switch"]["Passed"]
     assert not checks["Live confirmation"]["Passed"]
+
+
+def test_strict_broker_reads_raise_instead_of_reporting_false_empty_state():
+    class BrokenReads:
+        def get_orders(self, *args, **kwargs):
+            raise RuntimeError("orders unavailable")
+
+        def get_all_positions(self):
+            raise RuntimeError("positions unavailable")
+
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        trading_client=BrokenReads(),
+    )
+
+    try:
+        adapter.order_records(strict=True)
+        raise AssertionError("Strict order read should fail closed.")
+    except RuntimeError as exc:
+        assert "orders read failed" in str(exc)
+
+    try:
+        adapter.position_records(strict=True)
+        raise AssertionError("Strict position read should fail closed.")
+    except RuntimeError as exc:
+        assert "positions read failed" in str(exc)

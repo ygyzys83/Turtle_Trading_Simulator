@@ -38,10 +38,12 @@ def test_paper_test_plan_includes_local_simulator_check():
     assert "Record Simulated Exit Readiness" in text
 
 
-def test_readme_explains_agentic_portfolio_narrative():
+def test_readme_explains_product_and_backtest_contract_without_ui_story_copy():
     text = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "Portfolio Narrative" in text
-    assert "human-in-the-loop guardrails" in text
-    assert "deterministic risk policy" in text
-    assert "Portfolio Evidence" in text
+    assert "Portfolio Narrative" not in text
+    assert "## Backtest Assumptions" in text
+    assert "## Current Modules" in text
+    assert "deterministic strategy and risk code controls order eligibility" in text
+    assert "Daily Trading Screen" in text
+    assert "Full Records and Evidence" in text

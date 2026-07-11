@@ -58,7 +58,7 @@ BOUNDED_ATR_MULTIPLIERS = (1.5, 2.0, 2.5, 3.0)
 BOUNDED_MA_WINDOWS = (100, 150, 200, 250)
 OPTIMIZER_ENTRY_WINDOWS = (10, 15, 20, 25, 30, 40, 50)
 OPTIMIZER_EXIT_WINDOWS = (5, 10, 15, 20, 30)
-OPTIMIZER_ATR_MULTIPLIERS = (1.0, 1.5, 2.0, 2.5, 3.0)
+OPTIMIZER_ATR_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0)
 OPTIMIZER_TREND_WINDOWS = (50, 100, 150, 200)
 OPTIMIZER_PULLBACK_WINDOWS = (10, 20, 30, 50, 100, 150, 200)
 OPTIMIZER_MOMENTUM_WINDOWS = (3, 5, 10, 15, 20)
@@ -165,16 +165,16 @@ def score_evaluation(evaluation: WalkForwardResult) -> float:
     fragility_penalty = 0.0
     if train["profit_factor"] and oos["profit_factor"]:
         fragility_penalty = max(0.0, train["profit_factor"] - oos["profit_factor"]) * 1.5
-    no_trade_penalty = 5.0 if oos["total_trades"] == 0 else 0.0
+    insufficient_trade_penalty = 8.0 if oos["total_trades"] < 2 else 0.0
     verdict_bonus = {"Pass": 5.0, "Inconclusive": -1.0, "Needs review": -3.0}.get(evaluation.verdict, 0.0)
     return round(
         oos["return_pct"]
-        + oos["profit_factor"]
+        + min(float(oos["profit_factor"]), 3.0)
         + trade_bonus
         + verdict_bonus
         - drawdown_penalty
         - fragility_penalty
-        - no_trade_penalty,
+        - insufficient_trade_penalty,
         2,
     )
 
@@ -351,6 +351,7 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
         {"Item": "Pullback average", "Value": f"{settings['pullback_average_length']} bars", "Plain English": "Only affects Trend pullback continuation."},
         {"Item": "Momentum turn", "Value": f"{settings['momentum_turn_length']} bars", "Plain English": "Used by Trend pullback continuation and Trendline retest continuation."},
         {"Item": "Suggested strategy risk", "Value": f"{candidate.recommended_risk_per_trade_percent:.2f}%", "Plain English": "Risk size suggested by newer-data drawdown. Account risk limits still apply."},
+        {"Item": "Newer periods profitable", "Value": f"{candidate.profitable_test_periods}/{candidate.tested_periods}", "Plain English": "Checks whether results were spread across newer data instead of coming from one short stretch."},
         {"Item": "Main concern", "Value": candidate.concern, "Plain English": "What to watch before trusting this setting."},
     ]
 
@@ -372,6 +373,7 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Newer Trades": candidate.test_trades,
             "Profit Factor": candidate.test_profit_factor,
             "Worst Drop %": candidate.test_max_drawdown_percent,
+            "Profitable Periods": f"{candidate.profitable_test_periods}/{candidate.tested_periods}",
             "Plain English": candidate.reason,
         }
         for index, candidate in enumerate(candidates[:limit])
@@ -400,7 +402,7 @@ def _evaluate_optimizer_candidate(
     train_data = data.iloc[:split_index].copy()
     train_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
     train_result = _run_one(strategy_type, train_data, settings, account_equity, risk_limits)
-    train_stats = train_result["stats"]
+    train_stats = _closed_trade_stats(account_equity, train_result["trade_log"], split_index)
 
     oos_start = max(0, split_index - warmup_bars)
     warmup_offset = split_index - oos_start
@@ -413,6 +415,15 @@ def _evaluate_optimizer_candidate(
     ]
     oos_stats = _closed_trade_stats(account_equity, oos_trades, total_bars - split_index)
 
+    tested_periods = min(3, max(1, (total_bars - split_index) // 30))
+    period_pnl = [0.0] * tested_periods
+    test_span = max(1, total_bars - split_index)
+    for trade in oos_trades:
+        global_entry = oos_start + int(trade.get("entry_bar", 0))
+        relative_entry = max(0, global_entry - split_index)
+        bucket = min(tested_periods - 1, int(relative_entry * tested_periods / test_span))
+        period_pnl[bucket] += float(trade.get("pnl", 0))
+
     test_trades = int(oos_stats["total_trades"])
     return_pct = float(oos_stats["return_pct"])
     profit_factor = float(oos_stats["profit_factor"])
@@ -420,18 +431,25 @@ def _evaluate_optimizer_candidate(
     win_rate = float(oos_stats["win_rate"])
     train_return = float(train_stats["return_pct"])
     train_trades = int(train_stats["total_trades"])
-    profitable_periods = 1 if return_pct > 0 else 0
+    profitable_periods = sum(value > 0 for value in period_pnl)
     trade_penalty = 8.0 if test_trades < min_test_trades else 0.0
     drawdown_penalty = max(0.0, drawdown - target_max_drawdown_percent) * 0.9
     degradation_penalty = max(0.0, train_return - return_pct) * 0.15
     profit_factor_bonus = min(profit_factor, 3.0) * 2.0 if profit_factor > 0 else 0.0
     trade_bonus = min(test_trades, 8) * 0.4
-    score = round(return_pct + profit_factor_bonus + trade_bonus - drawdown * 0.35 - drawdown_penalty - degradation_penalty - trade_penalty, 2)
-    confidence = _optimizer_confidence(score, test_trades, drawdown, return_pct)
+    stability_bonus = profitable_periods * 1.25
+    concentration_penalty = 3.0 if tested_periods > 1 and profitable_periods <= 1 else 0.0
+    score = round(
+        return_pct + profit_factor_bonus + trade_bonus + stability_bonus
+        - drawdown * 0.35 - drawdown_penalty - degradation_penalty - trade_penalty - concentration_penalty,
+        2,
+    )
+    confidence = _optimizer_confidence(score, test_trades, drawdown, return_pct, profitable_periods, tested_periods)
     concern = _optimizer_concern(test_trades, drawdown, return_pct, train_return, min_test_trades)
     reason = (
         f"Newer-data return {return_pct:.2f}%, {test_trades} trades, "
-        f"profit factor {profit_factor:.2f}, worst drop {drawdown:.2f}%."
+        f"profit factor {profit_factor:.2f}, worst drop {drawdown:.2f}%, "
+        f"profitable in {profitable_periods}/{tested_periods} newer periods."
     )
     recommended_risk = _recommended_risk(settings, drawdown, target_max_drawdown_percent)
     return OptimizerCandidate(
@@ -448,10 +466,10 @@ def _evaluate_optimizer_candidate(
         test_profit_factor=round(profit_factor, 2),
         test_max_drawdown_percent=round(drawdown, 2),
         profitable_test_periods=profitable_periods,
-        tested_periods=1,
+        tested_periods=tested_periods,
         train_return_percent=round(train_return, 2),
         train_trades=train_trades,
-        stability=_stability_read(score, test_trades, drawdown, train_return, return_pct),
+        stability=_stability_read(score, test_trades, drawdown, train_return, return_pct, profitable_periods, tested_periods),
         recommended_risk_per_trade_percent=recommended_risk,
     )
 
@@ -466,6 +484,9 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
     peak = account
     max_drawdown = 0.0
     for trade in trade_log:
+        adverse_equity = equity + float(trade.get("max_adverse_pnl", 0))
+        if peak > 0:
+            max_drawdown = min(max_drawdown, (adverse_equity - peak) / peak)
         equity += float(trade.get("pnl", 0))
         peak = max(peak, equity)
         if peak > 0:
@@ -483,8 +504,8 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
         "total_trades": len(trade_log),
         "avg_win": avg_win,
         "avg_loss": avg_loss,
-        "rr_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss else 0,
-        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else 0,
+        "rr_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss else (99.0 if avg_win > 0 else 0),
+        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else (99.0 if gross_wins > 0 else 0),
         "max_drawdown_pct": round(abs(max_drawdown) * 100, 2),
         "exposure_pct": round(exposure_bars / eval_bars * 100, 2) if eval_bars else 0,
     }
@@ -504,8 +525,8 @@ def _normal_settings(settings: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _settings_distance(base: dict[str, Any], row: dict[str, Any]) -> tuple[float, ...]:
-    return (
+def _settings_distance(base: dict[str, Any], row: dict[str, Any]) -> float:
+    distances = (
         abs(row["entry_window"] - base["entry_window"]) / 10,
         abs(row["exit_window"] - base["exit_window"]) / 5,
         abs(row["atr_stop_multiplier"] - base["atr_stop_multiplier"]),
@@ -513,6 +534,7 @@ def _settings_distance(base: dict[str, Any], row: dict[str, Any]) -> tuple[float
         abs(row["pullback_average_length"] - base["pullback_average_length"]) / 20,
         abs(row["momentum_turn_length"] - base["momentum_turn_length"]) / 5,
     )
+    return float(sum(distances))
 
 
 def _warmup_bars(settings: dict[str, Any]) -> int:
@@ -526,10 +548,17 @@ def _warmup_bars(settings: dict[str, Any]) -> int:
     ) + 4
 
 
-def _optimizer_confidence(score: float, trades: int, drawdown: float, return_pct: float) -> str:
+def _optimizer_confidence(
+    score: float,
+    trades: int,
+    drawdown: float,
+    return_pct: float,
+    profitable_periods: int,
+    tested_periods: int,
+) -> str:
     if trades <= 0:
         return "Low"
-    if score >= 8 and trades >= 3 and return_pct > 0 and drawdown <= 10:
+    if score >= 8 and trades >= 4 and return_pct > 0 and drawdown <= 10 and profitable_periods >= max(2, tested_periods - 1):
         return "High"
     if score >= 2 and return_pct > 0:
         return "Medium"
@@ -548,9 +577,19 @@ def _optimizer_concern(trades: int, drawdown: float, return_pct: float, train_re
     return "No major issue from this bounded search."
 
 
-def _stability_read(score: float, trades: int, drawdown: float, train_return: float, return_pct: float) -> str:
+def _stability_read(
+    score: float,
+    trades: int,
+    drawdown: float,
+    train_return: float,
+    return_pct: float,
+    profitable_periods: int,
+    tested_periods: int,
+) -> str:
     if trades <= 0:
         return "Low confidence because the newer test period had no completed trades."
+    if tested_periods > 1 and profitable_periods <= 1:
+        return "Low confidence because most newer periods were not profitable."
     if return_pct > 0 and drawdown <= 8 and train_return >= 0 and score >= 5:
         return "Stable enough for paper testing; newer data stayed profitable with controlled drawdown."
     if return_pct > 0:

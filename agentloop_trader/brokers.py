@@ -194,7 +194,12 @@ class AlpacaBrokerAdapterStub:
         self.config = config or AlpacaConfig.from_env()
         self._client = trading_client
         self._client_error: str | None = None
+        self._read_errors: dict[str, str] = {}
         self.allow_order_submission = allow_order_submission
+
+    @property
+    def read_errors(self) -> dict[str, str]:
+        return dict(self._read_errors)
 
     def status(self) -> BrokerStatus:
         if not self.config.has_credentials:
@@ -224,12 +229,18 @@ class AlpacaBrokerAdapterStub:
                 can_submit_orders=False,
                 message=f"Alpaca account read failed: {exc}",
             )
-        can_submit = self.allow_order_submission and (self.config.paper or self.config.live_order_enabled)
+        account_blocked = any(
+            bool(getattr(account, field, False))
+            for field in ("trading_blocked", "account_blocked", "trade_suspended_by_user")
+        )
+        can_submit = self.allow_order_submission and (self.config.paper or self.config.live_order_enabled) and not account_blocked
         submit_message = (
             "enabled for paper trading"
             if self.config.paper and can_submit
             else "enabled for live trading"
             if can_submit
+            else "blocked by Alpaca account status"
+            if account_blocked
             else "blocked"
         )
         return BrokerStatus(
@@ -258,7 +269,7 @@ class AlpacaBrokerAdapterStub:
         client = self._get_client()
         if client is None:
             raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
-        request = self._build_order_request(intent)
+        request = self._build_order_request(intent, client_order_id=f"agentloop-{preview.preview_hash}"[:128])
         return client.submit_order(order_data=request)
 
     def cancel_order(self, broker_order_id: str, expected_cancel_hash: str | None = None):
@@ -296,17 +307,33 @@ class AlpacaBrokerAdapterStub:
             account = client.get_account()
         except Exception:
             return []
-        fields = ["status", "cash", "buying_power", "portfolio_value", "equity", "currency"]
+        fields = [
+            "status", "cash", "buying_power", "portfolio_value", "equity", "last_equity", "currency",
+            "trading_blocked", "account_blocked", "trade_suspended_by_user",
+        ]
         return [
             {"Field": field.replace("_", " ").title(), "Value": getattr(account, field, "")}
             for field in fields
         ]
 
-    def order_records(self) -> list[dict]:
+    def market_is_open(self) -> bool | None:
         client = self._get_client()
         if client is None:
+            return None
+        try:
+            clock = client.get_clock()
+        except Exception:
+            return None
+        return bool(getattr(clock, "is_open", False))
+
+    def order_records(self, strict: bool = False) -> list[dict]:
+        client = self._get_client()
+        if client is None:
+            if strict:
+                raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
             return []
-        orders = self._get_orders(client)
+        orders = self._get_orders(client, strict=strict)
+        self._read_errors.pop("orders", None)
         return alpaca_tracked_order_records([
             alpaca_tracked_order_from_broker_order(order, preview_hash="")
             for order in orders
@@ -321,7 +348,8 @@ class AlpacaBrokerAdapterStub:
             rows.append(self.tracked_order_record(broker_order_id, order.get("preview_hash", "")))
         return rows
 
-    def _get_orders(self, client) -> list:
+    def _get_orders(self, client, strict: bool = False) -> list:
+        last_error: Exception | None = None
         request = self._build_all_orders_request()
         if request is not None:
             for kwargs in ({"filter": request}, {"request_params": request}):
@@ -329,19 +357,31 @@ class AlpacaBrokerAdapterStub:
                     return client.get_orders(**kwargs)
                 except TypeError:
                     continue
-                except Exception:
-                    return []
+                except Exception as exc:
+                    last_error = exc
+                    break
             try:
                 return client.get_orders(request)
             except TypeError:
                 pass
-            except Exception:
-                return []
+            except Exception as exc:
+                last_error = exc
         try:
             orders = client.get_orders()
         except TypeError:
-            orders = client.get_orders(filter=None)
-        except Exception:
+            try:
+                orders = client.get_orders(filter=None)
+            except Exception as exc:
+                last_error = exc
+                orders = None
+        except Exception as exc:
+            last_error = exc
+            orders = None
+        if orders is None:
+            message = f"Alpaca orders read failed: {last_error or 'unknown error'}"
+            self._read_errors["orders"] = message
+            if strict:
+                raise RuntimeError(message) from last_error
             return []
         return orders
 
@@ -353,14 +393,21 @@ class AlpacaBrokerAdapterStub:
             alpaca_tracked_order_from_broker_order(order, preview_hash=preview_hash)
         ])[0]
 
-    def position_records(self) -> list[dict]:
+    def position_records(self, strict: bool = False) -> list[dict]:
         client = self._get_client()
         if client is None:
+            if strict:
+                raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
             return []
         try:
             positions = client.get_all_positions()
-        except Exception:
+        except Exception as exc:
+            message = f"Alpaca positions read failed: {exc}"
+            self._read_errors["positions"] = message
+            if strict:
+                raise RuntimeError(message) from exc
             return []
+        self._read_errors.pop("positions", None)
         return [
             {
                 "Symbol": getattr(position, "symbol", ""),
@@ -393,7 +440,7 @@ class AlpacaBrokerAdapterStub:
             return None
         return self._client
 
-    def _build_order_request(self, intent: TradeIntent):
+    def _build_order_request(self, intent: TradeIntent, client_order_id: str = ""):
         if intent.order_type == "limit" and (intent.limit_price is None or intent.limit_price <= 0):
             raise RuntimeError("Limit orders need a limit price.")
         try:
@@ -407,6 +454,8 @@ class AlpacaBrokerAdapterStub:
                 "type": intent.order_type,
                 "time_in_force": intent.time_in_force,
             }
+            if client_order_id:
+                order["client_order_id"] = client_order_id
             if intent.order_type == "limit":
                 order["limit_price"] = intent.limit_price
             return order
@@ -419,12 +468,14 @@ class AlpacaBrokerAdapterStub:
                 side=side,
                 time_in_force=tif,
                 limit_price=float(intent.limit_price),
+                client_order_id=client_order_id or None,
             )
         return MarketOrderRequest(
             symbol=intent.symbol_clean,
             qty=intent.quantity,
             side=side,
             time_in_force=tif,
+            client_order_id=client_order_id or None,
         )
 
     def _build_all_orders_request(self):
@@ -472,6 +523,10 @@ def build_alpaca_order_preview(
         blocked.append("No trade intent is present.")
     if symbol == "SYNTH":
         blocked.append("Synthetic symbols cannot be sent to Alpaca.")
+    if config.paper and decision.mode in {"live_with_approval", "automated_live"}:
+        blocked.append("Live order mode cannot send to an Alpaca paper account.")
+    if not config.paper and decision.mode not in {"live_with_approval", "automated_live"}:
+        blocked.append("Paper order mode cannot send to an Alpaca live account.")
     if not config.paper and not config.live_order_enabled:
         blocked.append("Alpaca live order submission is not enabled. Configure the live endpoint and confirmation first.")
     if not decision.approved_for_execution:

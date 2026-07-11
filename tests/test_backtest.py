@@ -121,6 +121,30 @@ def test_latest_bar_breakout_explains_missing_buy_intent():
     assert live["no_trade_reason"] == "No BUY because price is not above the 5-bar entry level."
 
 
+def test_breakout_channel_uses_prior_highs_not_prior_closes():
+    closes = list(range(100, 130))
+    highs = [price + 0.25 for price in closes]
+    highs[-2] = 140.0
+    market_data = pd.DataFrame(
+        {"Open": closes, "Close": closes, "High": highs, "Low": [price - 0.25 for price in closes]},
+        index=pd.date_range("2026-01-01", periods=len(closes), freq="D"),
+    )
+    market_data.attrs["symbol"] = "CHANNEL"
+
+    _, _, _, _, live, _, _ = simulate_turtle_strategy(
+        account=50_000,
+        entry_w=5,
+        exit_w=3,
+        atr_mult=2.0,
+        risk_pct_dec=0.01,
+        ma_w=5,
+        market_data=market_data,
+    )
+
+    assert live["don_high"] == 140.0
+    assert live["trade_intent"] is None
+
+
 def test_real_market_volume_feeds_setup_quality():
     prices = list(range(100, 150))
     market_data = pd.DataFrame(
@@ -239,6 +263,8 @@ def test_latest_bar_trend_pullback_generates_trade_intent():
     assert live["signal"] == "long"
     assert live["trade_intent"] is not None
     assert live["trade_intent"].symbol == "PULL"
+    expected_stop = min(min(prices[-10:]), prices[-1] - 2.0 * live["last_atr"])
+    assert live["trade_intent"].stop_loss == round(expected_stop, 2)
     assert live["no_trade_reason"] == "BUY intent is present."
     assert all(live["buy_requirements"].values())
 
@@ -287,7 +313,7 @@ def test_pullback_sell_exit_length_changes_backtest_exits():
 
 
 def test_latest_bar_trendline_breakout_generates_trade_intent():
-    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 97, 99, 100, 106]
+    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 97, 99, 95, 106]
     market_data = pd.DataFrame(
         {
             "Close": prices,
@@ -319,7 +345,7 @@ def test_latest_bar_trendline_breakout_generates_trade_intent():
 
 
 def test_latest_bar_trendline_retest_generates_trade_intent():
-    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 96, 96, 97, 97.4]
+    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 94, 106, 98, 103]
     market_data = pd.DataFrame(
         {
             "Close": prices,
@@ -346,9 +372,52 @@ def test_latest_bar_trendline_retest_generates_trade_intent():
     assert live["signal"] == "long"
     assert live["trade_intent"] is not None
     assert live["trade_intent"].symbol == "TLR"
+    expected_stop = min(live["trendline_level"] - 0.25 * live["last_atr"], prices[-1] - 2.0 * live["last_atr"])
+    assert live["trade_intent"].stop_loss == round(expected_stop, 2)
     assert live["buy_requirements"]["Retest held trendline"] is True
     assert live["retest_ready"] is True
     assert live["no_trade_reason"] == "BUY intent is present."
+
+
+def test_trendline_breakout_requires_a_new_crossing_not_merely_price_above_line():
+    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 97, 99, 100, 106]
+    market_data = pd.DataFrame(
+        {"Close": prices, "High": [p + 0.25 for p in prices], "Low": [p - 0.25 for p in prices]},
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="D"),
+    )
+    market_data.attrs["symbol"] = "TL"
+
+    live = simulate_trendline_breakout_strategy(
+        account=50_000, trendline_w=15, exit_w=3, atr_mult=2.0,
+        risk_pct_dec=0.01, ma_w=3, market_data=market_data,
+    )[4]
+
+    assert live["signal"] == "flat"
+    assert live["trendline_break"] is False
+
+
+def test_final_backtest_equity_includes_latest_open_position_value():
+    prices = list(range(100, 140))
+    prices[-1] = 150
+    market_data = pd.DataFrame(
+        {
+            "Open": prices,
+            "Close": prices,
+            "High": [p + 0.25 for p in prices],
+            "Low": [p - 0.25 for p in prices],
+            "Volume": [1_000_000] * len(prices),
+        },
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="D"),
+    )
+    market_data.attrs["symbol"] = "LATEST"
+
+    _, _, _, _, live, stats, _ = simulate_turtle_strategy(
+        account=50_000, entry_w=5, exit_w=3, atr_mult=2.0,
+        risk_pct_dec=0.01, ma_w=5, market_data=market_data,
+    )
+
+    assert live["in_simulated_trade"] is True
+    assert stats["final_equity"] == round(live["balance"], 2)
 
 
 def test_strategy_comparison_records_are_display_ready():

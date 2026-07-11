@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import time
 from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from pathlib import Path
@@ -21,7 +23,15 @@ class BrokerStateHealth:
     reasons: list[str]
 
 
-OPEN_ORDER_STATUSES = {"accepted", "new", "pending_new", "partially_filled"}
+OPEN_ORDER_STATUSES = {
+    "accepted",
+    "new",
+    "pending_new",
+    "partially_filled",
+    "pending_cancel",
+    "pending_replace",
+    "held",
+}
 TERMINAL_ORDER_STATUSES = {"filled", "canceled", "cancelled", "expired", "rejected"}
 
 
@@ -72,7 +82,8 @@ def preview_already_tracked(preview_hash: str, tracked_orders: list[dict]) -> bo
 
 
 def open_order_exposure_reasons(intent: TradeIntent | None, alpaca_orders: list[dict], allow_duplicate: bool = False) -> list[str]:
-    if allow_duplicate or intent is None or intent.side != "buy":
+    # Position adds never permit a second waiting order for the same ticker.
+    if intent is None or intent.side != "buy":
         return []
     reasons = []
     for order in alpaca_orders:
@@ -538,4 +549,45 @@ class BrokerStateStore:
 
     def replace_all(self, records: list[dict]) -> None:
         self.path.parent.mkdir(parents=True, exist_ok=True)
-        self.path.write_text(json.dumps(records, indent=2, sort_keys=True), encoding="utf-8")
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        lock_fd = None
+        for _ in range(100):
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except FileExistsError:
+                try:
+                    if time.time() - lock_path.stat().st_mtime > 30:
+                        lock_path.unlink()
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.02)
+        if lock_fd is None:
+            raise RuntimeError("Alpaca tracking file is busy; try again.")
+        try:
+            os.close(lock_fd)
+            current = self.read()
+            merged: dict[str, dict] = {}
+            unkeyed: list[dict] = []
+            for row in current + list(records):
+                record = dict(row)
+                key = str(record.get("broker_order_id") or record.get("Alpaca Order ID") or "").strip()
+                if not key:
+                    unkeyed.append(record)
+                    continue
+                prior = merged.get(key, {})
+                merged_record = {**prior, **record}
+                for settings_key in ("strategy_settings", "exit_settings"):
+                    if not record.get(settings_key) and prior.get(settings_key):
+                        merged_record[settings_key] = prior[settings_key]
+                merged[key] = merged_record
+            payload = list(merged.values()) + unkeyed
+            temporary = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
+            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+            temporary.replace(self.path)
+        finally:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass

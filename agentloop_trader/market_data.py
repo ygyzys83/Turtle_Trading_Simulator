@@ -6,11 +6,90 @@ from datetime import UTC, datetime, timedelta
 from typing import Any
 from urllib.parse import urlencode
 from urllib.request import Request, urlopen
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 
 
 ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
+NEW_YORK_TIME = ZoneInfo("America/New_York")
+INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
+
+
+def validate_price_bars(data: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
+    """Return sorted, numeric OHLCV bars or raise on unsafe market data."""
+    if data is None or data.empty:
+        raise ValueError(f"No price data returned for {symbol or 'the selected ticker'}.")
+    required = ["Close", "High", "Low"]
+    missing = [column for column in required if column not in data.columns]
+    if missing:
+        raise ValueError(f"Missing columns: {', '.join(missing)}")
+    clean = data.copy()
+    clean = clean[~clean.index.duplicated(keep="last")].sort_index()
+    numeric_columns = [column for column in ("Open", "High", "Low", "Close", "Volume") if column in clean.columns]
+    for column in numeric_columns:
+        clean[column] = pd.to_numeric(clean[column], errors="coerce")
+    clean = clean.dropna(subset=required)
+    if clean.empty:
+        raise ValueError(f"No usable price rows returned for {symbol or 'the selected ticker'}.")
+    invalid_price = (clean[required] <= 0).any(axis=1)
+    invalid_range = (clean["High"] < clean["Low"]) | (clean["High"] < clean["Close"]) | (clean["Low"] > clean["Close"])
+    if "Open" in clean.columns:
+        invalid_range |= (clean["High"] < clean["Open"]) | (clean["Low"] > clean["Open"])
+    if bool((invalid_price | invalid_range).any()):
+        raise ValueError(f"Invalid OHLC values returned for {symbol or 'the selected ticker'}.")
+    if "Volume" in clean.columns:
+        clean["Volume"] = clean["Volume"].fillna(0)
+        if bool((clean["Volume"] < 0).any()):
+            raise ValueError(f"Negative volume returned for {symbol or 'the selected ticker'}.")
+    clean.attrs.update(getattr(data, "attrs", {}))
+    if symbol:
+        clean.attrs["symbol"] = str(symbol).strip().upper()
+    return clean
+
+
+def completed_price_bars(
+    data: pd.DataFrame,
+    interval: str,
+    now: datetime | pd.Timestamp | None = None,
+) -> pd.DataFrame:
+    """Keep completed bars while preserving the newest available quote-like values."""
+    clean = validate_price_bars(data, str(getattr(data, "attrs", {}).get("symbol", "")))
+    latest = clean.iloc[-1]
+    attrs = dict(clean.attrs)
+    attrs.update({
+        "latest_price": float(latest["Close"]),
+        "latest_high": float(latest["High"]),
+        "latest_low": float(latest["Low"]),
+        "latest_bar_time": clean.index[-1].isoformat() if hasattr(clean.index[-1], "isoformat") else str(clean.index[-1]),
+    })
+    current = pd.Timestamp(now or datetime.now(UTC))
+    if current.tzinfo is None:
+        current = current.tz_localize("UTC")
+    current_et = current.tz_convert(NEW_YORK_TIME)
+
+    completed_mask: list[bool] = []
+    for raw_timestamp in clean.index:
+        timestamp = pd.Timestamp(raw_timestamp)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize(NEW_YORK_TIME)
+        timestamp_et = timestamp.tz_convert(NEW_YORK_TIME)
+        if interval == "1d":
+            session_close = timestamp_et.normalize() + pd.Timedelta(hours=16)
+            is_complete = timestamp_et.date() < current_et.date() or current_et >= session_close
+        else:
+            minutes = INTERVAL_MINUTES.get(interval, 60)
+            normal_end = timestamp_et + pd.Timedelta(minutes=minutes)
+            session_close = timestamp_et.normalize() + pd.Timedelta(hours=16)
+            bar_end = min(normal_end, session_close) if timestamp_et.hour >= 9 else normal_end
+            is_complete = current_et >= bar_end
+        completed_mask.append(bool(is_complete))
+
+    completed = clean.loc[completed_mask].copy()
+    if completed.empty:
+        raise ValueError("No completed price bars are available for the selected interval.")
+    completed.attrs.update(attrs)
+    return completed
 
 
 def alpaca_timeframe(interval: str) -> str:
@@ -94,6 +173,7 @@ def fetch_alpaca_bars(
     data = pd.DataFrame(
         {
             "Date": [bar.get("t") for bar in all_bars],
+            "Open": [bar.get("o") for bar in all_bars],
             "Close": [bar.get("c") for bar in all_bars],
             "High": [bar.get("h") for bar in all_bars],
             "Low": [bar.get("l") for bar in all_bars],
@@ -102,11 +182,10 @@ def fetch_alpaca_bars(
     )
     data["Date"] = pd.to_datetime(data["Date"], utc=True)
     data = data.set_index("Date").sort_index()
-    data = data[["Close", "High", "Low", "Volume"]].dropna(subset=["Close", "High", "Low"])
-    if data.empty:
-        raise ValueError(f"No usable Alpaca rows for {clean}.")
-    data.attrs["symbol"] = clean
-    return data
+    return completed_price_bars(
+        validate_price_bars(data[["Open", "Close", "High", "Low", "Volume"]], clean),
+        interval,
+    )
 
 
 def fetch_yfinance_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
@@ -136,15 +215,16 @@ def fetch_yfinance_bars(symbol: str, period: str, interval: str) -> pd.DataFrame
     missing = [column for column in required if column not in data.columns]
     if missing:
         raise ValueError(f"Missing columns: {', '.join(missing)}")
-    columns = required + (["Volume"] if "Volume" in data.columns else [])
+    columns = (["Open"] if "Open" in data.columns else []) + required + (["Volume"] if "Volume" in data.columns else [])
     data = data[columns].dropna(subset=required)
     if interval == "4h":
         aggregations = {"Close": "last", "High": "max", "Low": "min"}
+        if "Open" in data.columns:
+            aggregations["Open"] = "first"
         if "Volume" in data.columns:
             aggregations["Volume"] = "sum"
         data = data.resample("4h").agg(aggregations).dropna(subset=required)
-    data.attrs["symbol"] = clean
-    return data
+    return completed_price_bars(validate_price_bars(data, clean), interval)
 
 
 def fetch_price_bars(

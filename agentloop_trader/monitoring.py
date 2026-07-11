@@ -37,7 +37,7 @@ def monitor_paper_session(
     if session_loss_pct > limits.max_session_loss_pct:
         status = "BREACH"
         alerts.append(
-            f"Session loss {session_loss_pct:.2f}% exceeds max {limits.max_session_loss_pct:.2f}%."
+            f"Daily loss {session_loss_pct:.2f}% exceeds max {limits.max_session_loss_pct:.2f}%."
         )
     if exposure_pct > limits.max_portfolio_exposure_pct:
         status = "BREACH"
@@ -52,11 +52,11 @@ def monitor_paper_session(
 
     if status == "OK" and (exposure_pct > limits.max_portfolio_exposure_pct * 0.8 or session_loss_pct > limits.max_session_loss_pct * 0.8):
         status = "WARN"
-        alerts.append("Session is approaching a configured risk limit.")
+        alerts.append("The account is approaching a configured risk limit.")
 
     return MonitoringResult(
         status=status,
-        alerts=alerts or ["Session is within configured monitoring limits."],
+        alerts=alerts or ["The account is within configured monitoring limits."],
         metrics={
             "paper_cash": round(broker.cash, 2),
             "paper_equity": round(paper_equity, 2),
@@ -91,20 +91,20 @@ def daily_risk_records(
         if _enum_value(order.get("status", "")) in {"accepted", "new", "pending_new", "partially_filled", "filled"}
     ]
     local_notional = sum(_as_float(order.get("Notional")) for order in local_filled)
-    alpaca_quantity = sum(_as_float(order.get("filled_quantity") or order.get("quantity")) for order in alpaca_submitted)
+    alpaca_quantity = sum(_as_float(order.get("filled_quantity")) for order in alpaca_submitted)
     session_loss_pct = abs(session_pnl) / account_equity * 100 if account_equity and session_pnl < 0 else 0.0
     exposure_pct = portfolio_exposure / account_equity * 100 if account_equity else 0.0
     return [
         {"Metric": "Filled app paper orders", "Value": len(local_filled)},
         {"Metric": "Saved Alpaca active/filled orders", "Value": len(alpaca_submitted)},
         {"Metric": "Filled app order value", "Value": round(local_notional, 2)},
-        {"Metric": "Saved Alpaca shares", "Value": _format_number(alpaca_quantity)},
+        {"Metric": "Filled Alpaca shares", "Value": _format_number(alpaca_quantity)},
         {"Metric": "Portfolio exposure", "Value": round(portfolio_exposure, 2)},
         {"Metric": "Portfolio exposure %", "Value": round(exposure_pct, 2)},
         {"Metric": "Max portfolio exposure %", "Value": limits.max_portfolio_exposure_pct},
-        {"Metric": "Session P&L", "Value": round(session_pnl, 2)},
-        {"Metric": "Session loss %", "Value": round(session_loss_pct, 2)},
-        {"Metric": "Max session loss %", "Value": limits.max_session_loss_pct},
+        {"Metric": "Daily P&L", "Value": round(session_pnl, 2)},
+        {"Metric": "Daily loss %", "Value": round(session_loss_pct, 2)},
+        {"Metric": "Max daily loss %", "Value": limits.max_session_loss_pct},
         {"Metric": "Kill Switch on", "Value": limits.kill_switch_enabled},
         {"Metric": "Max open positions", "Value": limits.max_open_positions},
     ]

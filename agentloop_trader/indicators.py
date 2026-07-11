@@ -11,9 +11,15 @@ def calc_atr(
 ) -> list[float | None]:
     prices = np.asarray(prices, dtype=float)
     atrs: list[float | None] = [None] * len(prices)
+    if n <= 0:
+        raise ValueError("ATR length must be greater than zero.")
+    if len(prices) < n:
+        return atrs
     if highs is not None and lows is not None:
         highs = np.asarray(highs, dtype=float)
         lows = np.asarray(lows, dtype=float)
+        if len(highs) != len(prices) or len(lows) != len(prices):
+            raise ValueError("Close, high, and low arrays must have the same length.")
         tr = np.zeros(len(prices))
         tr[0] = highs[0] - lows[0]
         for i in range(1, len(prices)):
@@ -22,19 +28,23 @@ def calc_atr(
                 abs(highs[i] - prices[i - 1]),
                 abs(lows[i] - prices[i - 1]),
             )
+        # Wilder ATR: seed with the first n true ranges, then smooth recursively.
+        atrs[n - 1] = float(np.mean(tr[:n]))
         for i in range(n, len(prices)):
-            atrs[i] = float(np.mean(tr[i - n + 1:i + 1]))
+            atrs[i] = float((atrs[i - 1] * (n - 1) + tr[i]) / n)
         return atrs
 
+    synthetic_range = prices * 0.01
+    atrs[n - 1] = float(np.mean(synthetic_range[:n]))
     for i in range(n, len(prices)):
-        hi = prices[i - n + 1:i + 1] * 1.005
-        lo = prices[i - n + 1:i + 1] * 0.995
-        atrs[i] = float(np.mean(hi - lo))
+        atrs[i] = float((atrs[i - 1] * (n - 1) + synthetic_range[i]) / n)
     return atrs
 
 
 def calc_sma(prices, n: int) -> list[float | None]:
     prices = np.asarray(prices, dtype=float)
+    if n <= 0:
+        raise ValueError("Moving-average length must be greater than zero.")
     smas: list[float | None] = [None] * len(prices)
     for i in range(n - 1, len(prices)):
         smas[i] = float(np.mean(prices[i - n + 1:i + 1]))
@@ -43,6 +53,8 @@ def calc_sma(prices, n: int) -> list[float | None]:
 
 def calc_rsi(prices, n: int = 14) -> list[float | None]:
     prices = np.asarray(prices, dtype=float)
+    if n <= 0:
+        raise ValueError("RSI length must be greater than zero.")
     rsis: list[float | None] = [None] * len(prices)
     if len(prices) <= n:
         return rsis

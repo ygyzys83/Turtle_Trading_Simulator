@@ -18,6 +18,7 @@ def constrain_trade_intent_to_limits(
     limits: RiskLimits,
     current_portfolio_notional: float = 0.0,
     symbol_current_notional: float = 0.0,
+    session_pnl: float = 0.0,
     available_cash: float | None = None,
 ) -> TradeIntent | None:
     if intent is None or intent.entry_price is None or intent.quantity <= 0:
@@ -26,6 +27,19 @@ def constrain_trade_intent_to_limits(
     entry_price = float(intent.entry_price)
     if entry_price <= 0:
         return replace(intent, quantity=0)
+
+    session_start_equity = max(0.0, account_equity - session_pnl)
+    max_daily_loss = session_start_equity * limits.max_session_loss_pct / 100
+    if session_pnl < -max_daily_loss:
+        return replace(
+            intent,
+            quantity=0,
+            rationale=(
+                f"{intent.rationale} Deterministic risk sizing blocked this order because "
+                "the account exceeded its daily loss limit."
+            ).strip(),
+            source_signals=list(dict.fromkeys([*intent.source_signals, "daily_loss_limit"])),
+        )
 
     max_quantities = [intent.quantity, limits.max_quantity]
     if intent.stop_loss is not None:
@@ -89,6 +103,10 @@ def check_trade_intent(
     risk_dollars = intent.estimated_risk_dollars
     notional_dollars = intent.estimated_notional
 
+    checks["account_equity_positive"] = account_equity > 0
+    if not checks["account_equity_positive"]:
+        rejected.append("Account value must be greater than zero.")
+
     checks["kill_switch_off"] = not limits.kill_switch_enabled
     if limits.kill_switch_enabled:
         rejected.append("Kill Switch is on.")
@@ -108,6 +126,18 @@ def check_trade_intent(
     checks["stop_loss_present"] = (not limits.require_stop_loss) or intent.stop_loss is not None
     if not checks["stop_loss_present"]:
         rejected.append("Stop loss is required.")
+
+    stop_direction_valid = True
+    if intent.entry_price is not None and intent.stop_loss is not None:
+        stop_direction_valid = (
+            float(intent.stop_loss) < float(intent.entry_price)
+            if intent.side == "buy"
+            else float(intent.stop_loss) > float(intent.entry_price)
+        )
+    checks["stop_loss_direction_valid"] = stop_direction_valid
+    if not stop_direction_valid:
+        direction = "below" if intent.side == "buy" else "above"
+        rejected.append(f"Stop loss must be {direction} the entry price for a {intent.side} order.")
 
     max_risk_dollars = account_equity * limits.max_risk_per_trade_pct / 100
     checks["risk_within_limit"] = risk_dollars <= max_risk_dollars
@@ -151,11 +181,14 @@ def check_trade_intent(
             f"${max_symbol_notional:,.2f}."
         )
 
-    max_session_loss = account_equity * limits.max_session_loss_pct / 100
+    # session_pnl is measured from the broker's prior-day equity. Recover that
+    # starting value so the daily loss limit does not shrink as losses accrue.
+    session_start_equity = max(0.0, account_equity - session_pnl)
+    max_session_loss = session_start_equity * limits.max_session_loss_pct / 100
     checks["session_loss_within_limit"] = session_pnl >= -max_session_loss
     if not checks["session_loss_within_limit"]:
         rejected.append(
-            f"Session loss ${abs(session_pnl):,.2f} exceeds max ${max_session_loss:,.2f}."
+            f"Daily loss ${abs(session_pnl):,.2f} exceeds max ${max_session_loss:,.2f}."
         )
 
     if available_cash is not None:
@@ -225,10 +258,10 @@ def risk_policy_records(limits: RiskLimits) -> list[dict]:
     return [
         {"Policy": "Allowed symbols", "Value": ", ".join(limits.allowed_symbols) if limits.allowed_symbols else "Any"},
         {"Policy": "Max risk per trade", "Value": f"{limits.max_risk_per_trade_pct}%"},
-        {"Policy": "Max position notional", "Value": f"{limits.max_position_notional_pct}%"},
+        {"Policy": "Max new order size", "Value": f"{limits.max_position_notional_pct}%"},
         {"Policy": "Max portfolio exposure", "Value": f"{limits.max_portfolio_exposure_pct}%"},
         {"Policy": "Max symbol concentration", "Value": f"{limits.max_symbol_concentration_pct}%"},
-        {"Policy": "Max session loss", "Value": f"{limits.max_session_loss_pct}%"},
+        {"Policy": "Max daily loss", "Value": f"{limits.max_session_loss_pct}%"},
         {"Policy": "Max open positions", "Value": limits.max_open_positions},
         {"Policy": "Add to existing position", "Value": limits.allow_add_to_existing_position},
         {"Policy": "Stop loss required", "Value": limits.require_stop_loss},

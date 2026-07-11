@@ -229,3 +229,34 @@ def test_constrain_trade_intent_returns_zero_when_no_quantity_is_allowed():
     risk = check_trade_intent(adjusted, 50_000, RiskLimits(allowed_symbols=("AAPL",)))
     assert not risk.approved
     assert "Quantity must be greater than zero." in risk.rejected_reasons
+
+
+def test_risk_rejects_buy_stop_above_entry():
+    intent = TradeIntent(symbol="AAPL", side="buy", quantity=10, entry_price=100, stop_loss=101)
+
+    result = check_trade_intent(intent, 50_000, RiskLimits())
+
+    assert not result.approved
+    assert "Stop loss must be below the entry price for a buy order." in result.rejected_reasons
+
+
+def test_risk_rejects_nonpositive_account_value():
+    intent = TradeIntent(symbol="AAPL", side="buy", quantity=10, entry_price=100, stop_loss=95)
+
+    result = check_trade_intent(intent, 0, RiskLimits())
+
+    assert not result.approved
+    assert "Account value must be greater than zero." in result.rejected_reasons
+
+
+def test_deterministic_sizing_blocks_new_buys_after_daily_loss_limit():
+    intent = TradeIntent(symbol="AAPL", side="buy", quantity=10, entry_price=100, stop_loss=95)
+    adjusted = constrain_trade_intent_to_limits(
+        intent,
+        account_equity=97_000,
+        limits=RiskLimits(max_session_loss_pct=2),
+        session_pnl=-3_000,
+    )
+
+    assert adjusted.quantity == 0
+    assert "daily loss limit" in adjusted.rationale

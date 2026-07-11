@@ -110,7 +110,21 @@ def apply_buy_order_style(
         limit_price = float(intent.entry_price) * (1 + float(adjustment_pct) / 100)
     else:
         limit_price = float(intent.entry_price)
-    return replace(intent, order_type="limit", limit_price=round(limit_price, 2))
+    limit_price = round(limit_price, 2)
+    return replace(intent, order_type="limit", limit_price=limit_price, entry_price=limit_price)
+
+
+def reprice_trade_intent(intent: TradeIntent | None, current_price: float | None) -> TradeIntent | None:
+    """Move a proposed buy to the newest price while preserving its stop distance."""
+    if intent is None or intent.side != "buy" or intent.entry_price is None or current_price is None or current_price <= 0:
+        return intent
+    stop_distance = (
+        float(intent.entry_price) - float(intent.stop_loss)
+        if intent.stop_loss is not None
+        else None
+    )
+    stop_loss = round(float(current_price) - stop_distance, 2) if stop_distance is not None and stop_distance > 0 else intent.stop_loss
+    return replace(intent, entry_price=round(float(current_price), 2), stop_loss=stop_loss)
 
 
 def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict[str, Any] | None:
@@ -123,7 +137,18 @@ def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> d
     ]
     if not matches:
         return None
-    latest = matches[-1]
+    def priority(row: dict[str, Any]) -> int:
+        status = str(row.get("status", row.get("Status", ""))).strip().lower().rsplit(".", 1)[-1]
+        source = str(row.get("source", "")).strip().lower()
+        if source == "position_exit_settings" or status == "managed_exit_settings":
+            return 3
+        if status in {"filled", "partially_filled"}:
+            return 2
+        if source == "adopted_alpaca_position":
+            return 1
+        return 0
+
+    latest = max(enumerate(matches), key=lambda item: (priority(item[1]), item[0]))[1]
     settings = dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
     settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
     settings.setdefault("entry_filled_at", latest.get("filled_at", ""))
@@ -181,19 +206,21 @@ def evaluate_exit_settings(
         account = float(settings.get("account_size", 100000))
         result = selected_strategy_result(data, settings, account)
         live = result["live"]
-        current_price = _number(live.get("last_p"))
+        current_price = _number(data.attrs.get("latest_price"), _number(live.get("last_p")))
         strategy_exit = _number(live.get("exit_level"))
         current_atr = _number(live.get("last_atr"))
         entry = _number(position.get("Average Entry"), _number(settings.get("entry_reference_price"), current_price))
         atr_mult = float(settings.get("atr_stop_multiplier", 2.0))
-        original_stop = _number(settings.get("entry_stop_loss"))
-        if original_stop is None and entry is not None and current_atr is not None:
-            original_stop = entry - atr_mult * current_atr
         initial_risk = _number(settings.get("entry_stop_distance"))
-        if initial_risk is None and entry is not None and original_stop is not None:
-            initial_risk = entry - original_stop
+        saved_entry = _number(settings.get("planned_entry_price"), _number(settings.get("entry_reference_price")))
+        saved_stop = _number(settings.get("entry_stop_loss"))
+        if initial_risk is None and saved_entry is not None and saved_stop is not None:
+            initial_risk = saved_entry - saved_stop
         if initial_risk is not None and initial_risk <= 0:
             initial_risk = None
+        original_stop = entry - initial_risk if entry is not None and initial_risk is not None else saved_stop
+        if original_stop is None and entry is not None and current_atr is not None:
+            original_stop = entry - atr_mult * current_atr
         profit_r = (current_price - entry) / initial_risk if current_price is not None and entry is not None and initial_risk else None
 
         high_data = data.tail(1)
@@ -204,14 +231,19 @@ def evaluate_exit_settings(
             if not recent.empty:
                 high_data = recent
         current_high = _number(high_data["High"].max()) if "High" in high_data.columns else None
+        current_high = max(
+            [value for value in (current_high, _number(data.attrs.get("latest_high"))) if value is not None],
+            default=None,
+        )
         saved_high = _number(settings.get("highest_high_since_entry"))
         high = max([value for value in (current_high, saved_high, entry) if value is not None], default=None)
+        highest_profit_r = (high - entry) / initial_risk if high is not None and entry is not None and initial_risk else None
         protect = bool(settings.get("profit_protection_enabled", True))
         breakeven_after = float(settings.get("breakeven_after_r", 1.0))
         trail_after = float(settings.get("trail_after_r", 2.0))
         trail_mult = float(settings.get("trailing_atr_multiplier", 3.0))
-        breakeven = entry if protect and profit_r is not None and profit_r >= breakeven_after else None
-        atr_trail = high - trail_mult * current_atr if protect and profit_r is not None and profit_r >= trail_after and high is not None and current_atr is not None else None
+        breakeven = entry if protect and highest_profit_r is not None and highest_profit_r >= breakeven_after else None
+        atr_trail = high - trail_mult * current_atr if protect and highest_profit_r is not None and highest_profit_r >= trail_after and high is not None and current_atr is not None else None
         saved_trigger = _number(settings.get("last_exit_trigger_price"))
         candidates = [("strategy exit", strategy_exit), ("original stop", original_stop), ("break-even stop", breakeven), ("ATR trail", atr_trail), ("saved trigger", saved_trigger)]
         usable = [(name, value) for name, value in candidates if value is not None]
@@ -236,6 +268,7 @@ def evaluate_exit_settings(
             "trailing_stop_price": atr_trail,
             "highest_high_since_entry": high,
             "profit_r": profit_r,
+            "highest_profit_r": highest_profit_r,
             "current_atr": current_atr,
             "interval": interval,
             "checked_at": datetime.now().astimezone().isoformat(),

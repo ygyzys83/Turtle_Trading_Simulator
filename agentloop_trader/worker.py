@@ -39,6 +39,7 @@ from agentloop_trader.risk import check_trade_intent, constrain_trade_intent_to_
 from agentloop_trader.strategy_runtime import (
     apply_buy_order_style,
     evaluate_exit_settings,
+    reprice_trade_intent,
     selected_strategy_result,
     saved_exit_settings_for_symbol,
     update_exit_settings_for_symbol,
@@ -97,8 +98,45 @@ def _symbol_notional(positions: list[dict], symbol: str) -> float:
     return sum(abs(_number(row.get("Market Value"))) for row in positions if str(row.get("Symbol", "")).strip().upper() == clean)
 
 
+def _open_buy_order_notional(orders: list[dict], symbol: str = "") -> float:
+    clean = symbol.strip().upper()
+    total = 0.0
+    for row in orders:
+        if _enum_value(row.get("Side")) != "buy" or _enum_value(row.get("Status")) not in OPEN_ORDER_STATUSES:
+            continue
+        row_symbol = str(row.get("Symbol", "")).strip().upper()
+        if clean and row_symbol != clean:
+            continue
+        remaining_quantity = max(0.0, _number(row.get("Quantity")) - _number(row.get("Filled Qty")))
+        price = _number(row.get("Limit Price"), _number(row.get("Avg Fill")))
+        total += remaining_quantity * max(0.0, price)
+    return total
+
+
+def _open_buy_order_symbols(orders: list[dict]) -> set[str]:
+    return {
+        str(row.get("Symbol", "")).strip().upper()
+        for row in orders
+        if _enum_value(row.get("Side")) == "buy" and _enum_value(row.get("Status")) in OPEN_ORDER_STATUSES
+    }
+
+
 def _open_symbols(positions: list[dict]) -> set[str]:
-    return {str(row.get("Symbol", "")).strip().upper() for row in positions if _number(row.get("Quantity")) > 0}
+    return {str(row.get("Symbol", "")).strip().upper() for row in positions if _number(row.get("Quantity")) != 0}
+
+
+def _market_is_open(adapter: AlpacaBrokerAdapterStub) -> bool:
+    broker_clock = adapter.market_is_open() if hasattr(adapter, "market_is_open") else None
+    return bool(broker_clock) if broker_clock is not None else bool(market_session_advisory().get("Open"))
+
+
+def _strict_broker_records(adapter: AlpacaBrokerAdapterStub, method_name: str) -> list[dict]:
+    method = getattr(adapter, method_name)
+    try:
+        return method(strict=True)
+    except TypeError:
+        # Lightweight test adapters may not expose the strict keyword.
+        return method()
 
 
 def _track_broker_order(order: Any, preview_hash: str, strategy_settings: dict[str, Any] | None = None) -> dict:
@@ -176,7 +214,7 @@ def _send_exits(
         return 0, tracked_orders, "Auto exits are blocked by account switch or Kill Switch."
     if not adapter.config.paper:
         return 0, tracked_orders, "Auto exits are paper-only in this worker."
-    if not bool(market_session_advisory().get("Open")):
+    if not _market_is_open(adapter):
         return 0, tracked_orders, "Market is closed; auto exits wait for regular hours."
 
     sent = 0
@@ -251,29 +289,37 @@ def _send_entry(
         return 0, tracked_orders, "Auto entries are blocked by account switch or Kill Switch."
     if not adapter.config.paper:
         return 0, tracked_orders, "Auto entries are paper-only in this worker."
-    session = market_session_advisory()
-    if not bool(session.get("Open")) and not control.allow_limit_buys_outside_market_hours:
+    market_open = _market_is_open(adapter)
+    if not market_open and not control.allow_limit_buys_outside_market_hours:
         return 0, tracked_orders, "Market is closed; auto buys wait for regular hours."
 
+    account_records = adapter.account_records()
+    account_equity = _account_value(account_records, "portfolio value", 0.0)
+    available_cash = _account_value(account_records, "cash", 0.0)
+    prior_day_equity = _account_value(account_records, "last equity", account_equity)
+    if account_equity <= 0 or available_cash < 0:
+        return 0, tracked_orders, "Alpaca account value is unavailable; auto buy is paused."
+    session_pnl = account_equity - prior_day_equity
+    limits = _risk_limits(control)
+
     data = fetch_bars(control.symbol, control.history, control.interval, control.price_data_source)
-    result = selected_strategy_result(data, control.strategy_settings, max(1.0, float(control.account_size)), _risk_limits(control))
+    result = selected_strategy_result(data, control.strategy_settings, account_equity, limits)
     intent = result.get("live", {}).get("trade_intent")
     if intent is None:
         return 0, tracked_orders, "No BUY setup right now."
+    data_attrs = getattr(data, "attrs", {})
+    intent = reprice_trade_intent(intent, _number(data_attrs.get("latest_price"), _number(intent.entry_price if intent else 0)))
     intent = apply_buy_order_style(intent, control.order_style, control.limit_adjustment_pct, control.custom_limit_price)
-    if not bool(session.get("Open")) and intent is not None and intent.order_type != "limit":
+    if not market_open and intent is not None and intent.order_type != "limit":
         return 0, tracked_orders, "Outside-hours auto buys must be limit orders."
 
-    account_records = adapter.account_records()
-    account_equity = _account_value(account_records, "portfolio value", control.account_size)
-    available_cash = _account_value(account_records, "cash", 0.0)
-    limits = _risk_limits(control)
     intent = constrain_trade_intent_to_limits(
         intent,
         account_equity,
         limits,
-        current_portfolio_notional=_portfolio_notional(positions),
-        symbol_current_notional=_symbol_notional(positions, intent.symbol_clean if intent else ""),
+        current_portfolio_notional=_portfolio_notional(positions) + _open_buy_order_notional(orders),
+        symbol_current_notional=_symbol_notional(positions, intent.symbol_clean if intent else "") + _open_buy_order_notional(orders, intent.symbol_clean if intent else ""),
+        session_pnl=session_pnl,
         available_cash=available_cash,
     )
     risk = check_trade_intent(
@@ -281,14 +327,15 @@ def _send_entry(
         account_equity,
         limits,
         open_positions=_open_symbols(positions),
-        open_position_count=len(_open_symbols(positions)),
-        current_portfolio_notional=_portfolio_notional(positions),
-        symbol_current_notional=_symbol_notional(positions, intent.symbol_clean if intent else ""),
+        open_position_count=len(_open_symbols(positions) | _open_buy_order_symbols(orders)),
+        current_portfolio_notional=_portfolio_notional(positions) + _open_buy_order_notional(orders),
+        symbol_current_notional=_symbol_notional(positions, intent.symbol_clean if intent else "") + _open_buy_order_notional(orders, intent.symbol_clean if intent else ""),
+        session_pnl=session_pnl,
         available_cash=available_cash,
     )
     decision = ExecutionDecision("paper", risk.approved, False, "Background paper buy approved by deterministic rules." if risk.approved else "; ".join(risk.rejected_reasons), risk)
     preview = build_alpaca_order_preview(intent, decision, adapter.config)
-    duplicate_reasons = open_order_exposure_reasons(intent, orders, allow_duplicate=limits.allow_add_to_existing_position)
+    duplicate_reasons = open_order_exposure_reasons(intent, orders)
     if not preview.valid or duplicate_reasons:
         return 0, tracked_orders, "; ".join(preview.blocked_reasons + duplicate_reasons) or "Auto buy blocked."
 
@@ -337,22 +384,22 @@ def run_once(
     try:
         if not adapter.config.paper:
             raise RuntimeError("Background worker is paper-only. Set ALPACA_PAPER=true for this worker.")
-        positions = adapter.position_records()
-        orders = adapter.order_records()
+        positions = _strict_broker_records(adapter, "position_records")
+        orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(broker_store.read(), orders)
         tracked = _reconcile_positions(positions, tracked)
 
         cancel_count, cancel_action = _cancel_stale_limit_buys(control, adapter, orders, audit_store)
-        orders = adapter.order_records()
+        orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
         fetch_bars = _fetcher(control, adapter.config)
         exit_count, tracked, exit_action = _send_exits(control, adapter, positions, orders, tracked, fetch_bars, audit_store)
-        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, adapter.order_records()))
-        positions = adapter.position_records()
-        orders = adapter.order_records()
+        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
+        positions = _strict_broker_records(adapter, "position_records")
+        orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
         buy_count, tracked, buy_action = _send_entry(control, adapter, positions, orders, tracked, fetch_bars, audit_store)
-        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, adapter.order_records()))
+        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
 
         actions = [text for text in (cancel_action, exit_action, buy_action) if text]
         state = "Ready" if buy_count or exit_count or cancel_count else "Watching"

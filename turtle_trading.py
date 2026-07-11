@@ -3,10 +3,8 @@ import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
 from dataclasses import asdict, replace
-from datetime import UTC, datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from urllib.parse import urlencode
-from urllib.request import Request, urlopen
 import hashlib
 import json
 
@@ -30,8 +28,6 @@ from agentloop_trader.automation import (
     paper_automation_candidate_records,
     evidence_dashboard_records,
     paper_automation_dry_run,
-    strategy_settings_match,
-    strategy_settings_match_reason,
 )
 from agentloop_trader.automation_runtime import (
     AutomationControl,
@@ -93,8 +89,9 @@ from agentloop_trader.evidence import (
 )
 from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
-from agentloop_trader.market_data import build_company_research_context
+from agentloop_trader.market_data import build_company_research_context, fetch_alpaca_bars, fetch_yfinance_bars
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
+from agentloop_trader.strategy_runtime import reprice_trade_intent
 from agentloop_trader.monitoring import (
     broker_heartbeat_records,
     daily_risk_records,
@@ -168,7 +165,6 @@ from agentloop_trader.session_journal import (
 from agentloop_trader.shadow import record_shadow_decision, shadow_records
 from agentloop_trader.ui_summary import (
     agent_loop_stage_records,
-    agent_decision_summary,
     alpaca_evidence_summary_records,
     buy_requirement_records,
     compact_status_records,
@@ -176,7 +172,6 @@ from agentloop_trader.ui_summary import (
     no_buy_reason,
     operator_state_record,
     optional_quality_input_records,
-    optional_sell_quality_records,
     position_exit_plan_records,
     saved_records_overview_records,
     sell_requirement_records,
@@ -184,12 +179,6 @@ from agentloop_trader.ui_summary import (
     strategy_context_records,
     trade_evidence_summary_records,
 )
-
-try:
-    import yfinance as yf
-except ImportError:
-    yf = None
-
 
 st.set_page_config(page_title="AgentLoop Trader", layout="wide")
 
@@ -258,159 +247,12 @@ st.markdown("""
 
 @st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_data(ticker, period, interval):
-    if yf is None:
-        raise RuntimeError("yfinance is not installed. Run: pip install yfinance")
-    clean = ticker.strip().upper()
-    if not clean:
-        raise ValueError("Enter a ticker symbol.")
-
-    fetch_interval = "1h" if interval == "4h" else interval
-    kwargs = dict(
-        tickers=clean,
-        period=period,
-        interval=fetch_interval,
-        auto_adjust=True,
-        progress=False,
-        threads=False,
-        prepost=False,
-    )
-    try:
-        data = yf.download(**kwargs, multi_level_index=False)
-    except TypeError:
-        data = yf.download(**kwargs)
-
-    if data is None or data.empty:
-        raise ValueError(f"No price data returned for {clean}.")
-    if isinstance(data.columns, pd.MultiIndex):
-        levels = [list(map(str, data.columns.get_level_values(i))) for i in range(data.columns.nlevels)]
-        if clean in levels[-1]:
-            data = data.xs(clean, axis=1, level=-1)
-        elif clean in levels[0]:
-            data = data.xs(clean, axis=1, level=0)
-        else:
-            data.columns = data.columns.get_level_values(0)
-
-    required = ["Close", "High", "Low"]
-    missing = [c for c in required if c not in data.columns]
-    if missing:
-        raise ValueError(f"Missing columns: {', '.join(missing)}")
-
-    available_columns = required + (["Volume"] if "Volume" in data.columns else [])
-    data = data[available_columns].dropna(subset=required)
-    if data.empty:
-        raise ValueError(f"No usable rows for {clean}.")
-
-    if interval == "4h":
-        aggregations = {
-            "Close": "last",
-            "High": "max",
-            "Low": "min",
-        }
-        if "Volume" in data.columns:
-            aggregations["Volume"] = "sum"
-        data = data.resample("4h").agg(aggregations).dropna(subset=required)
-
-    data.attrs["symbol"] = clean
-    return data
-
-
-def alpaca_timeframe(interval: str) -> str:
-    return {
-        "1m": "1Min",
-        "5m": "5Min",
-        "15m": "15Min",
-        "30m": "30Min",
-        "1h": "1Hour",
-        "4h": "4Hour",
-        "1d": "1Day",
-    }.get(interval, "1Hour")
-
-
-def period_start_time(period: str) -> datetime:
-    now = datetime.now(UTC)
-    if period == "1d":
-        return now - timedelta(days=2)
-    if period == "5d":
-        return now - timedelta(days=7)
-    if period == "1mo":
-        return now - timedelta(days=31)
-    if period == "3mo":
-        return now - timedelta(days=93)
-    if period == "6mo":
-        return now - timedelta(days=186)
-    if period == "1y":
-        return now - timedelta(days=366)
-    if period == "2y":
-        return now - timedelta(days=732)
-    if period == "5y":
-        return now - timedelta(days=365 * 5 + 2)
-    if period == "10y":
-        return now - timedelta(days=365 * 10 + 3)
-    if period == "ytd":
-        return datetime(now.year, 1, 1, tzinfo=UTC)
-    if period == "max":
-        return now - timedelta(days=365 * 10 + 3)
-    return now - timedelta(days=366)
+    return fetch_yfinance_bars(ticker, period, interval)
 
 
 @st.cache_data(ttl=60, show_spinner=False)
 def fetch_alpaca_stock_data(ticker: str, period: str, interval: str, api_key: str | None, api_secret: str | None) -> pd.DataFrame:
-    clean = ticker.strip().upper()
-    if not clean:
-        raise ValueError("Enter a ticker symbol.")
-    if not api_key or not api_secret:
-        raise RuntimeError("Alpaca API key and secret are required for Alpaca price data.")
-
-    all_bars = []
-    page_token = ""
-    start_time = period_start_time(period).isoformat().replace("+00:00", "Z")
-    for _ in range(10):
-        params = {
-            "symbols": clean,
-            "timeframe": alpaca_timeframe(interval),
-            "start": start_time,
-            "adjustment": "all",
-            "feed": "iex",
-            "limit": 10000,
-        }
-        if page_token:
-            params["page_token"] = page_token
-        request = Request(
-            f"https://data.alpaca.markets/v2/stocks/bars?{urlencode(params)}",
-            headers={
-                "APCA-API-KEY-ID": api_key,
-                "APCA-API-SECRET-KEY": api_secret,
-                "Accept": "application/json",
-            },
-        )
-        with urlopen(request, timeout=20) as response:
-            payload = json.loads(response.read().decode("utf-8"))
-        all_bars.extend(payload.get("bars", {}).get(clean, []))
-        page_token = str(payload.get("next_page_token") or "")
-        if not page_token:
-            break
-
-    if not all_bars:
-        raise ValueError(f"No Alpaca price data returned for {clean}.")
-    data = pd.DataFrame(
-        [
-            {
-                "Date": bar.get("t"),
-                "Close": bar.get("c"),
-                "High": bar.get("h"),
-                "Low": bar.get("l"),
-                "Volume": bar.get("v"),
-            }
-            for bar in all_bars
-        ]
-    )
-    data["Date"] = pd.to_datetime(data["Date"], utc=True)
-    data = data.set_index("Date").sort_index()
-    data = data[["Close", "High", "Low", "Volume"]].dropna(subset=["Close", "High", "Low"])
-    if data.empty:
-        raise ValueError(f"No usable Alpaca rows for {clean}.")
-    data.attrs["symbol"] = clean
-    return data
+    return fetch_alpaca_bars(ticker, period, interval, api_key, api_secret)
 
 
 def fetch_price_data_for_source(symbol: str, history: str, interval_value: str, price_source: str) -> pd.DataFrame:
@@ -455,6 +297,33 @@ def normalized_order_status(value) -> str:
 def count_waiting_alpaca_orders(order_rows: list[dict]) -> int:
     waiting_statuses = {"accepted", "new", "pending_new", "partially_filled"}
     return sum(normalized_order_status(row.get("Status", row.get("status", ""))) in waiting_statuses for row in order_rows)
+
+
+def open_buy_order_notional(order_rows: list[dict], symbol: str = "") -> float:
+    clean_symbol = str(symbol).strip().upper()
+    total = 0.0
+    for row in order_rows:
+        if normalized_order_status(row.get("Status", "")) not in ACTIVE_ALPACA_ORDER_STATUSES:
+            continue
+        if normalized_order_status(row.get("Side", "")) != "buy":
+            continue
+        row_symbol = str(row.get("Symbol", "")).strip().upper()
+        if clean_symbol and row_symbol != clean_symbol:
+            continue
+        quantity = optional_float(row.get("Quantity")) or 0.0
+        filled_quantity = optional_float(row.get("Filled Qty")) or 0.0
+        price = first_available_number(row.get("Limit Price"), row.get("Avg Fill")) or 0.0
+        total += max(0.0, quantity - filled_quantity) * max(0.0, price)
+    return total
+
+
+def open_buy_order_symbols(order_rows: list[dict]) -> set[str]:
+    return {
+        str(row.get("Symbol", "")).strip().upper()
+        for row in order_rows
+        if normalized_order_status(row.get("Side", "")) == "buy"
+        and normalized_order_status(row.get("Status", "")) in ACTIVE_ALPACA_ORDER_STATUSES
+    }
 
 
 ACTIVE_ALPACA_ORDER_STATUSES = {
@@ -893,6 +762,7 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
     trigger = optional_float(exit_details.get("trigger_price"))
     distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
     profit_r = optional_float(exit_details.get("profit_r"))
+    highest_profit_r = optional_float(exit_details.get("highest_profit_r"))
     return [
         {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
         {"Area": "Position", "Item": "Shares", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current shares held at Alpaca."},
@@ -907,7 +777,8 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
         {"Area": "Exit plan", "Item": "Strategy exit", "Status / Value": money_or_missing(exit_details.get("strategy_exit_price")), "Plain English": "Exit line from the saved strategy settings."},
         {"Area": "Exit plan", "Item": "Original stop", "Status / Value": money_or_missing(exit_details.get("original_stop_price")), "Plain English": "Initial protective stop from the saved entry."},
         {"Area": "Exit plan", "Item": "Stop distance ATR multiplier", "Status / Value": str(settings.get("entry_stop_atr_multiplier", settings.get("atr_stop_multiplier", "Not recorded"))), "Plain English": "ATR multiplier used to set the original stop."},
-        {"Area": "Profit protection", "Item": "Profit in R", "Status / Value": f"{profit_r:.2f}R" if profit_r is not None else "Not available", "Plain English": "Profit compared with original trade risk."},
+        {"Area": "Profit protection", "Item": "Current profit in R", "Status / Value": f"{profit_r:.2f}R" if profit_r is not None else "Not available", "Plain English": "Current profit compared with original trade risk."},
+        {"Area": "Profit protection", "Item": "Highest profit reached in R", "Status / Value": f"{highest_profit_r:.2f}R" if highest_profit_r is not None else "Not available", "Plain English": "Highest price reached since entry compared with original trade risk. This turns profit protection on permanently."},
         {"Area": "Profit protection", "Item": "ATR trail", "Status / Value": money_or_missing(exit_details.get("trailing_stop_price")), "Plain English": "Highest high since entry minus the trailing ATR distance."},
         {"Area": "Profit protection", "Item": "Break-even stop", "Status / Value": money_or_missing(exit_details.get("breakeven_stop_price")), "Plain English": "Turns on after the saved profit threshold."},
         {"Area": "Automation", "Item": "Active sell trigger", "Status / Value": money_or_missing(trigger), "Plain English": f"Sell if price reaches this level or lower. Source: {exit_details.get('trigger_source', 'exit rule')}."},
@@ -1112,10 +983,6 @@ def set_automation_action(action: str, detail: str = "", checked_at: str | None 
     st.session_state["last_automation_action"] = action
     st.session_state["last_automation_blocked_reason"] = detail
     add_automation_history(action, detail, checked_at)
-
-
-def recent_automation_event_records() -> list[dict]:
-    return list(reversed(st.session_state.get("automation_event_history", [])))
 
 
 def strategy_use_case_records(selected_strategy: str) -> list[dict]:
@@ -1338,7 +1205,18 @@ def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> d
     ]
     if not matching_buys:
         return None
-    latest = matching_buys[-1]
+    def priority(order: dict) -> int:
+        status = normalized_order_status(order.get("status", order.get("Status", "")))
+        source = str(order.get("source", "")).strip().lower()
+        if source == "position_exit_settings" or status == "managed_exit_settings":
+            return 3
+        if status in {"filled", "partially_filled"}:
+            return 2
+        if source == "adopted_alpaca_position":
+            return 1
+        return 0
+
+    latest = max(enumerate(matching_buys), key=lambda item: (priority(item[1]), item[0]))[1]
     settings = dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
     settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
     settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
@@ -1433,10 +1311,24 @@ def show_blockers(title: str, blockers: list[str]) -> None:
         st.warning(f"{title}: " + " ".join(cleaned))
 
 
-def build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, selected_trade=None):
+def build_chart(
+    prices,
+    smas,
+    atrs,
+    entry_w,
+    exit_w,
+    ma_w,
+    labels,
+    trade_log,
+    selected_trade=None,
+    *,
+    strategy_type="breakout",
+    pullback_w=20,
+    market_data=None,
+):
     x = labels
-    dh = [float(np.max(prices[i - entry_w:i])) if i >= entry_w else None for i in range(len(prices))]
-    dl = [float(np.min(prices[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
+    highs = market_data["High"].to_numpy(dtype=float) if market_data is not None and "High" in market_data else prices
+    lows = market_data["Low"].to_numpy(dtype=float) if market_data is not None and "Low" in market_data else prices
     fig = go.Figure()
 
     fig.add_trace(go.Scatter(
@@ -1449,18 +1341,39 @@ def build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, se
         line=dict(color="#F0A830", width=1, dash="dot"),
         hovertemplate="%{x}<br>Trend filter: $%{y:.2f}<extra></extra>",
     ))
+    if strategy_type == "breakout":
+        entry_line = [float(np.max(highs[i - entry_w:i])) if i >= entry_w else None for i in range(len(prices))]
+        exit_line = [float(np.min(lows[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
+        fig.add_trace(go.Scatter(
+            x=x, y=entry_line, name=f"{entry_w}-bar entry high", mode="lines",
+            line=dict(color="#5DBF8A", width=1, dash="dash"),
+            hovertemplate="%{x}<br>Entry high: $%{y:.2f}<extra></extra>",
+        ))
+        fig.add_trace(go.Scatter(
+            x=x, y=exit_line, name=f"{exit_w}-bar exit low", mode="lines",
+            line=dict(color="#E8645A", width=1, dash="dash"),
+            hovertemplate="%{x}<br>Exit low: $%{y:.2f}<extra></extra>",
+        ))
+    elif strategy_type == "pullback":
+        pullback_line = [float(np.mean(prices[i - pullback_w + 1:i + 1])) if i + 1 >= pullback_w else None for i in range(len(prices))]
+        exit_line = [float(np.mean(prices[i - exit_w + 1:i + 1])) if i + 1 >= exit_w else None for i in range(len(prices))]
+        fig.add_trace(go.Scatter(
+            x=x, y=pullback_line, name=f"{pullback_w}-bar pullback average", mode="lines",
+            line=dict(color="#5DBF8A", width=1, dash="dash"),
+        ))
+        fig.add_trace(go.Scatter(
+            x=x, y=exit_line, name=f"{exit_w}-bar exit average", mode="lines",
+            line=dict(color="#E8645A", width=1, dash="dash"),
+        ))
+    else:
+        exit_line = [float(np.min(lows[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
+        fig.add_trace(go.Scatter(
+            x=x, y=exit_line, name=f"{exit_w}-bar exit low", mode="lines",
+            line=dict(color="#E8645A", width=1, dash="dash"),
+            hovertemplate="%{x}<br>Exit low: $%{y:.2f}<extra></extra>",
+        ))
     fig.add_trace(go.Scatter(
-        x=x, y=dh, name=f"{entry_w}-bar reference high", mode="lines",
-        line=dict(color="#5DBF8A", width=1, dash="dash"),
-        hovertemplate="%{x}<br>" + str(entry_w) + "-bar high: $%{y:.2f}<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=x, y=dl, name=f"{exit_w}-bar exit low", mode="lines",
-        line=dict(color="#E8645A", width=1, dash="dash"),
-        hovertemplate="%{x}<br>" + str(exit_w) + "-bar low: $%{y:.2f}<extra></extra>",
-    ))
-    fig.add_trace(go.Scatter(
-        x=x, y=atrs, name="ATR (14d)", mode="lines",
+        x=x, y=atrs, name="ATR (14 bars)", mode="lines",
         line=dict(color="#B07FE8", width=1, dash="dot"),
         yaxis="y2",
         hovertemplate="%{x}<br>ATR: $%{y:.2f}<extra></extra>",
@@ -1784,12 +1697,12 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
             if data_source == "Ticker (Alpaca)":
                 market_data_config = AlpacaConfig.from_env()
                 market_data = fetch_alpaca_stock_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
-                source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest bar {market_data.index[-1]}"
-                st.sidebar.caption(f"Loaded {len(market_data):,} Alpaca bars. Free IEX data can be delayed.")
+                source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca bars. Free IEX data can be delayed.")
             else:
                 market_data = fetch_stock_data(ticker, period, interval)
-                source_caption = f"{ticker} via yfinance ({period}, {interval}); latest bar {market_data.index[-1]}"
-                st.sidebar.caption(f"Loaded {len(market_data):,} yfinance bars. Yahoo intraday data may be delayed or limited.")
+                source_caption = f"{ticker} via yfinance ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                st.sidebar.caption(f"Loaded {len(market_data):,} completed yfinance bars. Yahoo intraday data may be delayed or limited.")
     except Exception as exc:
         st.error(f"Could not load {data_source} price data: {exc}")
         st.stop()
@@ -1926,12 +1839,12 @@ max_risk_limit = st.sidebar.slider(
     help="Hard cap on dollars at risk for one trade. If the stop loss would risk more than this, the app reduces size or blocks the trade.",
 )
 max_notional_limit = st.sidebar.slider(
-    "Max position notional (%)",
+    "Max new order size (%)",
     5.0,
     100.0,
     5.0,
     step=5.0,
-    help="Hard cap on position size as a percent of account value. Example: 25% on a $100,000 account allows up to $25,000 in one order.",
+    help="Hard cap on each new buy order as a percent of account value. Total exposure to one ticker is controlled separately by Max symbol concentration.",
 )
 max_portfolio_exposure = st.sidebar.slider(
     "Max portfolio exposure (%)",
@@ -1950,12 +1863,12 @@ max_symbol_concentration = st.sidebar.slider(
     help="Hard cap on exposure to one ticker. This prevents one symbol from becoming too large relative to the account.",
 )
 max_session_loss = st.sidebar.slider(
-    "Max session loss (%)",
+    "Max daily loss (%)",
     0.5,
     10.0,
     2.0,
     step=0.5,
-    help="Hard cap on loss for the current app session. If session loss reaches this level, new orders are blocked.",
+    help="Hard cap on today's account loss. For Alpaca this compares current equity with Alpaca's prior-day equity; new buys are blocked after the limit is reached.",
 )
 max_open_positions = st.sidebar.slider(
     "Max open positions",
@@ -2123,6 +2036,14 @@ alpaca_adapter = AlpacaBrokerAdapterStub(
 )
 broker_statuses = [paper_adapter.status(), alpaca_adapter.status()]
 alpaca_status = broker_statuses[1]
+alpaca_market_open = alpaca_adapter.market_is_open() if alpaca_status.connected else None
+if alpaca_market_open is not None:
+    current_market_advisory = {
+        "Market Session": "open" if alpaca_market_open else "closed_or_extended",
+        "Open": alpaca_market_open,
+        "Timestamp": pd.Timestamp.now(tz="America/Los_Angeles").isoformat(),
+        "Message": "Alpaca reports that the regular US equity session is open." if alpaca_market_open else "Alpaca reports that the regular US equity session is closed.",
+    }
 alpaca_account_mode = alpaca_adapter.config.account_mode
 alpaca_account_label = "Alpaca paper" if alpaca_adapter.config.paper else "Alpaca live"
 alpaca_order_noun = "paper" if alpaca_adapter.config.paper else "live"
@@ -2137,9 +2058,15 @@ alpaca_orders_enabled_for_mode = (
 alpaca_positions = alpaca_adapter.position_records() if alpaca_status.connected else []
 alpaca_orders = alpaca_adapter.order_records() if alpaca_status.connected else []
 alpaca_account_records = alpaca_adapter.account_records() if alpaca_status.connected else []
-alpaca_state_health = broker_state_health(alpaca_status.connected, alpaca_positions, alpaca_orders)
+alpaca_read_errors = getattr(alpaca_adapter, "read_errors", {})
+alpaca_state_health = broker_state_health(
+    alpaca_status.connected,
+    None if "positions" in alpaca_read_errors else alpaca_positions,
+    None if "orders" in alpaca_read_errors else alpaca_orders,
+)
 paper_positions_notional = sum(position.market_value for position in paper_broker.positions.values())
 alpaca_positions_notional = sum(float(row.get("Market Value") or 0) for row in alpaca_positions)
+alpaca_open_buy_notional = open_buy_order_notional(alpaca_orders)
 paper_equity = paper_broker.cash + paper_positions_notional
 session_pnl = paper_equity - st.session_state["paper_starting_cash"]
 alpaca_account_equity = first_available_number(
@@ -2150,6 +2077,10 @@ alpaca_account_cash = first_available_number(
     account_record_value(alpaca_account_records, "Cash"),
     account_record_value(alpaca_account_records, "Buying Power"),
 )
+alpaca_last_equity = first_available_number(
+    account_record_value(alpaca_account_records, "Last Equity"),
+    alpaca_account_equity,
+)
 use_alpaca_account_for_paper_risk = bool(enable_alpaca_paper_orders and alpaca_status.connected and alpaca_account_equity)
 paper_order_risk_equity = float(alpaca_account_equity) if use_alpaca_account_for_paper_risk else float(account)
 paper_order_available_cash = (
@@ -2157,8 +2088,16 @@ paper_order_available_cash = (
     if use_alpaca_account_for_paper_risk and alpaca_account_cash is not None
     else float(paper_broker.cash)
 )
-paper_order_portfolio_notional = alpaca_positions_notional if use_alpaca_account_for_paper_risk else paper_positions_notional + alpaca_positions_notional
-paper_order_session_pnl = 0.0 if use_alpaca_account_for_paper_risk else session_pnl
+paper_order_portfolio_notional = (
+    alpaca_positions_notional + alpaca_open_buy_notional
+    if use_alpaca_account_for_paper_risk
+    else paper_positions_notional + alpaca_positions_notional + alpaca_open_buy_notional
+)
+paper_order_session_pnl = (
+    float(alpaca_account_equity) - float(alpaca_last_equity)
+    if use_alpaca_account_for_paper_risk and alpaca_last_equity is not None
+    else session_pnl
+)
 paper_order_account_source = "Alpaca paper account" if use_alpaca_account_for_paper_risk else "Simulator account"
 effective_kill_switch = kill_switch
 risk_limits = RiskLimits(
@@ -2261,6 +2200,12 @@ smas = selected_strategy_result["smas"]
 atrs = selected_strategy_result["atrs"]
 trade_log = selected_strategy_result["trade_log"]
 live = selected_strategy_result["live"]
+latest_market_price = optional_float(market_data.attrs.get("latest_price")) if market_data is not None else None
+if latest_market_price is not None:
+    live["signal_bar_price"] = live.get("last_p")
+    live["latest_price"] = latest_market_price
+    live["trade_intent"] = reprice_trade_intent(live.get("trade_intent"), latest_market_price)
+    live["last_p"] = latest_market_price
 stats = selected_strategy_result["stats"]
 labels = selected_strategy_result["labels"]
 comparison_rows = strategy_comparison_records({
@@ -2274,7 +2219,7 @@ for row in comparison_rows:
 
 walk_forward_result = None
 walk_forward_error = None
-if run_walk_forward and strategy_type == "breakout":
+if run_walk_forward:
     try:
         walk_forward_result = evaluate_walk_forward(
             account=account,
@@ -2287,11 +2232,12 @@ if run_walk_forward and strategy_type == "breakout":
             market_data=market_data,
             train_fraction=train_fraction,
             risk_limits=risk_limits,
+            strategy_type=strategy_type,
+            pullback_w=pullback_w,
+            momentum_w=momentum_w,
         )
     except ValueError as exc:
         walk_forward_error = str(exc)
-elif run_walk_forward and strategy_type in {"pullback", "trendline", "trendline_retest"}:
-    walk_forward_error = "Newer-data test is currently available for channel breakout only."
 
 current_strategy_config = StrategyConfig(
     name=strategy_label,
@@ -2493,7 +2439,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
                 seed=None,
                 market_data=data,
             )
-        current_price = optional_float(saved_live.get("last_p"))
+        current_price = first_available_number(data.attrs.get("latest_price"), saved_live.get("last_p"))
         strategy_exit_price = optional_float(saved_live.get("exit_level"))
         current_atr = optional_float(saved_live.get("last_atr"))
         profit_protection_enabled = bool(settings.get("profit_protection_enabled", True))
@@ -2511,20 +2457,25 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             settings.get("entry_reference_price"),
             current_price,
         )
-        original_stop_price = first_available_number(
-            settings.get("entry_stop_loss"),
-            entry_reference_price - saved_atr_mult * current_atr
-            if entry_reference_price is not None and current_atr is not None
-            else None,
-        )
+        saved_entry_reference = first_available_number(settings.get("planned_entry_price"), settings.get("entry_reference_price"))
+        saved_entry_stop = optional_float(settings.get("entry_stop_loss"))
         initial_risk = first_available_number(
             settings.get("entry_stop_distance"),
-            entry_reference_price - original_stop_price
-            if entry_reference_price is not None and original_stop_price is not None
+            saved_entry_reference - saved_entry_stop
+            if saved_entry_reference is not None and saved_entry_stop is not None
             else None,
         )
         if initial_risk is not None and initial_risk <= 0:
             initial_risk = None
+        original_stop_price = first_available_number(
+            entry_reference_price - initial_risk
+            if entry_reference_price is not None and initial_risk is not None
+            else None,
+            saved_entry_stop,
+            entry_reference_price - saved_atr_mult * current_atr
+            if entry_reference_price is not None and current_atr is not None
+            else None,
+        )
         profit_r = (
             (current_price - entry_reference_price) / initial_risk
             if current_price is not None and entry_reference_price is not None and initial_risk
@@ -2542,24 +2493,33 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             if not since_entry.empty:
                 high_data = since_entry
         current_high_since_entry = optional_float(high_data["High"].max()) if "High" in high_data.columns and not high_data.empty else None
+        current_high_since_entry = max(
+            [value for value in (current_high_since_entry, optional_float(data.attrs.get("latest_high"))) if value is not None],
+            default=None,
+        )
         saved_high_since_entry = optional_float(settings.get("highest_high_since_entry"))
         highest_high_since_entry = max(
             [value for value in [current_high_since_entry, saved_high_since_entry, entry_reference_price] if value is not None],
             default=None,
         )
+        highest_profit_r = (
+            (highest_high_since_entry - entry_reference_price) / initial_risk
+            if highest_high_since_entry is not None and entry_reference_price is not None and initial_risk
+            else None
+        )
         breakeven_stop_price = (
             entry_reference_price
             if profit_protection_enabled
-            and profit_r is not None
-            and profit_r >= breakeven_after_r
+            and highest_profit_r is not None
+            and highest_profit_r >= breakeven_after_r
             and entry_reference_price is not None
             else None
         )
         trailing_stop_price = (
             highest_high_since_entry - trailing_atr_multiplier * current_atr
             if profit_protection_enabled
-            and profit_r is not None
-            and profit_r >= trail_after_r
+            and highest_profit_r is not None
+            and highest_profit_r >= trail_after_r
             and highest_high_since_entry is not None
             and current_atr is not None
             else None
@@ -2598,6 +2558,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             "trailing_stop_price": trailing_stop_price,
             "highest_high_since_entry": highest_high_since_entry,
             "profit_r": profit_r,
+            "highest_profit_r": highest_profit_r,
             "initial_risk": initial_risk,
             "current_atr": current_atr,
             "state_changed": state_changed,
@@ -2706,6 +2667,7 @@ symbol_current_notional = 0.0
 if not use_alpaca_account_for_paper_risk and intent_symbol in paper_broker.positions:
     symbol_current_notional += paper_broker.positions[intent_symbol].market_value
 symbol_current_notional += sum(float(row.get("Market Value") or 0) for row in alpaca_positions if str(row.get("Symbol", "")).strip().upper() == intent_symbol)
+symbol_current_notional += open_buy_order_notional(alpaca_orders, intent_symbol)
 raw_intent_quantity = intent.quantity if intent else None
 intent = constrain_trade_intent_to_limits(
     intent,
@@ -2756,7 +2718,7 @@ risk_check = check_trade_intent(
     account_equity=paper_order_risk_equity,
     limits=risk_limits,
     open_positions=trade_open_position_symbols,
-    open_position_count=len(trade_open_position_symbols),
+    open_position_count=len(trade_open_position_symbols | open_buy_order_symbols(alpaca_orders)),
     current_portfolio_notional=paper_order_portfolio_notional,
     symbol_current_notional=symbol_current_notional,
     session_pnl=paper_order_session_pnl,
@@ -2931,6 +2893,17 @@ else:
     final_answer = "WAIT"
     final_detail = strategy_decision_detail()
 answer_color = {"TRADE": "#3B6D11", "WAIT": "#8A6D1D", "BLOCK": "#A32D2D"}[final_answer]
+if final_answer == "TRADE":
+    new_trade_next_action = (
+        "Send the paper buy order to Alpaca."
+        if execution_mode == "paper"
+        else "Switch Order mode to Paper trading when you want to send this BUY."
+    )
+elif final_answer == "BLOCK":
+    first_trade_blocker = next(iter(preflight_check.blocked_reasons or risk_check.rejected_reasons), "A trade check is blocking this BUY.")
+    new_trade_next_action = f"Resolve this BUY blocker: {first_trade_blocker}"
+else:
+    new_trade_next_action = "Wait for the selected strategy's required BUY rules to pass."
 research_agent_report = build_research_agent_report(
     ticker=ticker,
     selected_strategy=strategy_label,
@@ -2938,7 +2911,7 @@ research_agent_report = build_research_agent_report(
     setup_rows=setup_scorecard_rows,
     final_read=final_answer,
     decision_detail=final_detail,
-    next_action=operator_state["Next Action"],
+    next_action=new_trade_next_action,
 )
 research_snapshot_key = hashlib.sha256(
     json.dumps(
@@ -2948,7 +2921,7 @@ research_snapshot_key = hashlib.sha256(
             "settings": current_strategy_settings,
             "final_read": final_answer,
             "best_strategy": research_agent_report.best_strategy,
-            "next_action": operator_state["Next Action"],
+            "next_action": new_trade_next_action,
         },
         sort_keys=True,
         default=str,
@@ -3440,37 +3413,6 @@ def render_automation_status() -> None:
         st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), width="stretch", hide_index=True)
 
 
-def render_daily_automation_panel() -> None:
-    status_label, status_detail, status_kind = automation_status_text()
-    panel_cols = st.columns(5)
-    metric_card(panel_cols[0], "Automation", automation_level_label.split(" - ")[0], "Sidebar setting")
-    metric_card(panel_cols[1], "Status", status_label, status_detail)
-    metric_card(panel_cols[2], "Last Check", st.session_state.get("last_automation_checked_at", "Not checked yet"), f"Every {automation_refresh_seconds}s")
-    metric_card(panel_cols[3], "Last Action", st.session_state.get("last_automation_action", "None"), st.session_state.get("last_automation_blocked_reason", "") or "No blocker")
-    metric_card(panel_cols[4], "Kill Switch", "On" if effective_kill_switch else "Off", "Blocks all paper orders" if effective_kill_switch else "Orders allowed")
-    if active_automation_level == "Auto exits only":
-        st.caption("Daily default: you approve buys manually; the app watches open positions and sells when their saved exit rule triggers.")
-    elif active_automation_level == "Auto entries and exits" and not full_automation_enabled:
-        st.caption("Auto entries and exits is selected, but automatic buys are off until Enable Automation is checked in the sidebar.")
-    if paper_buy_order_style != "Market":
-        limit_cancel_text = (
-            f"Unfilled limit buys auto-cancel after {stale_limit_order_label}."
-            if auto_cancel_stale_limit_orders
-            else "Unfilled limit buys stay open until you cancel them or Alpaca expires them."
-        )
-        st.caption(limit_cancel_text)
-    recent_actions = recent_automation_event_records()
-    if show_portfolio_evidence:
-        with st.expander("Automation watch details *", expanded=False):
-            st.dataframe(pd.DataFrame(automation_watch_records()), width="stretch", hide_index=True)
-            if recent_actions:
-                st.markdown("#### Last 5 automation actions *")
-                st.dataframe(pd.DataFrame(recent_actions), width="stretch", hide_index=True)
-    elif recent_actions:
-        with st.expander("Last 5 automation actions", expanded=False):
-            st.dataframe(pd.DataFrame(recent_actions), width="stretch", hide_index=True)
-
-
 def render_open_positions_panel() -> None:
     position_settings_by_symbol = {
         str(position.get("Symbol", "")).strip().upper(): (
@@ -3782,9 +3724,6 @@ def render_open_positions_panel() -> None:
             st.caption("No saved entry settings found for this position.")
 
 
-st.markdown("### Automation status")
-render_daily_automation_panel()
-
 command_center_view = st.radio(
     "Command center page",
     ["Open Positions", "Ideas", "New Trade", "Alpaca", "Paper Review"],
@@ -3868,42 +3807,22 @@ elif command_center_view == "New Trade":
     metric_card(desk_cols[0], "Final Answer", final_answer, final_detail)
     metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
     metric_card(desk_cols[2], "Strategy", strategy_label, "Selected in the sidebar")
-    metric_card(desk_cols[3], "Session P&L", f"${session_pnl:,.2f}", "Since reset", "pos" if session_pnl >= 0 else "neg")
-    st.markdown(
-        f"**Final answer:** "
-        f"<span style='color:{answer_color};font-weight:700'>{final_answer}</span> - {final_detail}",
-        unsafe_allow_html=True,
-    )
-    st.info(f"Next action: {operator_state['Next Action']}")
-    st.markdown(
-        agent_decision_summary(
-            intent_present=intent is not None,
-            thesis=trade_proposal.thesis.thesis,
-            blocked_reasons=preflight_check.blocked_reasons or risk_check.rejected_reasons,
-            next_action=operator_state["Next Action"],
-        )
-    )
-    st.markdown("#### Research agent read")
+    metric_card(desk_cols[3], "Account P&L today", f"${paper_order_session_pnl:,.2f}", paper_order_account_source, "pos" if paper_order_session_pnl >= 0 else "neg")
+    st.info(f"Next action: {new_trade_next_action}")
+    st.markdown("#### Research read")
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
-    st.info(research_agent_report.best_strategy_reason)
-    st.markdown("#### Research loop")
-    st.dataframe(pd.DataFrame(research_loop_rows), width="stretch", hide_index=True)
     st.markdown("#### Automation readiness")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("New trade")), width="stretch", hide_index=True)
     with st.expander("Compare the four strategies", expanded=False):
         st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
-        with st.expander("Detailed setup evidence *", expanded=False):
-            st.markdown("#### Trade read *")
-            st.dataframe(pd.DataFrame(trade_read_records()), width="stretch", hide_index=True)
-            st.markdown("#### Decision ticket *")
-            st.dataframe(pd.DataFrame(decision_ticket_records()), width="stretch", hide_index=True)
-            st.markdown("#### Setup quality details *")
+        with st.expander("Detailed research records *", expanded=False):
+            st.markdown("#### Research loop *")
+            st.dataframe(pd.DataFrame(research_loop_rows), width="stretch", hide_index=True)
+            st.markdown("#### Setup details *")
             st.dataframe(pd.DataFrame(setup_scorecard_rows), width="stretch", hide_index=True)
             st.markdown("#### Required BUY rules *")
             st.dataframe(pd.DataFrame(buy_requirement_records(live)), width="stretch", hide_index=True)
-            st.markdown("#### Quality input definitions *")
-            st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), width="stretch", hide_index=True)
             st.markdown("#### Strategy use cases *")
             st.dataframe(pd.DataFrame(strategy_use_case_records(strategy_label)), width="stretch", hide_index=True)
             st.markdown("#### Saved research reads *")
@@ -3960,14 +3879,6 @@ elif command_center_view == "New Trade":
             )
 elif command_center_view == "Alpaca":
     sub_section("1.4 Alpaca account", "Check broker connection, paper account status, and current Alpaca counts.")
-    risk_broker_rows = [
-        {"Item": "Alpaca connected", "Value": plain_yes_no(alpaca_status.connected)},
-        {"Item": "Use Alpaca paper account", "Value": plain_yes_no(enable_alpaca_paper_orders)},
-        {"Item": "Open Alpaca positions", "Value": len(alpaca_positions)},
-        {"Item": "Alpaca orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders)},
-        {"Item": "Alpaca data fresh", "Value": plain_yes_no(not alpaca_state_health.stale)},
-    ]
-    st.dataframe(pd.DataFrame(risk_broker_rows), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         st.markdown("#### Broker details *")
         st.dataframe(pd.DataFrame(broker_status_records(broker_statuses)), width="stretch", hide_index=True)
@@ -4094,7 +4005,20 @@ if command_center_view == "New Trade":
     selected_idx = st.session_state.get("selected_trade_idx", None)
     selected_trade = trade_log[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(trade_log) else None
     st.plotly_chart(
-        build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, selected_trade),
+        build_chart(
+            prices,
+            smas,
+            atrs,
+            entry_w,
+            exit_w,
+            ma_w,
+            labels,
+            trade_log,
+            selected_trade,
+            strategy_type=strategy_type,
+            pullback_w=pullback_w,
+            market_data=market_data,
+        ),
         width="stretch",
         config={"scrollZoom": True},
     )
@@ -4111,6 +4035,7 @@ if command_center_view == "New Trade":
             "Position $": t.get("notional", round(t["entry"] * t["shares"], 2)),
             "Risk $": t.get("risk_dollars", ""),
             "Risk %": t.get("risk_pct", ""),
+            "Worst Intratrade P&L $": t.get("max_adverse_pnl", ""),
             "Stop $": t["stop"],
             "Exit Rule": str(t.get("exit_rule", "Exit rule")).title(),
             "P&L $": t["pnl"],
@@ -4147,7 +4072,7 @@ if command_center_view == "New Trade":
     st.info(f"Current trading rule: {strategy_label}. Only the selected strategy can create the trade idea shown in this run.")
     c1, c2, c3, c4 = st.columns(4)
     pnl_color = "pos" if stats["total_pnl"] >= 0 else "neg"
-    metric_card(c1, "Final equity", f"${stats['final_equity']:,}", f"Started ${account:,}")
+    metric_card(c1, "Final equity", f"${stats['final_equity']:,}", "Includes any open simulated trade")
     metric_card(c2, "Total P&L", f"${stats['total_pnl']:,}", f"{stats['return_pct']}% return", pnl_color)
     metric_card(c3, "Win rate", f"{stats['win_rate']}%", f"{stats['wins']}W / {stats['losses']}L of {stats['total_trades']} trades")
     metric_card(c4, "Avg win/loss", f"{stats['rr_ratio']}x", "Average winner vs loser")
@@ -4156,8 +4081,13 @@ if command_center_view == "New Trade":
     metric_card(c5, "Worst drop", f"{stats['max_drawdown_pct']}%", "Largest equity pullback")
     metric_card(c6, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
     metric_card(c7, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
-    st.markdown("#### Exit model used in this backtest")
-    st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
+    with st.expander("Backtest assumptions and exit model", expanded=False):
+        st.markdown(
+            "Historical signals use completed bars. Entries use the signal-bar close. "
+            "Protective stops fill at the stop price, or at the bar open after a gap below the stop. "
+            "The test does not estimate commissions, spread, or slippage."
+        )
+        st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
     
     with st.expander("Optional strategy tests" + (" *" if show_portfolio_evidence else ""), expanded=False):
         st.markdown("#### Strategy comparison")
@@ -4230,7 +4160,10 @@ if command_center_view == "New Trade":
                             width="stretch",
                             hide_index=True,
                         )
-            st.caption("This recommends strategy inputs only. It does not change risk limits, broker access, order mode, credentials, or the Kill Switch.")
+            st.caption(
+                "This is a bounded comparison of nearby settings, not proof of a universal optimum. "
+                "It does not change account risk limits, broker access, order mode, credentials, or the Kill Switch."
+            )
     
     if show_portfolio_evidence:
         page_section("3. Trade details *", "Full Records view only: detailed trade rules, agent notes, and risk records.")
@@ -4291,7 +4224,6 @@ if command_center_view == "New Trade":
             if not checks_df.empty:
                 st.dataframe(checks_df, width="stretch", hide_index=True)
 if command_center_view == "Alpaca":
-    page_section("4. Alpaca paper trading", "Check the paper account, send paper orders, and control automation from one place.")
     st.info(f"{operator_state['State']}: {operator_state['Next Action']}")
     if show_portfolio_evidence:
         st.markdown("#### Alpaca evidence summary *")
@@ -4310,7 +4242,7 @@ if command_center_view == "Alpaca":
             width="stretch",
             hide_index=True,
         )
-    sub_section("4.1 Account status", "Current Alpaca paper connection, positions, and orders.")
+    st.markdown("#### Account overview")
     st.dataframe(pd.DataFrame(alpaca_daily_summary_records()), width="stretch", hide_index=True)
     with st.expander("Account, positions, and orders" + (" *" if show_portfolio_evidence else ""), expanded=False):
         if show_portfolio_evidence:
@@ -4367,7 +4299,7 @@ if command_center_view == "Alpaca":
             metric_card(portfolio_cols[1], "Session P&L", f"${session_pnl:,.2f}", "Since last reset", session_color)
             metric_card(portfolio_cols[2], "Simulator exposure", f"${paper_positions_notional:,.2f}", "Book value")
     
-    sub_section("4.2 Trading status")
+    st.markdown("#### Trading status")
     monitor_color = {"OK": "#3B6D11", "WARN": "#8A6D1D", "BREACH": "#A32D2D"}.get(monitoring_result.status, "inherit")
     monitor_label = {"OK": "OK", "WARN": "Needs attention", "BREACH": "Blocked"}.get(monitoring_result.status, monitoring_result.status)
     st.markdown(
@@ -4402,7 +4334,8 @@ if command_center_view == "Alpaca":
     
     render_automation_status()
 
-    sub_section("4.4 Alpaca order actions", "Send a buy, sell an open position, or cancel a waiting order for the configured Alpaca account.")
+    st.markdown("#### Order actions")
+    st.caption("Send a buy, sell an open position, or cancel a waiting order for the configured Alpaca account.")
     if waiting_limit_buy_rows:
         st.markdown("#### Waiting limit buys")
         st.dataframe(pd.DataFrame(waiting_limit_buy_rows), width="stretch", hide_index=True)
@@ -4410,15 +4343,14 @@ if command_center_view == "Alpaca":
             st.caption(f"Auto-cancel is on: an unfilled BUY limit order is canceled after {stale_limit_order_label}.")
         else:
             st.caption("Auto-cancel is off: waiting limit buys stay open until you cancel them or Alpaca expires them.")
-    if auto_cancel_stale_limit_orders or waiting_limit_buy_rows:
-        st.markdown("#### Limit buy auto-cancel status")
-        st.dataframe(
-            pd.DataFrame(stale_limit_cancel_status_records(managed_cancelable_alpaca_orders, stale_limit_order_minutes)),
-            width="stretch",
-            hide_index=True,
-        )
-        if show_portfolio_evidence:
-            with st.expander("Limit buy detection details *", expanded=False):
+    if show_portfolio_evidence and (auto_cancel_stale_limit_orders or waiting_limit_buy_rows):
+        with st.expander("Limit buy auto-cancel details *", expanded=False):
+            st.dataframe(
+                pd.DataFrame(stale_limit_cancel_status_records(managed_cancelable_alpaca_orders, stale_limit_order_minutes)),
+                width="stretch",
+                hide_index=True,
+            )
+            if managed_cancelable_alpaca_orders:
                 st.dataframe(
                     pd.DataFrame(cancelable_order_debug_records(managed_cancelable_alpaca_orders)),
                     width="stretch",

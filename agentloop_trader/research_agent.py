@@ -72,21 +72,24 @@ def _strategy_score(name: str, result: dict[str, Any]) -> StrategyFit:
     if signal == "long":
         score += 3.0
     score += rule_ratio * 2.0
-    if trades > 0:
+    if trades >= 3:
         score += 0.5
-    if return_pct > 0:
+    elif trades > 0:
+        score -= 1.0
+    score += max(-1.5, min(1.5, return_pct / 10.0))
+    if profit_factor >= 1.2:
         score += 1.0
-    if profit_factor >= 1.0:
-        score += 1.0
+    elif trades > 0 and profit_factor < 1.0:
+        score -= 1.0
     if win_rate >= 50:
         score += 0.5
-    if max_drawdown >= 25:
-        score -= 0.5
+    score -= min(2.0, max_drawdown / 20.0)
 
     status = "Buy setup" if signal == "long" else "Waiting"
     reason = (
         f"{passed_rules}/{total_rules} buy rules pass; "
-        f"backtest return {return_pct:.2f}%, win rate {win_rate:.0f}%, profit factor {profit_factor:.2f}."
+        f"{trades} completed trades, return {return_pct:.2f}%, win rate {win_rate:.0f}%, "
+        f"profit factor {profit_factor:.2f}, worst drop {max_drawdown:.2f}%."
     )
     return StrategyFit(strategy=name, status=status, score=round(score, 2), reason=reason)
 

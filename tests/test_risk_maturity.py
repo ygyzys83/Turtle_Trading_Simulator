@@ -55,7 +55,19 @@ def test_risk_rejects_session_loss_breach():
     )
 
     assert not result.approved
-    assert any("Session loss" in reason for reason in result.rejected_reasons)
+    assert any("Daily loss" in reason for reason in result.rejected_reasons)
+
+
+def test_daily_loss_limit_uses_prior_day_equity_not_reduced_current_equity():
+    result = check_trade_intent(
+        _intent(),
+        account_equity=98_000,
+        limits=RiskLimits(allowed_symbols=("AAPL",), max_session_loss_pct=2),
+        session_pnl=-2_000,
+    )
+
+    assert result.approved
+    assert result.checks["session_loss_within_limit"]
 
 
 def test_preflight_reports_ready_when_risk_execution_broker_and_audit_pass():

@@ -118,6 +118,23 @@ def test_optimizer_searches_all_strategies_and_returns_display_records():
 
     assert result.tested_candidates > 0
     assert result.best is not None
+    assert result.best.tested_periods >= 2
+    assert 0 <= result.best.profitable_test_periods <= result.best.tested_periods
     assert result.candidates == sorted(result.candidates, key=lambda row: row.score, reverse=True)
     assert optimizer_recommendation_records(result)
     assert optimizer_candidate_records(result.candidates)
+
+
+def test_optimizer_candidate_subset_varies_more_than_one_input_dimension():
+    current_settings = {
+        "entry_window": 20, "exit_window": 10, "atr_stop_multiplier": 2.0,
+        "risk_per_trade_pct": 1.0, "moving_average_window": 50,
+        "pullback_average_length": 20, "momentum_turn_length": 5,
+    }
+
+    rows = generate_optimizer_settings(current_settings, max_candidates_per_strategy=18)
+    breakout = [settings for _, strategy, settings in rows if strategy == "breakout"]
+
+    assert len({row["entry_window"] for row in breakout}) > 1
+    assert len({row["atr_stop_multiplier"] for row in breakout}) > 1
+    assert len({row["moving_average_window"] for row in breakout}) > 1

@@ -4,6 +4,7 @@ import numpy as np
 
 from agentloop_trader.data import generate_synthetic_prices
 from agentloop_trader.indicators import calc_atr, calc_rsi, calc_sma
+from agentloop_trader.market_data import validate_price_bars
 from agentloop_trader.models import BacktestResult, RiskLimits, StrategyConfig, TradeIntent
 
 
@@ -37,8 +38,8 @@ def _build_stats(
     win_rate = round(len(wins) / len(trade_log) * 100) if trade_log else 0
     avg_win = round(gross_wins / len(wins), 2) if wins else 0
     avg_loss = round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0
-    rr = round(abs(avg_win / avg_loss), 2) if avg_loss else 0
-    profit_factor = round(gross_wins / gross_losses, 2) if gross_losses else 0
+    rr = round(abs(avg_win / avg_loss), 2) if avg_loss else (99.0 if avg_win > 0 else 0)
+    profit_factor = round(gross_wins / gross_losses, 2) if gross_losses else (99.0 if gross_wins > 0 else 0)
     exposure_pct = round(exposure_bars / total_bars * 100, 2) if total_bars else 0
 
     result = BacktestResult(
@@ -127,10 +128,16 @@ def _trade_record(
     stop_price: float,
     account: float,
     exit_rule: str = "Exit rule",
+    lowest_price_since_entry: float | None = None,
 ) -> dict:
+    entry_price = round(float(entry_price), 2)
+    exit_price = round(float(exit_price), 2)
+    stop_price = round(float(stop_price), 2)
     pnl = (exit_price - entry_price) * shares
     notional = entry_price * shares
     risk_dollars = abs(entry_price - stop_price) * shares
+    adverse_price = min(entry_price, float(lowest_price_since_entry)) if lowest_price_since_entry is not None else entry_price
+    max_adverse_pnl = (adverse_price - entry_price) * shares
     return {
         "trade": trade_number,
         "symbol": symbol,
@@ -138,13 +145,15 @@ def _trade_record(
         "exit_date": labels[exit_bar],
         "entry_bar": entry_bar,
         "exit_bar": exit_bar,
-        "entry": round(entry_price, 2),
-        "exit": round(exit_price, 2),
+        "entry": entry_price,
+        "exit": exit_price,
         "shares": shares,
         "notional": round(notional, 2),
         "risk_dollars": round(risk_dollars, 2),
         "risk_pct": round(risk_dollars / account * 100, 2) if account else 0,
-        "stop": round(stop_price, 2),
+        "max_adverse_pnl": round(max_adverse_pnl, 2),
+        "max_adverse_pct": round(max_adverse_pnl / account * 100, 2) if account else 0,
+        "stop": stop_price,
         "exit_rule": exit_rule,
         "pnl": round(pnl, 2),
         "pct_acct": round(pnl / account * 100, 2) if account else 0,
@@ -169,12 +178,26 @@ def _profit_protection_stop(
     if strategy_exit_price is not None:
         candidates.append(("strategy exit", strategy_exit_price))
     if initial_risk > 0:
-        profit_r = (current_price - entry_price) / initial_risk
-        if profit_r >= breakeven_after_r:
+        highest_profit_r = (high_since_entry - entry_price) / initial_risk
+        if highest_profit_r >= breakeven_after_r:
             candidates.append(("break-even stop", entry_price))
-        if profit_r >= trail_after_r and current_atr is not None:
+        if highest_profit_r >= trail_after_r and current_atr is not None:
             candidates.append(("ATR trail", high_since_entry - trailing_atr_multiplier * current_atr))
     return max(candidates, key=lambda item: item[1])
+
+
+def _bar_open_prices(prices, market_data=None):
+    if market_data is not None and "Open" in market_data.columns:
+        clean = validate_price_bars(market_data, str(getattr(market_data, "attrs", {}).get("symbol", "MARKET")))
+        return clean["Open"].to_numpy(dtype=float)
+    return np.asarray(prices, dtype=float)
+
+
+def _protective_stop_fill(open_price: float, low_price: float, stop_price: float) -> float | None:
+    """Fill at the stop, or at the open when the bar gaps below it."""
+    if low_price > stop_price:
+        return None
+    return float(open_price if open_price < stop_price else stop_price)
 
 
 def _market_arrays(seed: int | None, market_data=None):
@@ -185,14 +208,75 @@ def _market_arrays(seed: int | None, market_data=None):
         labels = [f"Day {i + 1}" for i in range(n_bars)]
         symbol = "SYNTH"
     else:
+        market_data = validate_price_bars(market_data, str(getattr(market_data, "attrs", {}).get("symbol", "MARKET")))
         prices = market_data["Close"].to_numpy(dtype=float)
         highs = market_data["High"].to_numpy(dtype=float)
         lows = market_data["Low"].to_numpy(dtype=float)
         volumes = market_data["Volume"].to_numpy(dtype=float) if "Volume" in market_data else None
         n_bars = len(prices)
-        labels = market_data.index.strftime("%Y-%m-%d").tolist()
+        has_intraday_times = any(
+            getattr(timestamp, "hour", 0) or getattr(timestamp, "minute", 0)
+            for timestamp in market_data.index[: min(len(market_data), 100)]
+        )
+        labels = market_data.index.strftime("%Y-%m-%d %H:%M" if has_intraday_times else "%Y-%m-%d").tolist()
         symbol = str(getattr(market_data, "attrs", {}).get("symbol", "MARKET"))
     return prices, highs, lows, volumes, n_bars, labels, symbol
+
+
+def _trendline_crossed(prices, line: tuple[float, float, tuple[int, int]] | None, index: int) -> tuple[bool, float | None]:
+    if line is None or index <= 0:
+        return False, None
+    intercept, slope, (x1, _) = line
+    current_level = _trendline_value(intercept, slope, x1, index)
+    previous_level = _trendline_value(intercept, slope, x1, index - 1)
+    crossed = float(prices[index - 1]) <= previous_level and float(prices[index]) > current_level
+    return bool(crossed), current_level
+
+
+def _live_retest_context(
+    prices,
+    highs,
+    lows,
+    smas,
+    atrs,
+    momentum_smas,
+    index: int,
+    lookback: int,
+) -> tuple[bool, float | None, float | None]:
+    """Reconstruct a prior trendline breakout and later retest for the live bar."""
+    source = highs if highs is not None else prices
+    start = max(lookback, index - lookback)
+    latest: tuple[int, float, float, int] | None = None
+    for breakout_index in range(start, index):
+        line = _recent_descending_trendline(source, breakout_index, lookback)
+        crossed, _ = _trendline_crossed(prices, line, breakout_index)
+        sma = smas[breakout_index]
+        prev_sma = smas[breakout_index - 1] if breakout_index > 0 else sma
+        trend_ok = bool(sma is not None and prev_sma is not None and prices[breakout_index] > sma and sma >= prev_sma)
+        if crossed and trend_ok and line is not None:
+            intercept, slope, (x1, _) = line
+            latest = (breakout_index, intercept, slope, x1)
+    if latest is None:
+        return False, None, None
+    breakout_index, intercept, slope, x1 = latest
+    retest_seen = False
+    for retest_index in range(breakout_index + 1, index + 1):
+        atr = atrs[retest_index]
+        if atr is None:
+            continue
+        level = _trendline_value(intercept, slope, x1, retest_index)
+        low_value = float(lows[retest_index]) if lows is not None else float(prices[retest_index])
+        if low_value <= level + float(atr) * 0.5 and float(prices[retest_index]) >= level:
+            retest_seen = True
+    current_level = _trendline_value(intercept, slope, x1, index)
+    momentum_sma = momentum_smas[index]
+    momentum_turn = bool(
+        retest_seen
+        and momentum_sma is not None
+        and float(prices[index]) > float(momentum_sma)
+        and float(prices[index]) > float(prices[index - 1])
+    )
+    return momentum_turn and float(prices[index]) >= current_level, current_level, slope
 
 
 def _volume_status(volumes, index: int, window: int = 20) -> tuple[str, bool | None]:
@@ -338,6 +422,9 @@ def simulate_turtle_strategy(
     )
 
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    opens = _bar_open_prices(prices, market_data)
+    entry_source = highs if highs is not None else prices
+    exit_source = lows if lows is not None else prices
 
     min_bars = max(entry_w, exit_w, ma_w, config.atr_window) + 2
     if n_bars < min_bars:
@@ -353,6 +440,7 @@ def simulate_turtle_strategy(
     in_trade = False
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
     high_since_entry = 0.0
+    low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
     start = max(entry_w, exit_w, ma_w)
@@ -366,13 +454,14 @@ def simulate_turtle_strategy(
             equity_curve.append(balance)
             continue
 
-        don_high = float(np.max(prices[i - entry_w:i]))
-        don_low = float(np.min(prices[i - exit_w:i]))
-        ma_up = sma > (smas[i - 1] if smas[i - 1] is not None else sma)
+        don_high = float(np.max(entry_source[i - entry_w:i]))
+        don_low = float(np.min(exit_source[i - exit_w:i]))
+        prior_sma = smas[i - 1] if smas[i - 1] is not None else sma
+        ma_up = bool(p > sma and sma > prior_sma)
 
         if not in_trade:
             if p > don_high and ma_up:
-                stop = p - atr_mult * atr
+                stop = round(float(p - atr_mult * atr), 2)
                 risk = p - stop
                 raw_size = int((balance * risk_pct_dec) / risk) if risk > 0 else 0
                 size = _backtest_limited_quantity(
@@ -389,10 +478,28 @@ def simulate_turtle_strategy(
                     stop_price = stop
                     initial_stop_price = stop
                     high_since_entry = float(p)
+                    low_since_entry = float(p)
                     shares = size
                     entry_bar = i
         else:
             exposure_bars += 1
+            low_value = float(lows[i]) if lows is not None else float(p)
+            protective_fill = _protective_stop_fill(float(opens[i]), low_value, float(stop_price))
+            if protective_fill is not None:
+                low_since_entry = min(low_since_entry, protective_fill)
+                equity_curve.append(balance + (low_since_entry - entry_price) * shares)
+                balance += (protective_fill - entry_price) * shares
+                trade_log.append(_trade_record(
+                    trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
+                    entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
+                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                ))
+                in_trade = False
+                equity_curve.append(balance)
+                continue
+            low_since_entry = min(low_since_entry, low_value)
+            equity_curve.append(balance + (low_since_entry - entry_price) * shares)
             mark_to_market = balance + (p - entry_price) * shares
             high_value = float(highs[i]) if highs is not None else float(p)
             high_since_entry = max(high_since_entry, high_value)
@@ -420,6 +527,7 @@ def simulate_turtle_strategy(
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
+                    lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
@@ -433,9 +541,9 @@ def simulate_turtle_strategy(
     last_atr = atrs[-1]
     last_sma = smas[-1]
     prev_sma = next((smas[i] for i in range(len(smas) - 2, -1, -1) if smas[i] is not None), last_sma)
-    sma_up = bool(last_sma and prev_sma and last_sma > prev_sma)
-    dh_last = float(np.max(prices[-1 - entry_w:-1]))
-    dl_last = float(np.min(prices[-1 - exit_w:-1]))
+    sma_up = bool(last_sma and prev_sma and last_p > last_sma and last_sma > prev_sma)
+    dh_last = float(np.max(entry_source[-1 - entry_w:-1]))
+    dl_last = float(np.min(exit_source[-1 - exit_w:-1]))
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
     raw_pos_size = int((balance * risk_pct_dec) / (atr_mult * last_atr)) if last_atr else 0
@@ -478,7 +586,7 @@ def simulate_turtle_strategy(
 
     buy_requirements = {
         f"Price above {entry_w}-bar high": last_p > dh_last,
-        f"{ma_w}-bar trend filter rising": sma_up,
+        f"Price above rising {ma_w}-bar trend filter": sma_up,
         "Position size above zero": pos_size > 0,
     }
     if proposed_trade_intent is not None:
@@ -522,7 +630,9 @@ def simulate_turtle_strategy(
         f"Price at or below {exit_w}-bar exit level": strategy_exit_ready,
     }
 
-    final_equity = equity_curve[-1] if equity_curve else balance
+    if not equity_curve or equity_curve[-1] != live_balance:
+        equity_curve.append(live_balance)
+    final_equity = live_balance
     stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
     return prices, smas, atrs, trade_log, live, stats, labels
 
@@ -548,6 +658,7 @@ def simulate_trend_pullback_strategy(
         moving_average_window=trend_w,
     )
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    opens = _bar_open_prices(prices, market_data)
     min_bars = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window) + 3
     if n_bars < min_bars:
         raise ValueError(f"Need at least {min_bars} bars for these settings; got {n_bars}.")
@@ -565,6 +676,7 @@ def simulate_trend_pullback_strategy(
     in_trade = False
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
     high_since_entry = 0.0
+    low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
     start = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window)
@@ -597,7 +709,7 @@ def simulate_trend_pullback_strategy(
 
         if not in_trade:
             if setup_ready:
-                stop = min(float(np.min(prices[i - pullback_w:i + 1])), p - atr_mult * atr)
+                stop = round(min(float(np.min(prices[i - pullback_w:i + 1])), p - atr_mult * atr), 2)
                 risk = p - stop
                 raw_size = int((balance * risk_pct_dec) / risk) if risk > 0 else 0
                 size = _backtest_limited_quantity(
@@ -614,10 +726,28 @@ def simulate_trend_pullback_strategy(
                     stop_price = stop
                     initial_stop_price = stop
                     high_since_entry = float(p)
+                    low_since_entry = float(p)
                     shares = size
                     entry_bar = i
         else:
             exposure_bars += 1
+            low_value = float(lows[i]) if lows is not None else float(p)
+            protective_fill = _protective_stop_fill(float(opens[i]), low_value, float(stop_price))
+            if protective_fill is not None:
+                low_since_entry = min(low_since_entry, protective_fill)
+                equity_curve.append(balance + (low_since_entry - entry_price) * shares)
+                balance += (protective_fill - entry_price) * shares
+                trade_log.append(_trade_record(
+                    trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
+                    entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
+                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                ))
+                in_trade = False
+                equity_curve.append(balance)
+                continue
+            low_since_entry = min(low_since_entry, low_value)
+            equity_curve.append(balance + (low_since_entry - entry_price) * shares)
             mark_to_market = balance + (p - entry_price) * shares
             high_value = float(highs[i]) if highs is not None else float(p)
             high_since_entry = max(high_since_entry, high_value)
@@ -646,6 +776,7 @@ def simulate_trend_pullback_strategy(
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
+                    lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
@@ -661,9 +792,11 @@ def simulate_trend_pullback_strategy(
     setup_ready, pullback_depth, trend_ok, touched_pullback, momentum_turn = setup_at(live_bar)
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
-    stop_distance = atr_mult * last_atr if last_atr else 0
+    atr_stop = last_p - atr_mult * last_atr if last_atr else last_p
+    recent_close_low = float(np.min(prices[-pullback_w:]))
+    live_stop = min(recent_close_low, atr_stop)
+    stop_distance = max(0.0, last_p - live_stop)
     raw_pos_size = int((balance * risk_pct_dec) / stop_distance) if stop_distance else 0
-    live_stop = last_p - stop_distance if stop_distance else last_p
     pos_size = _backtest_limited_quantity(
         raw_quantity=raw_pos_size,
         account_equity=live_balance,
@@ -689,8 +822,8 @@ def simulate_trend_pullback_strategy(
             side="buy",
             quantity=pos_size,
             entry_price=last_p,
-            stop_loss=round(last_p - stop_distance, 2) if stop_distance else None,
-        max_holding_bars=exit_w,
+            stop_loss=round(live_stop, 2) if stop_distance else None,
+            max_holding_bars=exit_w,
             rationale=f"Trend pullback: price is above the {trend_w}-bar trend filter and momentum turned back up after a pullback.",
             source_signals=[
                 f"above_{trend_w}_bar_trend_filter",
@@ -754,7 +887,9 @@ def simulate_trend_pullback_strategy(
         f"Price below {exit_w}-bar exit average": strategy_exit_ready,
     }
 
-    final_equity = equity_curve[-1] if equity_curve else balance
+    if not equity_curve or equity_curve[-1] != live_balance:
+        equity_curve.append(live_balance)
+    final_equity = live_balance
     stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
     return prices, trend_smas, atrs, trade_log, live, stats, labels
 
@@ -771,6 +906,7 @@ def simulate_trendline_breakout_strategy(
     risk_limits: RiskLimits | None = None,
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    opens = _bar_open_prices(prices, market_data)
     min_bars = max(trendline_w, exit_w, ma_w, 14) + 4
     if n_bars < min_bars:
         raise ValueError(f"Need at least {min_bars} bars for these settings; got {n_bars}.")
@@ -784,6 +920,7 @@ def simulate_trendline_breakout_strategy(
     in_trade = False
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
     high_since_entry = 0.0
+    low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
     start = max(trendline_w, exit_w, ma_w, 14)
@@ -796,18 +933,20 @@ def simulate_trendline_breakout_strategy(
         if atr is None or sma is None:
             equity_curve.append(balance)
             continue
-        line = _recent_descending_trendline(prices, i, trendline_w)
+        trendline_source = highs if highs is not None else prices
+        line = _recent_descending_trendline(trendline_source, i, trendline_w)
         trendline_level = None
+        crossed_trendline = False
         if line is not None:
-            intercept, slope, (x1, _) = line
-            trendline_level = _trendline_value(intercept, slope, x1, i)
+            crossed_trendline, trendline_level = _trendline_crossed(prices, line, i)
         prev_sma = smas[i - 1] if smas[i - 1] is not None else sma
         trend_ok = bool(p > sma and sma >= prev_sma)
-        exit_level = float(np.min(prices[i - exit_w:i]))
+        exit_source = lows if lows is not None else prices
+        exit_level = float(np.min(exit_source[i - exit_w:i]))
 
         if not in_trade:
-            if trendline_level is not None and p > trendline_level and trend_ok:
-                stop = p - atr_mult * atr
+            if trendline_level is not None and crossed_trendline and trend_ok:
+                stop = round(float(p - atr_mult * atr), 2)
                 raw_size = int((balance * risk_pct_dec) / (p - stop)) if p > stop else 0
                 size = _backtest_limited_quantity(
                     raw_quantity=raw_size,
@@ -823,10 +962,28 @@ def simulate_trendline_breakout_strategy(
                     stop_price = stop
                     initial_stop_price = stop
                     high_since_entry = float(p)
+                    low_since_entry = float(p)
                     shares = size
                     entry_bar = i
         else:
             exposure_bars += 1
+            low_value = float(lows[i]) if lows is not None else float(p)
+            protective_fill = _protective_stop_fill(float(opens[i]), low_value, float(stop_price))
+            if protective_fill is not None:
+                low_since_entry = min(low_since_entry, protective_fill)
+                equity_curve.append(balance + (low_since_entry - entry_price) * shares)
+                balance += (protective_fill - entry_price) * shares
+                trade_log.append(_trade_record(
+                    trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
+                    entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
+                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                ))
+                in_trade = False
+                equity_curve.append(balance)
+                continue
+            low_since_entry = min(low_since_entry, low_value)
+            equity_curve.append(balance + (low_since_entry - entry_price) * shares)
             mark_to_market = balance + (p - entry_price) * shares
             high_value = float(highs[i]) if highs is not None else float(p)
             high_since_entry = max(high_since_entry, high_value)
@@ -854,6 +1011,7 @@ def simulate_trendline_breakout_strategy(
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
+                    lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
@@ -864,12 +1022,15 @@ def simulate_trendline_breakout_strategy(
 
     live = _trendline_live_fields(
         prices=prices,
+        highs=highs,
+        lows=lows,
         smas=smas,
         atrs=atrs,
         rsis=rsis,
         volumes=volumes,
         index=live_bar,
         lookback=trendline_w,
+        ma_w=ma_w,
         exit_w=exit_w,
         atr_mult=atr_mult,
         balance=balance + ((float(prices[-1]) - entry_price) * shares if in_trade else 0.0),
@@ -882,7 +1043,10 @@ def simulate_trendline_breakout_strategy(
         require_retest=False,
     )
     live["in_simulated_trade"] = in_trade
-    final_equity = equity_curve[-1] if equity_curve else balance
+    live_balance = float(live["balance"])
+    if not equity_curve or equity_curve[-1] != live_balance:
+        equity_curve.append(live_balance)
+    final_equity = live_balance
     stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
     return prices, smas, atrs, trade_log, live, stats, labels
 
@@ -900,6 +1064,7 @@ def simulate_trendline_retest_strategy(
     risk_limits: RiskLimits | None = None,
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    opens = _bar_open_prices(prices, market_data)
     min_bars = max(trendline_w, exit_w, ma_w, momentum_w, 14) + 4
     if n_bars < min_bars:
         raise ValueError(f"Need at least {min_bars} bars for these settings; got {n_bars}.")
@@ -915,8 +1080,10 @@ def simulate_trendline_retest_strategy(
     waiting_retest = False
     retest_seen = False
     breakout_line: tuple[float, float, int] | None = None
+    breakout_bar: int | None = None
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
     high_since_entry = 0.0
+    low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
     start = max(trendline_w, exit_w, ma_w, momentum_w, 14)
@@ -930,19 +1097,27 @@ def simulate_trendline_retest_strategy(
         if atr is None or sma is None or momentum_sma is None:
             equity_curve.append(balance)
             continue
-        line = _recent_descending_trendline(prices, i, trendline_w)
+        trendline_source = highs if highs is not None else prices
+        line = _recent_descending_trendline(trendline_source, i, trendline_w)
         prev_sma = smas[i - 1] if smas[i - 1] is not None else sma
         trend_ok = bool(p > sma and sma >= prev_sma)
-        exit_level = float(np.min(prices[i - exit_w:i]))
+        exit_source = lows if lows is not None else prices
+        exit_level = float(np.min(exit_source[i - exit_w:i]))
 
         if not in_trade:
+            if waiting_retest and breakout_bar is not None and i - breakout_bar > trendline_w:
+                waiting_retest = False
+                retest_seen = False
+                breakout_line = None
+                breakout_bar = None
             if not waiting_retest and line is not None:
+                crossed_trendline, level = _trendline_crossed(prices, line, i)
                 intercept, slope, (x1, _) = line
-                level = _trendline_value(intercept, slope, x1, i)
-                if p > level and trend_ok:
+                if crossed_trendline and trend_ok:
                     waiting_retest = True
                     retest_seen = False
                     breakout_line = (intercept, slope, x1)
+                    breakout_bar = i
             elif waiting_retest and breakout_line is not None:
                 intercept, slope, x1 = breakout_line
                 level = _trendline_value(intercept, slope, x1, i)
@@ -951,7 +1126,7 @@ def simulate_trendline_retest_strategy(
                     retest_seen = True
                 momentum_turn = bool(retest_seen and p > momentum_sma and p > float(prices[i - 1]) and trend_ok)
                 if momentum_turn:
-                    stop = min(level - atr * 0.25, p - atr_mult * atr)
+                    stop = round(min(level - atr * 0.25, p - atr_mult * atr), 2)
                     raw_size = int((balance * risk_pct_dec) / (p - stop)) if p > stop else 0
                     size = _backtest_limited_quantity(
                         raw_quantity=raw_size,
@@ -966,14 +1141,33 @@ def simulate_trendline_retest_strategy(
                         waiting_retest = False
                         retest_seen = False
                         breakout_line = None
+                        breakout_bar = None
                         entry_price = p
                         stop_price = stop
                         initial_stop_price = stop
                         high_since_entry = float(p)
+                        low_since_entry = float(p)
                         shares = size
                         entry_bar = i
         else:
             exposure_bars += 1
+            low_value = float(lows[i]) if lows is not None else float(p)
+            protective_fill = _protective_stop_fill(float(opens[i]), low_value, float(stop_price))
+            if protective_fill is not None:
+                low_since_entry = min(low_since_entry, protective_fill)
+                equity_curve.append(balance + (low_since_entry - entry_price) * shares)
+                balance += (protective_fill - entry_price) * shares
+                trade_log.append(_trade_record(
+                    trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
+                    entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
+                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                ))
+                in_trade = False
+                equity_curve.append(balance)
+                continue
+            low_since_entry = min(low_since_entry, low_value)
+            equity_curve.append(balance + (low_since_entry - entry_price) * shares)
             mark_to_market = balance + (p - entry_price) * shares
             high_value = float(highs[i]) if highs is not None else float(p)
             high_since_entry = max(high_since_entry, high_value)
@@ -1001,6 +1195,7 @@ def simulate_trendline_retest_strategy(
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
+                    lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
                 equity_curve.append(balance)
@@ -1011,12 +1206,15 @@ def simulate_trendline_retest_strategy(
 
     live = _trendline_live_fields(
         prices=prices,
+        highs=highs,
+        lows=lows,
         smas=smas,
         atrs=atrs,
         rsis=rsis,
         volumes=volumes,
         index=live_bar,
         lookback=trendline_w,
+        ma_w=ma_w,
         exit_w=exit_w,
         atr_mult=atr_mult,
         balance=balance + ((float(prices[-1]) - entry_price) * shares if in_trade else 0.0),
@@ -1028,9 +1226,13 @@ def simulate_trendline_retest_strategy(
         setup_type="trendline_retest",
         require_retest=True,
         momentum_w=momentum_w,
+        momentum_smas=momentum_smas,
     )
     live["in_simulated_trade"] = in_trade
-    final_equity = equity_curve[-1] if equity_curve else balance
+    live_balance = float(live["balance"])
+    if not equity_curve or equity_curve[-1] != live_balance:
+        equity_curve.append(live_balance)
+    final_equity = live_balance
     stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
     return prices, smas, atrs, trade_log, live, stats, labels
 
@@ -1038,12 +1240,15 @@ def simulate_trendline_retest_strategy(
 def _trendline_live_fields(
     *,
     prices,
+    highs,
+    lows,
     smas,
     atrs,
     rsis,
     volumes,
     index: int,
     lookback: int,
+    ma_w: int,
     exit_w: int,
     atr_mult: float,
     balance: float,
@@ -1055,11 +1260,13 @@ def _trendline_live_fields(
     setup_type: str,
     require_retest: bool,
     momentum_w: int = 5,
+    momentum_smas=None,
 ) -> dict:
     last_p = float(prices[index])
     last_atr = atrs[index]
     last_sma = smas[index]
-    line = _recent_descending_trendline(prices, index, lookback)
+    trendline_source = highs if highs is not None else prices
+    line = _recent_descending_trendline(trendline_source, index, lookback)
     trendline_level = None
     trendline_slope = None
     if line is not None:
@@ -1068,15 +1275,26 @@ def _trendline_live_fields(
         trendline_slope = slope
     prev_sma = next((smas[i] for i in range(index - 1, -1, -1) if smas[i] is not None), last_sma)
     trend_ok = bool(last_sma and prev_sma and last_p > last_sma and last_sma >= prev_sma)
-    trendline_break = bool(trendline_level is not None and last_p > trendline_level and trend_ok)
+    crossed_trendline, _ = _trendline_crossed(prices, line, index)
+    trendline_break = bool(trendline_level is not None and crossed_trendline and trend_ok)
     retest_ready = False
-    if require_retest and trendline_level is not None and last_atr:
-        low_value = float(prices[index])
-        retest_ready = bool(low_value <= trendline_level + last_atr * 0.5 and last_p >= trendline_level and trend_ok)
+    if require_retest and momentum_smas is not None:
+        retest_ready, retest_level, retest_slope = _live_retest_context(
+            prices, highs, lows, smas, atrs, momentum_smas, index, lookback
+        )
+        if retest_level is not None:
+            trendline_level = retest_level
+            trendline_slope = retest_slope
+        retest_ready = bool(retest_ready and trend_ok)
     entry_ready = retest_ready if require_retest else trendline_break
-    stop_distance = atr_mult * last_atr if last_atr else 0
+    atr_stop = last_p - atr_mult * last_atr if last_atr else last_p
+    stop_loss = (
+        min(float(trendline_level) - float(last_atr) * 0.25, atr_stop)
+        if require_retest and trendline_level is not None and last_atr is not None
+        else atr_stop
+    )
+    stop_distance = max(0.0, last_p - stop_loss)
     raw_pos_size = int((balance * risk_pct_dec) / stop_distance) if stop_distance else 0
-    stop_loss = last_p - stop_distance if stop_distance else last_p
     pos_size = _backtest_limited_quantity(
         raw_quantity=raw_pos_size,
         account_equity=balance,
@@ -1103,7 +1321,7 @@ def _trendline_live_fields(
             source_signals=[
                 "descending_trendline_detected",
                 "close_above_trendline" if not require_retest else "trendline_retest_continuation",
-                f"sma_{lookback}_trend_context",
+                f"sma_{ma_w}_trend_context",
                 "atr_position_sizing",
             ],
         )
@@ -1128,7 +1346,8 @@ def _trendline_live_fields(
     else:
         no_trade_reason = "No BUY because the selected strategy rules are not fully met."
 
-    exit_level = float(np.min(prices[index - exit_w:index])) if index >= exit_w else last_p
+    exit_source = lows if lows is not None else prices
+    exit_level = float(np.min(exit_source[index - exit_w:index])) if index >= exit_w else last_p
     live = _base_live_fields(
         prices=prices,
         smas=smas,

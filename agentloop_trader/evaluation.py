@@ -4,9 +4,9 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from agentloop_trader.backtest import simulate_turtle_strategy
 from agentloop_trader.data import generate_synthetic_prices
 from agentloop_trader.models import RiskLimits
+from agentloop_trader.strategy_runtime import _run_one
 
 
 @dataclass(frozen=True)
@@ -45,6 +45,9 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
     peak = account
     max_drawdown = 0.0
     for trade in trade_log:
+        adverse_equity = equity + float(trade.get("max_adverse_pnl", 0))
+        if peak > 0:
+            max_drawdown = min(max_drawdown, (adverse_equity - peak) / peak)
         equity += trade["pnl"]
         peak = max(peak, equity)
         if peak > 0:
@@ -64,8 +67,8 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
         "total_trades": len(trade_log),
         "avg_win": avg_win,
         "avg_loss": avg_loss,
-        "rr_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss else 0,
-        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else 0,
+        "rr_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss else (99.0 if avg_win > 0 else 0),
+        "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else (99.0 if gross_wins > 0 else 0),
         "max_drawdown_pct": round(abs(max_drawdown) * 100, 2),
         "exposure_pct": round(exposure_bars / eval_bars * 100, 2) if eval_bars else 0,
     }
@@ -82,8 +85,11 @@ def evaluate_walk_forward(
     market_data=None,
     train_fraction: float = 0.65,
     risk_limits: RiskLimits | None = None,
+    strategy_type: str = "breakout",
+    pullback_w: int = 20,
+    momentum_w: int = 10,
 ) -> WalkForwardResult:
-    warmup_bars = max(entry_w, exit_w, ma_w, 14) + 2
+    warmup_bars = max(entry_w, exit_w, ma_w, pullback_w, momentum_w, 14) + 4
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=seed)
     if market_data is not None:
         data.attrs["symbol"] = getattr(market_data, "attrs", {}).get("symbol", "MARKET")
@@ -98,17 +104,24 @@ def evaluate_walk_forward(
 
     train_data = data.iloc[:split_index].copy()
     train_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
-    _, _, _, _, _, train_stats, _ = simulate_turtle_strategy(
-        account, entry_w, exit_w, atr_mult, risk_pct_dec, ma_w, seed, train_data, risk_limits
-    )
+    settings = {
+        "strategy_type": strategy_type,
+        "entry_window": entry_w,
+        "exit_window": exit_w,
+        "atr_stop_multiplier": atr_mult,
+        "risk_per_trade_pct": risk_pct_dec * 100,
+        "moving_average_window": ma_w,
+        "pullback_average_length": pullback_w,
+        "momentum_turn_length": momentum_w,
+    }
+    train_trade_log = _run_one(strategy_type, train_data, settings, account, risk_limits)["trade_log"]
+    train_stats = _closed_trade_stats(account, train_trade_log, split_index)
 
     oos_start = max(0, split_index - warmup_bars)
     warmup_offset = split_index - oos_start
     oos_data = data.iloc[oos_start:].copy()
     oos_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
-    _, _, _, oos_trade_log, _, _, _ = simulate_turtle_strategy(
-        account, entry_w, exit_w, atr_mult, risk_pct_dec, ma_w, seed, oos_data, risk_limits
-    )
+    oos_trade_log = _run_one(strategy_type, oos_data, settings, account, risk_limits)["trade_log"]
     oos_trades = [
         trade
         for trade in oos_trade_log

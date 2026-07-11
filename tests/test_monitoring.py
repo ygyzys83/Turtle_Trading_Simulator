@@ -28,9 +28,9 @@ def test_daily_risk_records_summarize_local_and_tracked_alpaca_state():
     assert metrics["Filled app paper orders"] == 1
     assert metrics["Saved Alpaca active/filled orders"] == 2
     assert metrics["Filled app order value"] == 1200
-    assert metrics["Saved Alpaca shares"] == "50"
+    assert metrics["Filled Alpaca shares"] == "10"
     assert metrics["Portfolio exposure %"] == 20
-    assert metrics["Session loss %"] == 0.5
+    assert metrics["Daily loss %"] == 0.5
 
 
 def test_broker_heartbeat_records_enforce_fresh_state_policy():

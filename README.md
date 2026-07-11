@@ -37,22 +37,6 @@ The app should be treated as a personal paper-trading and strategy-research envi
 
 This repository is now being developed toward eventual real-money Alpaca use, but live unattended trading is not considered safe until the controls in `docs/PRODUCTION_SAFETY.md` and `docs/LIVE_DEPLOYMENT_CHECKLIST.md` are satisfied.
 
-## Portfolio Narrative
-
-AgentLoop Trader is designed to demonstrate a practical agentic workflow with human-in-the-loop guardrails:
-
-1. Observe market state and strategy signals.
-2. Propose a structured trade thesis and intent.
-3. Gate the proposal through deterministic risk policy.
-4. Let the user choose manual paper orders, auto exits, or paper auto entries and exits.
-5. Reconcile broker state after each action.
-6. Review paper outcomes and preserve useful audit evidence.
-7. Use optional background automation for paper trading only.
-
-The default Streamlit workspace is a daily trading screen for running a small personal paper account. `Full Records and Evidence *` exposes the deeper artifacts that make the AI TPM story visible: run manifests, audit rows, readiness records, and broker history. This is the Portfolio Evidence layer with a clearer day-to-day label.
-
-The product intent is a simple workflow: enter or scan tickers, review a research read, choose a strategy, paper-test the setup, and automate exits first. Full paper automation is available for testing, but live automation is still deliberately locked.
-
 ## UI Product Rule
 
 The daily workflow should stay simple enough for an expert operator to use quickly:
@@ -62,17 +46,17 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Hard blockers prevent obvious mechanical mistakes. Warnings inform the operator without adding ceremony.
 - Button labels should describe the actual action in plain language, such as review, send, refresh, track, exit, or cancel.
 
-## Architecture Roadmap
+## Backtest Assumptions
 
-1. Refactor the simulator into reusable modules for data, indicators, strategy, backtesting, risk, execution, agents, and UI.
-2. Preserve the turtle trend-following strategy as Strategy 1.
-3. Add structured models for trade intents, theses, backtest results, risk checks, execution decisions, session configs, and audit events.
-4. Expand the backtest harness with richer metrics, walk-forward testing, and out-of-sample evaluation.
-5. Add deterministic risk controls for allowed symbols, stop-loss requirements, max risk per trade, max position size, portfolio concentration, duplicate positions, and kill-switch behavior.
-6. Add an AI research/thesis layer that produces bounded trade proposals.
-7. Add a paper broker adapter with orders, fills, positions, cash, and P&L.
-8. Add broker adapters later, targeting Alpaca first because its API-first paper/live workflow is faster to operationalize.
-9. Add monitoring and post-trade review so closed trades can be evaluated against their original thesis.
+- Indicators and entry signals use completed bars.
+- Breakout continuation compares the completed-bar close with prior bar highs for entry and prior bar lows for exit.
+- Historical entries use the signal-bar close.
+- Protective stops fill at the stop price, or at the next bar open after a gap below the stop.
+- Break-even and ATR trailing protection turn on when the highest price since entry reaches the saved R threshold; once active, protection does not loosen.
+- Results include unrealized profit or loss from a simulated position still open on the final bar.
+- Newer-data and optimizer comparisons use completed trades on both sides of the split so open-position P&L cannot skew one side.
+- Commission, spread, market impact, and slippage are not estimated. Treat paper fills and live fills as the final execution test.
+- Alpaca and Yahoo price data are validated, sorted, deduplicated, and checked for impossible OHLC values before use.
 
 ## Current Modules
 

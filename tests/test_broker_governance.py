@@ -56,6 +56,16 @@ def test_open_order_exposure_normalizes_alpaca_enum_values():
     assert reasons == ["Alpaca Orders already has an open AAPL buy order with status accepted."]
 
 
+def test_open_order_exposure_stays_blocked_when_position_adds_are_allowed():
+    intent = TradeIntent(symbol="AAPL", side="buy", quantity=10, entry_price=100, stop_loss=95)
+    orders = [{"Symbol": "AAPL", "Side": "buy", "Status": "pending_cancel"}]
+
+    reasons = open_order_exposure_reasons(intent, orders, allow_duplicate=True)
+
+    assert reasons
+    assert "open AAPL buy order" in reasons[0]
+
+
 def test_exit_position_reasons_require_existing_position():
     preview = build_exit_order_previews(
         [{"Symbol": "AAPL", "Quantity": "12"}],
@@ -349,7 +359,7 @@ def test_broker_state_store_upserts_records():
     assert records[0]["status"] == "filled"
 
 
-def test_broker_state_store_replace_all_records():
+def test_broker_state_store_replace_all_merges_existing_history():
     with tempfile.TemporaryDirectory() as tmp_dir:
         store = BrokerStateStore(f"{tmp_dir}/broker_state.json")
         store.upsert({"broker_order_id": "1", "symbol": "AAPL"})
@@ -357,7 +367,21 @@ def test_broker_state_store_replace_all_records():
 
         records = store.read()
 
-    assert records == [{"broker_order_id": "2", "symbol": "MSFT"}]
+    assert {record["broker_order_id"] for record in records} == {"1", "2"}
+
+
+def test_broker_state_store_preserves_exit_settings_during_refresh():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BrokerStateStore(f"{tmp_dir}/broker_state.json")
+        store.replace_all([
+            {"broker_order_id": "1", "status": "accepted", "exit_settings": {"interval": "1h"}}
+        ])
+        store.replace_all([{"broker_order_id": "1", "status": "filled"}])
+
+        record = store.read()[0]
+
+    assert record["status"] == "filled"
+    assert record["exit_settings"] == {"interval": "1h"}
 
 
 def test_market_session_advisory_identifies_weekend_closed():
