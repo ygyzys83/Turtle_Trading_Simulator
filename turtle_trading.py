@@ -108,16 +108,12 @@ from agentloop_trader.ops_readiness import (
     strategy_state_snapshot_records,
 )
 from agentloop_trader.parameter_loop import (
-    candidate_records,
-    evaluate_parameter_candidates,
     optimize_strategy_inputs,
     optimizer_candidate_records,
     optimizer_regime_records,
     optimizer_recommendation_records,
     optimizer_robustness_records,
     optimizer_stress_records,
-    recommend_candidate,
-    recommendation_summary,
     validate_settings_across_tickers,
 )
 from agentloop_trader.research_agent import (
@@ -1686,6 +1682,10 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
     interval = st.sidebar.selectbox("Interval", ["1d", "4h", "1h", "30m", "15m", "5m", "1m"], index=2)
     if interval == "1d":
         period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"], 5
+    elif interval == "4h" and data_source == "Ticker (Alpaca)":
+        period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y"], 3
+    elif interval == "1h" and data_source == "Ticker (Alpaca)":
+        period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y"], 3
     elif interval in ("4h", "1h"):
         period_options, period_index = ["1mo", "3mo", "6mo", "1y"], 3
     elif interval in ("30m", "15m"):
@@ -1889,12 +1889,12 @@ run_walk_forward = st.sidebar.checkbox(
     help="Splits the price history into older data and newer data. The app checks whether the selected strategy still works on the newer bars instead of only fitting the older bars.",
 )
 train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step=5) / 100
-run_parameter_loop = st.sidebar.checkbox(
-    "Find recommended strategy inputs",
-    value=False,
-    help="Tests bounded inputs across all four strategies. It favors nearby settings that also work, checks separate time periods, reserves the final 20% of history for one untouched test, and adds trading-cost stress. It does not change your settings automatically.",
-)
 max_parameter_candidates = st.sidebar.slider("Settings to compare per strategy", 4, 24, 12, step=4)
+run_strategy_input_search = st.sidebar.button(
+    "Run Strategy Input Search",
+    help="Runs the four-strategy input search once and saves the result. Ordinary page refreshes do not rerun it.",
+)
+optimizer_sidebar_status = st.sidebar.empty()
 
 st.sidebar.subheader(
     "Setup quality checks",
@@ -2611,34 +2611,96 @@ def refresh_trailing_state_for_open_positions() -> bool:
     return changed
 
 
-parameter_candidates = []
-recommended_candidate = None
-parameter_loop_error = None
-strategy_optimizer_result = None
-if run_parameter_loop:
+optimizer_setting_keys = (
+    "strategy_type",
+    "strategy_label",
+    "entry_window",
+    "exit_window",
+    "atr_stop_multiplier",
+    "risk_per_trade_pct",
+    "moving_average_window",
+    "pullback_average_length",
+    "momentum_turn_length",
+)
+optimizer_market_fingerprint = "synthetic-default"
+if market_data is not None:
+    fingerprint_columns = [
+        column for column in ("Open", "High", "Low", "Close", "Volume")
+        if column in market_data.columns
+    ]
+    hashed_market_data = pd.util.hash_pandas_object(
+        market_data[fingerprint_columns], index=True
+    ).values.tobytes()
+    optimizer_market_fingerprint = hashlib.sha256(hashed_market_data).hexdigest()
+optimizer_equity = float(paper_order_risk_equity)
+optimizer_equity_rounding_digits = max(
+    0,
+    len(str(max(1, int(abs(optimizer_equity))))) - 3,
+)
+optimizer_equity_bucket = round(optimizer_equity, -optimizer_equity_rounding_digits)
+optimizer_signature_payload = {
+    "ticker": ticker,
+    "source": data_source,
+    "interval": interval,
+    "history": period,
+    "market_data": optimizer_market_fingerprint,
+    "strategy_settings": {
+        key: current_strategy_settings[key] for key in optimizer_setting_keys
+    },
+    "account_equity_bucket": optimizer_equity_bucket,
+    "risk_limits": asdict(risk_limits),
+    "older_data_fraction": train_fraction,
+    "settings_per_strategy": max_parameter_candidates,
+}
+optimizer_signature = hashlib.sha256(
+    json.dumps(optimizer_signature_payload, sort_keys=True, default=str).encode("utf-8")
+).hexdigest()
+optimizer_search_completed = False
+if run_strategy_input_search:
     try:
-        strategy_optimizer_result = optimize_strategy_inputs(
-            market_data=market_data,
-            current_settings=current_strategy_settings,
-            account_equity=float(paper_order_risk_equity),
-            risk_limits=risk_limits,
-            train_fraction=train_fraction,
-            max_candidates_per_strategy=max_parameter_candidates,
-        )
-        if strategy_type == "breakout":
-            parameter_candidates = evaluate_parameter_candidates(
-                current=current_strategy_config,
-                account=account,
-                risk_pct_dec=risk_dec,
-                seed=seed,
+        with st.spinner("Searching strategy inputs..."):
+            fresh_optimizer_result = optimize_strategy_inputs(
                 market_data=market_data,
-                train_fraction=train_fraction,
-                max_candidates=max_parameter_candidates,
+                current_settings=current_strategy_settings,
+                account_equity=float(paper_order_risk_equity),
                 risk_limits=risk_limits,
+                train_fraction=train_fraction,
+                max_candidates_per_strategy=max_parameter_candidates,
             )
-            recommended_candidate = recommend_candidate(parameter_candidates)
+        st.session_state["strategy_optimizer_search"] = {
+            "signature": optimizer_signature,
+            "result": fresh_optimizer_result,
+            "error": None,
+            "completed_at": pd.Timestamp.now(tz="America/Los_Angeles").isoformat(),
+        }
+        optimizer_search_completed = True
     except ValueError as exc:
-        parameter_loop_error = str(exc)
+        st.session_state["strategy_optimizer_search"] = {
+            "signature": optimizer_signature,
+            "result": None,
+            "error": str(exc),
+            "completed_at": pd.Timestamp.now(tz="America/Los_Angeles").isoformat(),
+        }
+
+optimizer_search_state = st.session_state.get("strategy_optimizer_search")
+strategy_optimizer_result = (
+    optimizer_search_state.get("result") if optimizer_search_state else None
+)
+parameter_loop_error = (
+    optimizer_search_state.get("error") if optimizer_search_state else None
+)
+optimizer_result_stale = bool(
+    optimizer_search_state
+    and optimizer_search_state.get("signature") != optimizer_signature
+)
+if optimizer_search_state is None:
+    optimizer_sidebar_status.caption("No saved strategy input search.")
+elif optimizer_result_stale:
+    optimizer_sidebar_status.warning("Inputs changed. Run the search again.")
+elif parameter_loop_error:
+    optimizer_sidebar_status.error("Strategy input search could not finish.")
+else:
+    optimizer_sidebar_status.success("Strategy input search is ready.")
 
 monitoring_result = monitor_paper_session(
     broker=paper_broker,
@@ -2764,9 +2826,6 @@ audit_key = (
     risk_check.approved,
     execution_decision.reason,
     stats["total_trades"],
-    run_parameter_loop,
-    max_parameter_candidates,
-    recommended_candidate.score if recommended_candidate else None,
     max_portfolio_exposure,
     max_symbol_concentration,
     max_session_loss,
@@ -2777,20 +2836,23 @@ if st.session_state.get("last_audit_key") != audit_key:
     st.session_state["session_audit_events"].extend(audit_events)
     if persist_audit_log:
         audit_store.append_many(audit_events)
-    if run_parameter_loop and parameter_loop_error is None:
-        parameter_event = AuditEvent(
-            event_type="bounded_parameter_loop_completed",
-            message=recommendation_summary(recommended_candidate),
-            payload={
-                "candidate_count": len(parameter_candidates),
-                "recommended_score": None if recommended_candidate is None else recommended_candidate.score,
-                "recommended_status": None if recommended_candidate is None else recommended_candidate.status,
-            },
-        )
-        st.session_state["session_audit_events"].append(parameter_event)
-        if persist_audit_log:
-            audit_store.append(parameter_event)
     st.session_state["last_audit_key"] = audit_key
+if optimizer_search_completed and strategy_optimizer_result is not None:
+    optimizer_best = strategy_optimizer_result.best
+    parameter_event = AuditEvent(
+        event_type="strategy_input_search_completed",
+        message=strategy_optimizer_result.summary,
+        payload={
+            "tested_candidates": strategy_optimizer_result.tested_candidates,
+            "best_strategy": None if optimizer_best is None else optimizer_best.strategy_label,
+            "best_score": None if optimizer_best is None else optimizer_best.score,
+            "confidence": None if optimizer_best is None else optimizer_best.confidence,
+            "search_signature": optimizer_signature,
+        },
+    )
+    st.session_state["session_audit_events"].append(parameter_event)
+    if persist_audit_log:
+        audit_store.append(parameter_event)
 
 st.title("AgentLoop Trader")
 st.caption(f"Research, risk checks, and paper trading. Prices: {source_caption}")
@@ -4131,20 +4193,25 @@ if command_center_view == "New Trade":
                     st.markdown(f"- {reason}")
         
         st.markdown("#### Recommended strategy inputs")
-        if not run_parameter_loop:
-            st.caption("This is turned off. Enable it in the sidebar to search for recommended strategy inputs.")
+        if optimizer_search_state is None:
+            st.caption("Click Run Strategy Input Search in the sidebar when you want a recommendation.")
         elif parameter_loop_error:
             st.warning(parameter_loop_error)
         elif strategy_optimizer_result is None:
             st.caption("No recommendation is available yet.")
         else:
+            if optimizer_result_stale:
+                st.warning("Inputs changed since this result was created. Run Strategy Input Search again before using the recommendation.")
             st.info(strategy_optimizer_result.summary)
             st.dataframe(
                 pd.DataFrame(optimizer_recommendation_records(strategy_optimizer_result)),
                 width="stretch",
                 hide_index=True,
             )
-            if strategy_optimizer_result.best is not None and st.button("Use Recommended Inputs"):
+            if strategy_optimizer_result.best is not None and st.button(
+                "Use Recommended Inputs",
+                disabled=optimizer_result_stale,
+            ):
                 apply_settings = dict(strategy_optimizer_result.best.settings)
                 apply_settings["risk_per_trade_pct"] = strategy_optimizer_result.best.recommended_risk_per_trade_percent
                 st.session_state["optimizer_apply_settings"] = apply_settings
@@ -4168,7 +4235,10 @@ if command_center_view == "New Trade":
                     hide_index=True,
                 )
             with st.expander("Test these settings on other tickers", expanded=False):
-                if data_source == "Synthetic":
+                cross_ticker_context = (ticker, data_source, interval, period)
+                if optimizer_result_stale:
+                    st.caption("Run Strategy Input Search again before testing this recommendation on other tickers.")
+                elif data_source == "Synthetic":
                     st.caption("Choose Ticker (Alpaca) or Ticker (yfinance) first. This check needs real price history.")
                 elif strategy_optimizer_result.best is None:
                     st.caption("No recommended settings are available to test.")
@@ -4203,11 +4273,16 @@ if command_center_view == "New Trade":
                         )
                         st.session_state["optimizer_cross_ticker"] = {
                             "settings": dict(strategy_optimizer_result.best.settings),
+                            "context": cross_ticker_context,
                             "result": cross_result,
                             "problems": problems,
                         }
                     cross_state = st.session_state.get("optimizer_cross_ticker")
-                    if cross_state and cross_state.get("settings") == strategy_optimizer_result.best.settings:
+                    if (
+                        cross_state
+                        and cross_state.get("settings") == strategy_optimizer_result.best.settings
+                        and cross_state.get("context") == cross_ticker_context
+                    ):
                         cross_result = cross_state["result"]
                         st.markdown(
                             f"**Profitable on {cross_result.profitable_tickers} of {cross_result.tested_tickers} other tickers.** "

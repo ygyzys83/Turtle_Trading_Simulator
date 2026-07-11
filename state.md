@@ -439,6 +439,8 @@ The recommended strategy-input search was strengthened to reduce overfitting wit
 
 The normal recommendation remains one compact table. Detailed robustness evidence is under `Why this recommendation`; other-ticker validation is under `Test these settings on other tickers`. The search does not change account risk limits, broker access, order mode, credentials, the Kill Switch, or settings automatically. RSI remains a possible future deterministic strategy variable and was not added in this batch.
 
+The optimizer is now run explicitly with `Run Strategy Input Search` instead of a persistent checkbox. Its result is saved through ordinary Streamlit reruns and marked stale when the ticker, source, interval, history, market bars, strategy inputs, material account-equity bucket, risk limits, older-data split, or candidate count changes. A stale recommendation cannot be applied or tested on other tickers until the search is run again. Alpaca history choices now extend through `2y` for `1h` bars and `5y` for `4h` bars; Yahoo intraday choices remain shorter.
+
 Recommended operating mode:
 
 - Workspace: Daily Trading Screen.

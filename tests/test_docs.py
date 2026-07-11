@@ -47,3 +47,13 @@ def test_readme_explains_product_and_backtest_contract_without_ui_story_copy():
     assert "deterministic strategy and risk code controls order eligibility" in text
     assert "Daily Trading Screen" in text
     assert "Full Records and Evidence" in text
+
+
+def test_strategy_input_search_is_explicit_and_alpaca_intraday_history_is_bounded():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert '"Run Strategy Input Search"' in text
+    assert '"Find recommended strategy inputs"' not in text
+    assert '["1mo", "3mo", "6mo", "1y", "2y", "5y"]' in text
+    assert '["1mo", "3mo", "6mo", "1y", "2y"]' in text
+    assert '"Inputs changed. Run the search again."' in text
