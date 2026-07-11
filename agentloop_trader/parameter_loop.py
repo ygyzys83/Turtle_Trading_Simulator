@@ -1,9 +1,12 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from itertools import product
+from math import e, sqrt
+from statistics import NormalDist, median
 from typing import Any
 
+import numpy as np
 import pandas as pd
 
 from agentloop_trader.evaluation import WalkForwardResult, evaluate_walk_forward, synthetic_ohlc_frame
@@ -40,6 +43,54 @@ class OptimizerCandidate:
     train_trades: int
     stability: str
     recommended_risk_per_trade_percent: float
+    plateau_neighbors: int = 1
+    plateau_median_return_percent: float = 0.0
+    plateau_profitable_percent: float = 0.0
+    rolling_profitable_windows: int = 0
+    rolling_windows: int = 0
+    rolling_median_return_percent: float = 0.0
+    rolling_worst_drawdown_percent: float = 0.0
+    validation_trade_returns: tuple[float, ...] = ()
+
+
+@dataclass(frozen=True)
+class LockedTestResult:
+    return_percent: float
+    trades: int
+    win_rate_percent: float
+    profit_factor: float
+    max_drawdown_percent: float
+    passed: bool
+    detail: str
+
+
+@dataclass(frozen=True)
+class BootstrapResult:
+    samples: int
+    completed_trades: int
+    median_return_percent: float
+    fifth_percentile_return_percent: float
+    loss_probability_percent: float
+    ninety_fifth_percentile_drawdown_percent: float
+
+
+@dataclass(frozen=True)
+class TrialAdjustment:
+    tested_candidates: int
+    trade_sharpe: float
+    expected_best_sharpe_from_search: float
+    deflated_sharpe_probability_percent: float
+    evidence: str
+
+
+@dataclass(frozen=True)
+class RobustnessEvidence:
+    parameter_range: dict[str, tuple[float, float]]
+    locked_test: LockedTestResult | None
+    stress_rows: list[dict[str, Any]] = field(default_factory=list)
+    regime_rows: list[dict[str, Any]] = field(default_factory=list)
+    bootstrap: BootstrapResult | None = None
+    trial_adjustment: TrialAdjustment | None = None
 
 
 @dataclass(frozen=True)
@@ -50,6 +101,17 @@ class StrategyInputRecommendation:
     tested_candidates: int
     rejected_candidates: int
     train_fraction: float
+    locked_fraction: float = 0.20
+    robustness: RobustnessEvidence | None = None
+
+
+@dataclass(frozen=True)
+class CrossTickerResult:
+    tested_tickers: int
+    profitable_tickers: int
+    median_return_percent: float
+    worst_drawdown_percent: float
+    rows: list[dict[str, Any]] = field(default_factory=list)
 
 
 BOUNDED_ENTRY_WINDOWS = (15, 20, 25, 30)
@@ -226,8 +288,11 @@ def optimize_strategy_inputs(
     max_candidates_per_strategy: int = 18,
     min_test_trades: int = 2,
     target_max_drawdown_percent: float = 8.0,
+    locked_fraction: float = 0.20,
+    rolling_windows: int = 4,
+    bootstrap_samples: int = 1000,
 ) -> StrategyInputRecommendation:
-    """Rank strategy settings using older data for fit and newer data for proof."""
+    """Select stable settings, then evaluate the winner on an untouched final period."""
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=42)
     candidates = generate_optimizer_settings(current_settings, max_candidates_per_strategy=max_candidates_per_strategy)
     ranked: list[OptimizerCandidate] = []
@@ -242,6 +307,7 @@ def optimize_strategy_inputs(
                 account_equity=account_equity,
                 risk_limits=risk_limits,
                 train_fraction=train_fraction,
+                locked_fraction=locked_fraction,
                 min_test_trades=min_test_trades,
                 target_max_drawdown_percent=target_max_drawdown_percent,
             )
@@ -250,8 +316,71 @@ def optimize_strategy_inputs(
             continue
         ranked.append(candidate)
 
+    ranked = _attach_plateau_scores(ranked)
+    ranked.sort(key=lambda row: row.score, reverse=True)
+    shortlist_size = min(12, len(ranked))
+    shortlist = []
+    for candidate in ranked[:shortlist_size]:
+        rolling = _rolling_evidence(
+            candidate.strategy_type,
+            candidate.settings,
+            data,
+            account_equity,
+            risk_limits,
+            locked_fraction=locked_fraction,
+            windows=rolling_windows,
+        )
+        rolling_bonus = (
+            rolling["median_return_percent"] * 0.35
+            + (rolling["profitable_windows"] / max(1, rolling["windows"])) * 3.0
+            - rolling["worst_drawdown_percent"] * 0.15
+        )
+        shortlist.append(replace(
+            candidate,
+            score=round(candidate.score + rolling_bonus, 2),
+            rolling_profitable_windows=rolling["profitable_windows"],
+            rolling_windows=rolling["windows"],
+            rolling_median_return_percent=rolling["median_return_percent"],
+            rolling_worst_drawdown_percent=rolling["worst_drawdown_percent"],
+        ))
+    ranked = shortlist + ranked[shortlist_size:]
     ranked.sort(key=lambda row: row.score, reverse=True)
     best = ranked[0] if ranked else None
+    robustness = None
+    if best is not None:
+        locked_test, locked_trades = _locked_test(
+            best.strategy_type,
+            best.settings,
+            data,
+            account_equity,
+            risk_limits,
+            locked_fraction=locked_fraction,
+            min_trades=min_test_trades,
+        )
+        full_result = _run_one(best.strategy_type, data, best.settings, account_equity, risk_limits)
+        full_trades = list(full_result["trade_log"])
+        stress_rows = _execution_stress_rows(full_trades, account_equity)
+        regime_rows = _regime_rows(data, full_trades, account_equity, best.settings)
+        bootstrap = _bootstrap_trades(full_trades, account_equity, samples=bootstrap_samples)
+        trial_adjustment = _trial_adjustment(best, ranked)
+        parameter_range = _parameter_plateau_range(best, ranked)
+        final_confidence, final_stability = _final_confidence(
+            best,
+            locked_test,
+            stress_rows,
+            trial_adjustment,
+        )
+        updated_best = replace(best, confidence=final_confidence, stability=final_stability)
+        ranked = [updated_best if row is best else row for row in ranked]
+        best = updated_best
+        robustness = RobustnessEvidence(
+            parameter_range=parameter_range,
+            locked_test=locked_test,
+            stress_rows=stress_rows,
+            regime_rows=regime_rows,
+            bootstrap=bootstrap,
+            trial_adjustment=trial_adjustment,
+        )
     summary = optimizer_summary(best)
     return StrategyInputRecommendation(
         best=best,
@@ -260,6 +389,8 @@ def optimize_strategy_inputs(
         tested_candidates=len(ranked),
         rejected_candidates=rejected,
         train_fraction=train_fraction,
+        locked_fraction=locked_fraction,
+        robustness=robustness,
     )
 
 
@@ -326,13 +457,12 @@ def generate_optimizer_settings(
 
 def optimizer_summary(candidate: OptimizerCandidate | None) -> str:
     if candidate is None:
-        return "No strategy settings had enough newer-data evidence to recommend."
+        return "No strategy settings had enough validation evidence to recommend."
     return (
         f"Best current fit: {candidate.strategy_label}. "
-        f"Use buy lookback {candidate.settings['entry_window']}, sell exit {candidate.settings['exit_window']}, "
-        f"stop {candidate.settings['atr_stop_multiplier']:.2f}x ATR, trend filter {candidate.settings['moving_average_window']}, "
-        f"pullback average {candidate.settings['pullback_average_length']}, and momentum turn {candidate.settings['momentum_turn_length']}. "
-        f"Newer-data return was {candidate.test_return_percent:.2f}% with a {candidate.test_max_drawdown_percent:.2f}% worst drop."
+        f"Suggested settings: {_settings_text(candidate.settings)}. "
+        f"Validation return was {candidate.test_return_percent:.2f}% with a "
+        f"{candidate.test_max_drawdown_percent:.2f}% worst drop. Confidence: {candidate.confidence}."
     )
 
 
@@ -341,19 +471,50 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
     if candidate is None:
         return [{"Item": "Recommendation", "Value": "No recommendation", "Plain English": result.summary}]
     settings = candidate.settings
+    evidence = result.robustness
+    locked = evidence.locked_test if evidence else None
+    trial = evidence.trial_adjustment if evidence else None
+    stress_10 = next(
+        (row for row in evidence.stress_rows if row["Round-trip slippage"] == "10 bps per side"),
+        None,
+    ) if evidence else None
     return [
         {"Item": "Best strategy", "Value": candidate.strategy_label, "Plain English": candidate.reason},
-        {"Item": "Confidence", "Value": candidate.confidence, "Plain English": candidate.stability},
-        {"Item": "Buy lookback", "Value": f"{settings['entry_window']} bars", "Plain English": "Bars used for breakout or trendline entry logic."},
-        {"Item": "Sell exit", "Value": f"{settings['exit_window']} bars", "Plain English": "Bars used to calculate the strategy exit line."},
-        {"Item": "Stop distance", "Value": f"{settings['atr_stop_multiplier']:.2f}x ATR", "Plain English": "Initial stop distance used for sizing and protection."},
-        {"Item": "Trend filter", "Value": f"{settings['moving_average_window']} bars", "Plain English": "Trend average used before allowing long trades."},
-        {"Item": "Pullback average", "Value": f"{settings['pullback_average_length']} bars", "Plain English": "Only affects Trend pullback continuation."},
-        {"Item": "Momentum turn", "Value": f"{settings['momentum_turn_length']} bars", "Plain English": "Used by Trend pullback continuation and Trendline retest continuation."},
-        {"Item": "Suggested strategy risk", "Value": f"{candidate.recommended_risk_per_trade_percent:.2f}%", "Plain English": "Risk size suggested by newer-data drawdown. Account risk limits still apply."},
-        {"Item": "Newer periods profitable", "Value": f"{candidate.profitable_test_periods}/{candidate.tested_periods}", "Plain English": "Checks whether results were spread across newer data instead of coming from one short stretch."},
+        {"Item": "Suggested settings", "Value": _settings_text(settings), "Plain English": "The single setting combination to paper test first."},
+        {"Item": "Strong nearby range", "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}), "Plain English": "Nearby profitable settings. A useful result should not depend on one exact number."},
+        {"Item": "Suggested strategy risk", "Value": f"{candidate.recommended_risk_per_trade_percent:.2f}%", "Plain English": "Risk size suggested by validation-period drawdown. Account risk limits still apply."},
+        {"Item": "Rolling periods profitable", "Value": f"{candidate.rolling_profitable_windows}/{candidate.rolling_windows}", "Plain English": "How often the unchanged settings made money across separate chronological periods."},
+        {"Item": "Locked final test", "Value": _locked_text(locked), "Plain English": "This final period was not used to choose the strategy or settings."},
+        {"Item": "10 bps slippage test", "Value": _stress_text(stress_10), "Plain English": "Estimated result after adding 0.10% price friction to both entry and exit."},
+        {"Item": "Trial-adjusted confidence", "Value": _trial_text(trial), "Plain English": "Reduces confidence when many setting combinations were searched."},
+        {"Item": "Overall confidence", "Value": candidate.confidence, "Plain English": candidate.stability},
         {"Item": "Main concern", "Value": candidate.concern, "Plain English": "What to watch before trusting this setting."},
     ]
+
+
+def optimizer_robustness_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+    candidate = result.best
+    evidence = result.robustness
+    if candidate is None or evidence is None:
+        return []
+    locked = evidence.locked_test
+    bootstrap = evidence.bootstrap
+    trial = evidence.trial_adjustment
+    return [
+        {"Check": "Nearby settings", "Result": f"{candidate.plateau_profitable_percent:.0f}% profitable across {candidate.plateau_neighbors} nearby settings", "Why it matters": "Avoids choosing an isolated lucky setting."},
+        {"Check": "Rolling periods", "Result": f"{candidate.rolling_profitable_windows}/{candidate.rolling_windows} profitable; median {candidate.rolling_median_return_percent:.2f}%", "Why it matters": "Checks different chronological periods."},
+        {"Check": "Locked final period", "Result": _locked_text(locked), "Why it matters": locked.detail if locked else "Not available."},
+        {"Check": "Resampled trade results", "Result": _bootstrap_text(bootstrap), "Why it matters": "Estimates how sensitive results are to a different ordering and mix of trades."},
+        {"Check": "Many settings searched", "Result": _trial_text(trial), "Why it matters": trial.evidence if trial else "Not available."},
+    ]
+
+
+def optimizer_stress_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+    return list(result.robustness.stress_rows) if result.robustness else []
+
+
+def optimizer_regime_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+    return list(result.robustness.regime_rows) if result.robustness else []
 
 
 def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int = 12) -> list[dict[str, Any]]:
@@ -374,10 +535,87 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Profit Factor": candidate.test_profit_factor,
             "Worst Drop %": candidate.test_max_drawdown_percent,
             "Profitable Periods": f"{candidate.profitable_test_periods}/{candidate.tested_periods}",
+            "Nearby Settings": candidate.plateau_neighbors,
+            "Nearby Profitable %": candidate.plateau_profitable_percent,
+            "Rolling Periods": f"{candidate.rolling_profitable_windows}/{candidate.rolling_windows}",
             "Plain English": candidate.reason,
         }
         for index, candidate in enumerate(candidates[:limit])
     ]
+
+
+def _settings_text(settings: dict[str, Any]) -> str:
+    strategy_type = str(settings.get("strategy_type", ""))
+    parts = []
+    if strategy_type != "pullback":
+        parts.append(f"buy lookback {int(settings['entry_window'])}")
+    parts.extend([
+        f"sell exit {int(settings['exit_window'])}",
+        f"stop {float(settings['atr_stop_multiplier']):.2f}x ATR",
+        f"trend filter {int(settings['moving_average_window'])}",
+    ])
+    if strategy_type == "pullback":
+        parts.append(f"pullback average {int(settings['pullback_average_length'])}")
+    if strategy_type in {"pullback", "trendline_retest"}:
+        parts.append(f"momentum turn {int(settings['momentum_turn_length'])}")
+    return "; ".join(parts)
+
+
+def _parameter_range_text(strategy_type: str, ranges: dict[str, tuple[float, float]]) -> str:
+    if not ranges:
+        return "Not available"
+    labels = {
+        "entry_window": "buy lookback",
+        "exit_window": "sell exit",
+        "atr_stop_multiplier": "stop ATR",
+        "moving_average_window": "trend filter",
+        "pullback_average_length": "pullback average",
+        "momentum_turn_length": "momentum turn",
+    }
+    keys = ["exit_window", "atr_stop_multiplier", "moving_average_window"]
+    if strategy_type != "pullback":
+        keys.insert(0, "entry_window")
+    if strategy_type == "pullback":
+        keys.append("pullback_average_length")
+    if strategy_type in {"pullback", "trendline_retest"}:
+        keys.append("momentum_turn_length")
+    parts = []
+    for key in keys:
+        low, high = ranges[key]
+        number = lambda value: f"{value:.2f}" if key == "atr_stop_multiplier" else f"{value:.0f}"
+        parts.append(f"{labels[key]} {number(low)}-{number(high)}")
+    return "; ".join(parts)
+
+
+def _locked_text(locked: LockedTestResult | None) -> str:
+    if locked is None:
+        return "Not available"
+    status = "Passed" if locked.passed else "Did not pass"
+    return f"{status}: {locked.return_percent:.2f}% return, {locked.trades} trades, {locked.max_drawdown_percent:.2f}% worst drop"
+
+
+def _stress_text(row: dict[str, Any] | None) -> str:
+    if not row:
+        return "Not available"
+    status = "Passed" if row["Passed"] else "Did not pass"
+    return f"{status}: {float(row['Return Percent']):.2f}% return"
+
+
+def _trial_text(trial: TrialAdjustment | None) -> str:
+    if trial is None:
+        return "Not available"
+    if trial.evidence.startswith("Insufficient"):
+        return "Not enough completed trades"
+    return f"{trial.deflated_sharpe_probability_percent:.1f}% after {trial.tested_candidates} settings"
+
+
+def _bootstrap_text(bootstrap: BootstrapResult | None) -> str:
+    if bootstrap is None:
+        return "Not enough completed trades"
+    return (
+        f"{bootstrap.fifth_percentile_return_percent:.2f}% fifth-percentile return; "
+        f"{bootstrap.loss_probability_percent:.1f}% chance of loss"
+    )
 
 
 def _evaluate_optimizer_candidate(
@@ -389,14 +627,16 @@ def _evaluate_optimizer_candidate(
     account_equity: float,
     risk_limits: RiskLimits | None,
     train_fraction: float,
+    locked_fraction: float,
     min_test_trades: int,
     target_max_drawdown_percent: float,
 ) -> OptimizerCandidate:
     data = market_data.copy()
     total_bars = len(data)
     warmup_bars = _warmup_bars(settings)
-    split_index = int(total_bars * train_fraction)
-    if split_index < warmup_bars or total_bars - split_index < 30:
+    locked_start = int(total_bars * (1.0 - locked_fraction))
+    split_index = min(int(total_bars * train_fraction), locked_start - 30)
+    if split_index < warmup_bars or locked_start - split_index < 30 or total_bars - locked_start < 30:
         raise ValueError("Not enough bars for strategy input search.")
 
     train_data = data.iloc[:split_index].copy()
@@ -406,18 +646,19 @@ def _evaluate_optimizer_candidate(
 
     oos_start = max(0, split_index - warmup_bars)
     warmup_offset = split_index - oos_start
-    oos_data = data.iloc[oos_start:].copy()
+    oos_data = data.iloc[oos_start:locked_start].copy()
     oos_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
     oos_result = _run_one(strategy_type, oos_data, settings, account_equity, risk_limits)
     oos_trades = [
         trade for trade in oos_result["trade_log"]
         if int(trade.get("entry_bar", 0)) >= warmup_offset
     ]
-    oos_stats = _closed_trade_stats(account_equity, oos_trades, total_bars - split_index)
+    validation_bars = locked_start - split_index
+    oos_stats = _closed_trade_stats(account_equity, oos_trades, validation_bars)
 
-    tested_periods = min(3, max(1, (total_bars - split_index) // 30))
+    tested_periods = min(3, max(1, validation_bars // 30))
     period_pnl = [0.0] * tested_periods
-    test_span = max(1, total_bars - split_index)
+    test_span = max(1, validation_bars)
     for trade in oos_trades:
         global_entry = oos_start + int(trade.get("entry_bar", 0))
         relative_entry = max(0, global_entry - split_index)
@@ -452,6 +693,11 @@ def _evaluate_optimizer_candidate(
         f"profitable in {profitable_periods}/{tested_periods} newer periods."
     )
     recommended_risk = _recommended_risk(settings, drawdown, target_max_drawdown_percent)
+    trade_returns = tuple(
+        float(trade.get("pnl", 0)) / float(trade.get("notional", 0))
+        for trade in oos_trades
+        if float(trade.get("notional", 0)) > 0
+    )
     return OptimizerCandidate(
         strategy_label=strategy_label,
         strategy_type=strategy_type,
@@ -471,6 +717,370 @@ def _evaluate_optimizer_candidate(
         train_trades=train_trades,
         stability=_stability_read(score, test_trades, drawdown, train_return, return_pct, profitable_periods, tested_periods),
         recommended_risk_per_trade_percent=recommended_risk,
+        validation_trade_returns=trade_returns,
+    )
+
+
+def _evaluate_range(
+    strategy_type: str,
+    settings: dict[str, Any],
+    data: pd.DataFrame,
+    start: int,
+    end: int,
+    account_equity: float,
+    risk_limits: RiskLimits | None,
+) -> tuple[dict[str, Any], list[dict]]:
+    warmup = _warmup_bars(settings)
+    warm_start = max(0, start - warmup)
+    segment = data.iloc[warm_start:end].copy()
+    segment.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
+    result = _run_one(strategy_type, segment, settings, account_equity, risk_limits)
+    offset = start - warm_start
+    trades = [trade for trade in result["trade_log"] if int(trade.get("entry_bar", 0)) >= offset]
+    return _closed_trade_stats(account_equity, trades, max(1, end - start)), trades
+
+
+def _attach_plateau_scores(candidates: list[OptimizerCandidate]) -> list[OptimizerCandidate]:
+    updated = []
+    for candidate in candidates:
+        neighbors = [
+            row for row in candidates
+            if row.strategy_type == candidate.strategy_type
+            and _settings_distance(candidate.settings, row.settings) <= 2.5
+        ]
+        returns = [row.test_return_percent for row in neighbors]
+        median_return = float(median(returns)) if returns else candidate.test_return_percent
+        profitable_percent = sum(value > 0 for value in returns) / len(returns) * 100 if returns else 0.0
+        isolation_penalty = 2.0 if len(neighbors) < 3 else 0.0
+        plateau_adjustment = median_return * 0.25 + (profitable_percent / 100 - 0.5) * 3.0 - isolation_penalty
+        updated.append(replace(
+            candidate,
+            score=round(candidate.score + plateau_adjustment, 2),
+            plateau_neighbors=len(neighbors),
+            plateau_median_return_percent=round(median_return, 2),
+            plateau_profitable_percent=round(profitable_percent, 1),
+        ))
+    return updated
+
+
+def _rolling_evidence(
+    strategy_type: str,
+    settings: dict[str, Any],
+    data: pd.DataFrame,
+    account_equity: float,
+    risk_limits: RiskLimits | None,
+    *,
+    locked_fraction: float,
+    windows: int,
+) -> dict[str, Any]:
+    end = int(len(data) * (1.0 - locked_fraction))
+    start = _warmup_bars(settings)
+    usable = max(0, end - start)
+    window_count = min(max(1, windows), max(1, usable // 30))
+    boundaries = np.linspace(start, end, window_count + 1, dtype=int)
+    rows = []
+    for index in range(window_count):
+        left, right = int(boundaries[index]), int(boundaries[index + 1])
+        if right - left < 10:
+            continue
+        try:
+            stats, _ = _evaluate_range(
+                strategy_type, settings, data, left, right, account_equity, risk_limits
+            )
+        except ValueError:
+            continue
+        rows.append(stats)
+    returns = [float(row["return_pct"]) for row in rows]
+    return {
+        "windows": len(rows),
+        "profitable_windows": sum(value > 0 for value in returns),
+        "median_return_percent": round(float(median(returns)), 2) if returns else 0.0,
+        "worst_drawdown_percent": round(max((float(row["max_drawdown_pct"]) for row in rows), default=0.0), 2),
+    }
+
+
+def _parameter_plateau_range(
+    best: OptimizerCandidate,
+    candidates: list[OptimizerCandidate],
+) -> dict[str, tuple[float, float]]:
+    neighbors = [
+        row for row in candidates
+        if row.strategy_type == best.strategy_type
+        and row.test_return_percent >= 0
+        and _settings_distance(best.settings, row.settings) <= 2.5
+    ] or [best]
+    keys = (
+        "entry_window",
+        "exit_window",
+        "atr_stop_multiplier",
+        "moving_average_window",
+        "pullback_average_length",
+        "momentum_turn_length",
+    )
+    return {
+        key: (
+            min(float(row.settings[key]) for row in neighbors),
+            max(float(row.settings[key]) for row in neighbors),
+        )
+        for key in keys
+    }
+
+
+def _locked_test(
+    strategy_type: str,
+    settings: dict[str, Any],
+    data: pd.DataFrame,
+    account_equity: float,
+    risk_limits: RiskLimits | None,
+    *,
+    locked_fraction: float,
+    min_trades: int,
+) -> tuple[LockedTestResult, list[dict]]:
+    start = int(len(data) * (1.0 - locked_fraction))
+    stats, trades = _evaluate_range(
+        strategy_type, settings, data, start, len(data), account_equity, risk_limits
+    )
+    passed = bool(
+        stats["total_trades"] >= min_trades
+        and stats["return_pct"] > 0
+        and stats["profit_factor"] >= 1.0
+        and stats["max_drawdown_pct"] <= 10.0
+    )
+    if stats["total_trades"] < min_trades:
+        detail = "Not enough completed trades in the locked period."
+    elif passed:
+        detail = "The untouched final period stayed profitable with controlled drawdown."
+    else:
+        detail = "The untouched final period did not confirm every profitability and drawdown requirement."
+    return LockedTestResult(
+        return_percent=float(stats["return_pct"]),
+        trades=int(stats["total_trades"]),
+        win_rate_percent=float(stats["win_rate"]),
+        profit_factor=float(stats["profit_factor"]),
+        max_drawdown_percent=float(stats["max_drawdown_pct"]),
+        passed=passed,
+        detail=detail,
+    ), trades
+
+
+def _execution_stress_rows(trades: list[dict], account_equity: float) -> list[dict[str, Any]]:
+    rows = []
+    for basis_points in (0, 5, 10, 20):
+        adjusted = []
+        for trade in trades:
+            entry = float(trade.get("entry", 0))
+            exit_price = float(trade.get("exit", 0))
+            shares = float(trade.get("shares", 0))
+            execution_cost = (entry + exit_price) * shares * basis_points / 10_000
+            record = dict(trade)
+            record["pnl"] = float(trade.get("pnl", 0)) - execution_cost
+            record["max_adverse_pnl"] = float(trade.get("max_adverse_pnl", 0)) - execution_cost
+            adjusted.append(record)
+        stats = _closed_trade_stats(account_equity, adjusted, max(1, len(adjusted)))
+        rows.append({
+            "Round-trip slippage": f"{basis_points} bps per side",
+            "Return Percent": stats["return_pct"],
+            "Profit Factor": stats["profit_factor"],
+            "Worst Drop Percent": stats["max_drawdown_pct"],
+            "Passed": bool(stats["total_trades"] > 0 and stats["return_pct"] > 0),
+        })
+    return rows
+
+
+def _regime_rows(
+    data: pd.DataFrame,
+    trades: list[dict],
+    account_equity: float,
+    settings: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if data.empty or not trades:
+        return []
+    close = data["Close"].astype(float)
+    trend_window = max(20, int(settings.get("moving_average_window", 50)))
+    trend_average = close.rolling(trend_window).mean()
+    trend_prior = trend_average.shift(max(1, trend_window // 10))
+    previous_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            data["High"].astype(float) - data["Low"].astype(float),
+            (data["High"].astype(float) - previous_close).abs(),
+            (data["Low"].astype(float) - previous_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    atr_percent = true_range.ewm(alpha=1 / 14, adjust=False, min_periods=14).mean() / close * 100
+    volatility_cutoff = float(atr_percent.dropna().median()) if not atr_percent.dropna().empty else 0.0
+    groups: dict[str, list[dict]] = {
+        "Rising trend": [], "Sideways trend": [], "Falling trend": [],
+        "Lower volatility": [], "Higher volatility": [],
+    }
+    for trade in trades:
+        index = int(trade.get("entry_bar", -1))
+        if index < 0 or index >= len(data):
+            continue
+        average = trend_average.iloc[index]
+        prior = trend_prior.iloc[index]
+        price = close.iloc[index]
+        if pd.notna(average) and pd.notna(prior) and price > average and average > prior:
+            groups["Rising trend"].append(trade)
+        elif pd.notna(average) and pd.notna(prior) and price < average and average < prior:
+            groups["Falling trend"].append(trade)
+        else:
+            groups["Sideways trend"].append(trade)
+        volatility = atr_percent.iloc[index]
+        groups["Higher volatility" if pd.notna(volatility) and volatility > volatility_cutoff else "Lower volatility"].append(trade)
+    rows = []
+    for name, group in groups.items():
+        stats = _closed_trade_stats(account_equity, group, max(1, len(group)))
+        rows.append({
+            "Market condition": name,
+            "Trades": stats["total_trades"],
+            "Return Percent": stats["return_pct"],
+            "Win Rate Percent": stats["win_rate"],
+            "Profit Factor": stats["profit_factor"],
+            "Worst Drop Percent": stats["max_drawdown_pct"],
+        })
+    return rows
+
+
+def _bootstrap_trades(
+    trades: list[dict],
+    account_equity: float,
+    *,
+    samples: int,
+    seed: int = 42,
+) -> BootstrapResult | None:
+    pnl = np.asarray([float(trade.get("pnl", 0)) for trade in trades], dtype=float)
+    if len(pnl) < 2 or samples <= 0:
+        return None
+    rng = np.random.default_rng(seed)
+    returns = []
+    drawdowns = []
+    for _ in range(samples):
+        sequence = rng.choice(pnl, size=len(pnl), replace=True)
+        equity = account_equity + np.cumsum(sequence)
+        curve = np.concatenate(([account_equity], equity))
+        peaks = np.maximum.accumulate(curve)
+        drawdown = np.max(np.where(peaks > 0, (peaks - curve) / peaks * 100, 0))
+        returns.append(float(sequence.sum() / account_equity * 100))
+        drawdowns.append(float(drawdown))
+    return BootstrapResult(
+        samples=samples,
+        completed_trades=len(trades),
+        median_return_percent=round(float(np.median(returns)), 2),
+        fifth_percentile_return_percent=round(float(np.percentile(returns, 5)), 2),
+        loss_probability_percent=round(float(np.mean(np.asarray(returns) < 0) * 100), 1),
+        ninety_fifth_percentile_drawdown_percent=round(float(np.percentile(drawdowns, 95)), 2),
+    )
+
+
+def _trade_sharpe(values: tuple[float, ...]) -> float:
+    if len(values) < 2:
+        return 0.0
+    array = np.asarray(values, dtype=float)
+    deviation = float(np.std(array, ddof=1))
+    return float(np.mean(array) / deviation) if deviation > 0 else 0.0
+
+
+def _trial_adjustment(
+    best: OptimizerCandidate,
+    candidates: list[OptimizerCandidate],
+) -> TrialAdjustment | None:
+    values = np.asarray(best.validation_trade_returns, dtype=float)
+    candidate_sharpes = [
+        _trade_sharpe(row.validation_trade_returns)
+        for row in candidates
+        if len(row.validation_trade_returns) >= 2
+    ]
+    if len(values) < 3 or len(candidate_sharpes) < 2:
+        return TrialAdjustment(
+            tested_candidates=len(candidates),
+            trade_sharpe=round(_trade_sharpe(best.validation_trade_returns), 3),
+            expected_best_sharpe_from_search=0.0,
+            deflated_sharpe_probability_percent=0.0,
+            evidence="Insufficient completed validation trades for a trial-adjusted probability.",
+        )
+    sharpe = _trade_sharpe(best.validation_trade_returns)
+    sharpe_std = float(np.std(candidate_sharpes, ddof=1))
+    trials = max(2, len(candidates))
+    normal = NormalDist()
+    gamma = 0.5772156649
+    expected_best = sharpe_std * (
+        (1 - gamma) * normal.inv_cdf(1 - 1 / trials)
+        + gamma * normal.inv_cdf(1 - 1 / (trials * e))
+    )
+    centered = values - float(np.mean(values))
+    sigma = float(np.std(values, ddof=0))
+    skew = float(np.mean((centered / sigma) ** 3)) if sigma > 0 else 0.0
+    kurtosis = float(np.mean((centered / sigma) ** 4)) if sigma > 0 else 3.0
+    denominator = max(1e-9, 1 - skew * sharpe + ((kurtosis - 1) / 4) * sharpe ** 2)
+    statistic = (sharpe - expected_best) * sqrt(len(values) - 1) / sqrt(denominator)
+    probability = normal.cdf(statistic) * 100
+    evidence = (
+        "Stronger after accounting for the number of settings tested."
+        if probability >= 80
+        else "Moderate after accounting for the number of settings tested."
+        if probability >= 60
+        else "Weak after accounting for the number of settings tested."
+    )
+    return TrialAdjustment(
+        tested_candidates=len(candidates),
+        trade_sharpe=round(sharpe, 3),
+        expected_best_sharpe_from_search=round(expected_best, 3),
+        deflated_sharpe_probability_percent=round(probability, 1),
+        evidence=evidence,
+    )
+
+
+def _final_confidence(
+    best: OptimizerCandidate,
+    locked: LockedTestResult,
+    stress_rows: list[dict[str, Any]],
+    trial: TrialAdjustment | None,
+) -> tuple[str, str]:
+    rolling_ratio = best.rolling_profitable_windows / max(1, best.rolling_windows)
+    stress_10 = next((row for row in stress_rows if row["Round-trip slippage"] == "10 bps per side"), {})
+    trial_probability = trial.deflated_sharpe_probability_percent if trial else 0.0
+    if locked.passed and rolling_ratio >= 0.75 and bool(stress_10.get("Passed")) and trial_probability >= 80:
+        return "High", "Strong enough for paper testing across rolling windows, locked data, execution stress, and trial adjustment."
+    if locked.passed and rolling_ratio >= 0.5 and bool(stress_10.get("Passed")):
+        return "Medium", "Reasonable for paper testing, but the statistical or rolling evidence is not uniformly strong."
+    return "Low", "Historical evidence is fragile or incomplete; treat this as a research candidate, not a preferred setup."
+
+
+def validate_settings_across_tickers(
+    settings: dict[str, Any],
+    market_data_by_symbol: dict[str, pd.DataFrame],
+    account_equity: float,
+    risk_limits: RiskLimits | None = None,
+) -> CrossTickerResult:
+    strategy_type = str(settings.get("strategy_type", "trendline_retest"))
+    rows = []
+    for symbol, data in market_data_by_symbol.items():
+        try:
+            result = _run_one(strategy_type, data, settings, account_equity, risk_limits)
+            stats = _closed_trade_stats(account_equity, result["trade_log"], len(data))
+            rows.append({
+                "Ticker": str(symbol).upper(),
+                "Trades": stats["total_trades"],
+                "Return Percent": stats["return_pct"],
+                "Profit Factor": stats["profit_factor"],
+                "Worst Drop Percent": stats["max_drawdown_pct"],
+                "Profitable": bool(stats["total_trades"] >= 2 and stats["return_pct"] > 0),
+            })
+        except ValueError as exc:
+            rows.append({
+                "Ticker": str(symbol).upper(), "Trades": 0, "Return Percent": 0.0,
+                "Profit Factor": 0.0, "Worst Drop Percent": 0.0,
+                "Profitable": False, "Problem": str(exc),
+            })
+    returns = [float(row["Return Percent"]) for row in rows]
+    return CrossTickerResult(
+        tested_tickers=len(rows),
+        profitable_tickers=sum(bool(row["Profitable"]) for row in rows),
+        median_return_percent=round(float(median(returns)), 2) if returns else 0.0,
+        worst_drawdown_percent=round(max((float(row["Worst Drop Percent"]) for row in rows), default=0.0), 2),
+        rows=rows,
     )
 
 

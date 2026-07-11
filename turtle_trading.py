@@ -112,9 +112,13 @@ from agentloop_trader.parameter_loop import (
     evaluate_parameter_candidates,
     optimize_strategy_inputs,
     optimizer_candidate_records,
+    optimizer_regime_records,
     optimizer_recommendation_records,
+    optimizer_robustness_records,
+    optimizer_stress_records,
     recommend_candidate,
     recommendation_summary,
+    validate_settings_across_tickers,
 )
 from agentloop_trader.research_agent import (
     build_research_agent_report,
@@ -1888,7 +1892,7 @@ train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step
 run_parameter_loop = st.sidebar.checkbox(
     "Find recommended strategy inputs",
     value=False,
-    help="Tests bounded strategy input combinations across all four strategies, then recommends the strongest newer-data result. It does not change your sidebar settings automatically.",
+    help="Tests bounded inputs across all four strategies. It favors nearby settings that also work, checks separate time periods, reserves the final 20% of history for one untouched test, and adds trading-cost stress. It does not change your settings automatically.",
 )
 max_parameter_candidates = st.sidebar.slider("Settings to compare per strategy", 4, 24, 12, step=4)
 
@@ -4145,6 +4149,74 @@ if command_center_view == "New Trade":
                 apply_settings["risk_per_trade_pct"] = strategy_optimizer_result.best.recommended_risk_per_trade_percent
                 st.session_state["optimizer_apply_settings"] = apply_settings
                 st.rerun()
+            with st.expander("Why this recommendation", expanded=False):
+                st.dataframe(
+                    pd.DataFrame(optimizer_robustness_records(strategy_optimizer_result)),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.markdown("##### Trading-cost test")
+                st.dataframe(
+                    pd.DataFrame(optimizer_stress_records(strategy_optimizer_result)),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.markdown("##### Results by market condition")
+                st.dataframe(
+                    pd.DataFrame(optimizer_regime_records(strategy_optimizer_result)),
+                    width="stretch",
+                    hide_index=True,
+                )
+            with st.expander("Test these settings on other tickers", expanded=False):
+                if data_source == "Synthetic":
+                    st.caption("Choose Ticker (Alpaca) or Ticker (yfinance) first. This check needs real price history.")
+                elif strategy_optimizer_result.best is None:
+                    st.caption("No recommended settings are available to test.")
+                else:
+                    comparison_symbols = st.text_input(
+                        "Other tickers",
+                        value="MSFT, NVDA, AMZN, META, GOOGL",
+                        help="The app applies the recommended settings without changing them. Use liquid stocks that are not the ticker used to choose the settings.",
+                    )
+                    if st.button("Run Other-Ticker Test"):
+                        symbols = []
+                        for value in comparison_symbols.split(","):
+                            candidate_symbol = value.strip().upper()
+                            if candidate_symbol and candidate_symbol != ticker and candidate_symbol not in symbols:
+                                symbols.append(candidate_symbol)
+                        symbols = symbols[:8]
+                        loaded = {}
+                        problems = []
+                        with st.spinner("Testing unchanged settings on other tickers..."):
+                            for comparison_symbol in symbols:
+                                try:
+                                    loaded[comparison_symbol] = fetch_price_data_for_source(
+                                        comparison_symbol, period, interval, data_source
+                                    )
+                                except Exception as exc:
+                                    problems.append(f"{comparison_symbol}: {exc}")
+                        cross_result = validate_settings_across_tickers(
+                            strategy_optimizer_result.best.settings,
+                            loaded,
+                            float(paper_order_risk_equity),
+                            risk_limits,
+                        )
+                        st.session_state["optimizer_cross_ticker"] = {
+                            "settings": dict(strategy_optimizer_result.best.settings),
+                            "result": cross_result,
+                            "problems": problems,
+                        }
+                    cross_state = st.session_state.get("optimizer_cross_ticker")
+                    if cross_state and cross_state.get("settings") == strategy_optimizer_result.best.settings:
+                        cross_result = cross_state["result"]
+                        st.markdown(
+                            f"**Profitable on {cross_result.profitable_tickers} of {cross_result.tested_tickers} other tickers.** "
+                            f"Median return: **{cross_result.median_return_percent:.2f}%**; "
+                            f"worst drop: **{cross_result.worst_drawdown_percent:.2f}%**."
+                        )
+                        st.dataframe(pd.DataFrame(cross_result.rows), width="stretch", hide_index=True)
+                        for problem in cross_state.get("problems", []):
+                            st.warning(problem)
             if show_portfolio_evidence:
                 st.markdown("#### Top tested settings *")
                 st.dataframe(
@@ -4152,16 +4224,8 @@ if command_center_view == "New Trade":
                     width="stretch",
                     hide_index=True,
                 )
-                if parameter_candidates:
-                    with st.expander("Original breakout-only nearby test *", expanded=False):
-                        st.markdown(f"**Suggested setting:** {recommendation_summary(recommended_candidate)}")
-                        st.dataframe(
-                            pd.DataFrame(candidate_records(parameter_candidates)),
-                            width="stretch",
-                            hide_index=True,
-                        )
             st.caption(
-                "This is a bounded comparison of nearby settings, not proof of a universal optimum. "
+                "This searches bounded settings and favors stable ranges, rolling results, an untouched final period, and realistic trading costs. It is not proof of future profit. "
                 "It does not change account risk limits, broker access, order mode, credentials, or the Kill Switch."
             )
     

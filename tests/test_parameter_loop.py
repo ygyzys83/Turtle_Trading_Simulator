@@ -1,4 +1,5 @@
 from agentloop_trader.models import StrategyConfig
+from agentloop_trader.evaluation import synthetic_ohlc_frame
 from agentloop_trader.parameter_loop import (
     BOUNDED_ATR_MULTIPLIERS,
     BOUNDED_ENTRY_WINDOWS,
@@ -10,10 +11,27 @@ from agentloop_trader.parameter_loop import (
     generate_optimizer_settings,
     optimize_strategy_inputs,
     optimizer_candidate_records,
+    optimizer_regime_records,
     optimizer_recommendation_records,
+    optimizer_robustness_records,
+    optimizer_stress_records,
     recommend_candidate,
     recommendation_summary,
+    validate_settings_across_tickers,
 )
+
+
+CURRENT_SETTINGS = {
+    "strategy_label": "Trendline retest continuation",
+    "strategy_type": "trendline_retest",
+    "entry_window": 20,
+    "exit_window": 10,
+    "atr_stop_multiplier": 2.0,
+    "risk_per_trade_pct": 1.0,
+    "moving_average_window": 50,
+    "pullback_average_length": 20,
+    "momentum_turn_length": 5,
+}
 
 
 def test_generate_bounded_candidates_stays_inside_allowed_parameter_sets():
@@ -86,17 +104,7 @@ def test_parameter_loop_recommendation_and_records_are_display_ready():
 
 
 def test_optimizer_searches_all_strategies_and_returns_display_records():
-    current_settings = {
-        "strategy_label": "Trendline retest continuation",
-        "strategy_type": "trendline_retest",
-        "entry_window": 20,
-        "exit_window": 10,
-        "atr_stop_multiplier": 2.0,
-        "risk_per_trade_pct": 1.0,
-        "moving_average_window": 50,
-        "pullback_average_length": 20,
-        "momentum_turn_length": 5,
-    }
+    current_settings = dict(CURRENT_SETTINGS)
 
     settings = generate_optimizer_settings(current_settings, max_candidates_per_strategy=2)
     strategy_names = {row[0] for row in settings}
@@ -123,6 +131,13 @@ def test_optimizer_searches_all_strategies_and_returns_display_records():
     assert result.candidates == sorted(result.candidates, key=lambda row: row.score, reverse=True)
     assert optimizer_recommendation_records(result)
     assert optimizer_candidate_records(result.candidates)
+    assert result.robustness is not None
+    assert result.robustness.locked_test is not None
+    assert result.best.rolling_windows > 0
+    assert result.best.plateau_neighbors > 0
+    assert optimizer_robustness_records(result)
+    assert optimizer_stress_records(result)
+    assert optimizer_regime_records(result)
 
 
 def test_optimizer_candidate_subset_varies_more_than_one_input_dimension():
@@ -138,3 +153,46 @@ def test_optimizer_candidate_subset_varies_more_than_one_input_dimension():
     assert len({row["entry_window"] for row in breakout}) > 1
     assert len({row["atr_stop_multiplier"] for row in breakout}) > 1
     assert len({row["moving_average_window"] for row in breakout}) > 1
+
+
+def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():
+    result = optimize_strategy_inputs(
+        market_data=synthetic_ohlc_frame(seed=19),
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=2,
+        bootstrap_samples=200,
+    )
+
+    stress_returns = [row["Return Percent"] for row in optimizer_stress_records(result)]
+    assert stress_returns == sorted(stress_returns, reverse=True)
+    assert result.robustness.bootstrap == optimize_strategy_inputs(
+        market_data=synthetic_ohlc_frame(seed=19),
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=2,
+        bootstrap_samples=200,
+    ).robustness.bootstrap
+
+
+def test_cross_ticker_check_uses_the_selected_settings_without_reoptimizing():
+    result = optimize_strategy_inputs(
+        market_data=synthetic_ohlc_frame(seed=42),
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=2,
+        bootstrap_samples=100,
+    )
+    selected_settings = dict(result.best.settings)
+    other_tickers = {
+        "AAA": synthetic_ohlc_frame(seed=7),
+        "BBB": synthetic_ohlc_frame(seed=8),
+        "CCC": synthetic_ohlc_frame(seed=9),
+    }
+
+    cross_result = validate_settings_across_tickers(selected_settings, other_tickers, 50_000)
+
+    assert cross_result.tested_tickers == 3
+    assert len(cross_result.rows) == 3
+    assert selected_settings == result.best.settings
+    assert all(row["Ticker"] in other_tickers for row in cross_result.rows)

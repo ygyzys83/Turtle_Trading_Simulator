@@ -14,7 +14,8 @@ A governed trading simulator, paper-trading console, and research lab for testin
 - Runs each trade intent through deterministic risk checks.
 - Supports explicit execution modes: backtest only, paper trading, shadow mode, live with approval, and automated live.
 - Adds an out-of-sample walk-forward evaluation panel to compare training and test-period behavior.
-- Adds a bounded parameter loop that ranks allowed strategy settings without changing risk or execution code.
+- Adds a bounded strategy-input search that favors stable nearby settings, rolling periods, an untouched final period, and realistic execution-cost stress.
+- Can apply the selected settings unchanged to other tickers and report whether the result generalizes.
 - Adds portfolio-aware risk policy and execution preflight checks.
 - Adds a broker adapter interface with a local simulator and Alpaca paper-order support.
 - Adds durable JSONL audit logs and shadow-mode decision recording.
@@ -55,7 +56,7 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Break-even and ATR trailing protection turn on when the highest price since entry reaches the saved R threshold; once active, protection does not loosen.
 - Results include unrealized profit or loss from a simulated position still open on the final bar.
 - Newer-data and optimizer comparisons use completed trades on both sides of the split so open-position P&L cannot skew one side.
-- Commission, spread, market impact, and slippage are not estimated. Treat paper fills and live fills as the final execution test.
+- Normal backtest results do not deduct commission, spread, market impact, or slippage. The strategy-input recommendation separately shows 5, 10, and 20 basis-point-per-side stress results; paper and live fills remain the final execution test.
 - Alpaca and Yahoo price data are validated, sorted, deduplicated, and checked for impossible OHLC values before use.
 
 ## Current Modules

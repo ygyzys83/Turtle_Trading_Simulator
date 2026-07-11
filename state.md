@@ -1,0 +1,499 @@
+# Trading Simulator - Conversation State Handoff
+
+Last updated: 2026-07-10 (Pacific Time)
+
+Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
+
+## Project Location
+
+Primary project directory:
+
+`C:\Users\godma\PycharmProjects\Trading_Simulator`
+
+Primary Streamlit entry point:
+
+`turtle_trading.py`
+
+Python package:
+
+`agentloop_trader\`
+
+The user manually creates Git commits and pushes them. When the user says "let's commit," provide a commit message only. Do not commit or push on the user's behalf unless they explicitly change that instruction.
+
+## Product Goal
+
+Build a simple, credible automated trading application for the user's own small Alpaca account while also making it an impressive AI Technical Product Manager portfolio project.
+
+The intended product story is:
+
+1. The user provides a ticker, or eventually receives candidate tickers from a scanner/recommendation loop.
+2. Deterministic research and optional LLM explanation assess the setup.
+3. The app compares strategies and strategy inputs.
+4. Historical simulation and newer-data testing show how the selected rules behaved.
+5. The user tests the workflow through Alpaca paper trading.
+6. The user normally approves entries manually and lets the background worker manage exits.
+7. Full paper automation is available for testing but is not the default daily workflow.
+8. Live trading is wired but remains deliberately restricted until paper validation is complete.
+
+The immediate objective is not additional feature expansion. It is to run paper trading for at least two weeks, observe real behavior, and correct issues found under actual market conditions.
+
+## User Preferences And Working Style
+
+- Use simple, natural, explicit language throughout the UI.
+- Do not use ambiguous jargon when a plain description is available.
+- Match instructions to exact UI labels.
+- When giving manual test instructions, always state:
+  - Workspace: Daily Trading Screen or Full Records and Evidence.
+  - Command-center page: Open Positions, Ideas, New Trade, Alpaca, or Paper Review.
+  - Order mode: Backtest only, Paper trading, Practice mode, or live mode.
+  - Automation setting: Manual, Auto exits, or Auto entries and exits.
+  - Exact buttons, checkboxes, and expected messages.
+- The user is an experienced trader/investor. Do not add ceremony merely to protect paper trading.
+- Keep essential deterministic controls, audit records, and a Kill Switch, but do not clutter the daily workflow with repetitive checklists.
+- Detailed records belong in Full Records and Evidence or collapsed expanders.
+- Do not remove completed functionality casually. Hide or consolidate detailed evidence when it is useful but not needed daily.
+- Prioritize research quality, strategy quality, correct math, and reliable automation over governance theater.
+- The user wants decisive implementation and large safe batches rather than artificial batching.
+- The user controls Git commits.
+
+## Intended Daily Workflow
+
+### Sidebar
+
+The sidebar is organized in this order:
+
+1. Kill Switch.
+2. Background Automation worker controls.
+3. Navigation / Workspace.
+4. Automation level.
+5. Paper trading and order behavior.
+6. Ticker and price data.
+7. Strategy settings.
+8. Risk limits.
+9. Research options.
+10. Setup quality checks.
+11. Advanced files/reset controls in a collapsed section.
+
+### Main Command Center
+
+The main pages are:
+
+- Open Positions: primary daily position-management and exit surface.
+- Ideas: scans a bounded ticker list and creates deterministic or optional LLM research reads.
+- New Trade: research, BUY decision, backtest, strategy comparison, and order preparation.
+- Alpaca: account summary, waiting orders, order actions, and automation status.
+- Paper Review: daily paper-trading journal, progress, and performance review.
+
+Two workspaces exist:
+
+- Daily Trading Screen: streamlined daily operation.
+- Full Records and Evidence *: adds detailed rules, logs, lifecycle tables, audit evidence, and deployment records. An asterisk marks Full Records-only content.
+
+## Current Strategy Set
+
+The app supports four long strategies.
+
+### 1. Breakout continuation
+
+- Entry: completed-bar close moves above the highest prior bar high over the selected buy lookback.
+- Trend requirement: price is above a rising trend-filter SMA.
+- Exit line: lowest prior bar low over the selected sell exit length.
+- Initial stop: selected ATR multiplier below entry.
+
+### 2. Trend pullback continuation
+
+- Trend requirement: price is above a rising long-term trend-filter SMA.
+- Pullback requirement: recent price action reaches the selected pullback-average area.
+- Momentum requirement: price turns back up above the selected short momentum average.
+- Historical and live initial stop: lower of the recent pullback low or the ATR stop.
+- Strategy exit: selected sell-length moving average.
+
+### 3. Trendline breakout
+
+- Finds recent descending trendlines from confirmed swing highs.
+- Requires a true close crossing from below the line to above it, not merely a price already above the line.
+- Requires price above a rising trend-filter SMA.
+- Initial stop: selected ATR multiplier.
+- Strategy exit: selected prior-low channel.
+
+### 4. Trendline retest continuation
+
+- Requires a recent descending-trendline breakout.
+- Waits for a retest near the broken line and a momentum turn upward.
+- A pending breakout expires after the configured trendline lookback, preventing stale retests.
+- Historical and live initial stop: lower of the structural retest stop and the ATR stop.
+- Strategy exit: selected prior-low channel.
+
+## Indicator And Market-Data Rules
+
+- ATR uses the standard Wilder-smoothed 14-bar true range.
+- ATR is interval-specific. A 1-hour ATR and daily ATR are different measurements.
+- Strategy signals and indicators use completed bars only.
+- The newest forming bar is preserved separately for current price, high, and order repricing.
+- Alpaca and Yahoo data are sorted, deduplicated, converted to numeric OHLCV values, and validated for impossible ranges.
+- Alpaca is the preferred real-ticker data source.
+- Yahoo remains available as a second option.
+- Synthetic data remains the app default so startup is immediate and does not depend on an API call.
+- Alpaca free market data may use the IEX feed and therefore may not represent full consolidated-market volume.
+- Event-calendar/fundamental data is not fully connected. Event risk is informational unless a future implementation explicitly changes it.
+
+## Backtest Contract
+
+- Historical entries occur at the completed signal bar's close.
+- Protective stops fill at the stop price.
+- If a bar opens below a long stop, the simulated fill occurs at that bar's open to model the gap.
+- Strategy exits based on a completed close fill at that close.
+- Position sizing is recomputed from account equity, selected strategy risk, stop distance, and configured risk caps.
+- Historical trade records include:
+  - Entry and exit.
+  - Quantity and notional.
+  - Initial risk dollars and account-risk percentage.
+  - Stop.
+  - Exit rule.
+  - P&L.
+  - Maximum adverse movement during the trade.
+- Final equity includes unrealized P&L from a simulated position still open on the final bar.
+- Completed-trade metrics such as win rate and profit factor exclude that open trade.
+- Maximum drawdown includes adverse intratrade movement, not only closed-trade endpoints.
+- Commission, spread, market impact, and slippage are not modeled. Paper fills are required to evaluate execution realism.
+- Research Inputs are setup-quality descriptions. They do not change historical P&L unless they are explicitly implemented as strategy rules.
+- Strategy Settings and Risk Limits do affect simulated orders and historical results.
+
+## Risk And Position-Sizing Hierarchy
+
+The strategy proposes raw quantity from:
+
+`strategy risk dollars / stop risk per share`
+
+Then deterministic sizing applies the most restrictive quantity allowed by:
+
+1. Raw strategy quantity.
+2. Maximum quantity.
+3. Max risk per trade.
+4. Max new order size.
+5. Remaining portfolio exposure.
+6. Remaining symbol concentration.
+7. Available cash.
+8. Daily-loss state.
+
+Relevant distinctions:
+
+- Strategy risk per trade controls the strategy's desired sizing.
+- Max risk per trade is the hard account-level ceiling.
+- Max new order size caps each new order's notional value.
+- Max symbol concentration caps existing ticker exposure plus the proposed order.
+- Max portfolio exposure includes positions and remaining unfilled BUY-order exposure.
+- Max open positions includes symbols represented by waiting BUY orders.
+- Daily loss is calculated from Alpaca current portfolio value versus Alpaca prior-day equity.
+- The daily-loss dollar threshold is based on prior-day equity, not the already-reduced current equity.
+- Adding to an existing filled position may be enabled.
+- A second waiting BUY for the same ticker remains blocked even when adding to a filled position is allowed.
+- Exits are not blocked by entry risk sizing because reducing exposure must remain possible.
+
+## Per-Position Exit Management
+
+Alpaca combines multiple buys for one ticker into one broker position. The app manages that combined position with one saved exit plan.
+
+When an additional lot changes the Alpaca average entry:
+
+- The position's original risk distance is preserved.
+- The protective stop is rebased from the new average entry.
+- The app uses the most recent filled/adopted/manual position exit settings, not an unrelated waiting add-on order.
+
+The active sell trigger is the highest valid value among:
+
+1. Original protective stop.
+2. Current strategy exit line.
+3. Break-even stop, once enabled.
+4. ATR trailing stop, once enabled.
+5. Previously saved trigger.
+
+This means protection can tighten but cannot loosen.
+
+### R-based profit protection
+
+`1R = entry price - original stop price` for a long position.
+
+Defaults:
+
+- Move stop to break-even after the highest price since entry reaches +1R.
+- Start ATR trailing after the highest price since entry reaches +2R.
+- Trail by 3 ATR from the highest high since entry.
+
+Important behavior:
+
+- Activation uses the highest price reached since entry, not current price.
+- Once a threshold has been reached, the protection remains active after a pullback.
+- The position table displays current profit in R and highest profit reached in R separately.
+- The exact interval, sell exit length, trend filter, pullback average, momentum length, ATR multiplier, entry ATR, initial stop, strategy exit, trailing stop, and active trigger are saved/displayed when available.
+- Positions opened before those fields were introduced may honestly display "Not recorded."
+
+## Alpaca Integration
+
+- Paper credentials are stored in `.env`; never print, commit, or copy their values into documentation.
+- `.env` is ignored by Git.
+- Paper endpoint: `https://paper-api.alpaca.markets/v2`.
+- Market-data endpoint is handled separately by the Alpaca data API.
+- Paper orders can be market or limit orders.
+- Limit choices include below current price, at current price, above current price, and a custom limit price.
+- Limit BUY orders may optionally be submitted outside regular market hours.
+- Old unfilled limit BUY orders can be canceled automatically after 5 minutes, 10 minutes, 15 minutes, 30 minutes, 1 hour, 2 hours, 4 hours, or 8 hours.
+- Default stale-order time is 1 hour.
+- Alpaca's broker clock is authoritative for regular-market status when available.
+- Every submitted order uses a deterministic `client_order_id` derived from the reviewed order, providing an additional duplicate-order barrier.
+- Broker reads fail closed in the worker. A positions/orders API failure cannot be mistaken for an empty account.
+- Live order wiring requires live credentials, the live endpoint, `ALPACA_PAPER=false`, the explicit live environment switch, and the exact live confirmation string.
+- Automated live submission is not the current validated operating mode.
+
+## Background Worker
+
+The sidebar has Start Worker and Stop Worker buttons below the Kill Switch.
+
+The worker can continue after the Streamlit browser is closed.
+
+It currently supports:
+
+- Automatic paper exits for saved per-position exit plans.
+- Automatic paper entries for the currently configured ticker when full paper automation is selected and explicitly enabled.
+- Automatic stale limit-BUY cancellation.
+- Alpaca order/position reconciliation.
+- Audit logging.
+- Atomic broker-state updates across the Streamlit app and worker.
+
+The worker:
+
+- Is paper-only in its current unattended path.
+- Uses Alpaca portfolio value and cash for sizing.
+- Uses Alpaca prior-day equity for daily P&L.
+- Includes positions and open BUY orders in exposure calculations.
+- Refuses new buys when account data cannot be read.
+- Refuses new buys after the daily-loss threshold.
+- Blocks duplicate waiting buys.
+- Blocks duplicate waiting sells.
+- Records an exit reason and all trigger components when it sends an exit.
+- Continues to retry safely after transient blocked/error cycles.
+
+The worker cannot discover random tickers by itself yet. Auto entry only evaluates the ticker/settings saved in the automation control file. The Ideas scanner is the start of the future discovery loop.
+
+## Research And Agent Loop
+
+The deterministic research loop is authoritative for trade eligibility:
+
+1. Load and validate price bars.
+2. Run all four strategy simulations.
+3. Evaluate current required strategy rules.
+4. Apply deterministic risk sizing and hard risk limits.
+5. Produce a plain-English research read.
+6. Recommend the best current strategy fit.
+7. Present BUY, WAIT, or BLOCK.
+8. Record the result for comparison and audit evidence.
+
+The concise Research read includes:
+
+- Final answer.
+- Best strategy fit.
+- Trend.
+- Setup.
+- Volatility.
+- Liquidity.
+- Risk/reward.
+- Event risk status.
+- Next action.
+
+Optional LLM adapters:
+
+- Built-in deterministic writer.
+- Local Ollama.
+- Gemini.
+
+LLM boundaries:
+
+- The LLM receives structured deterministic facts.
+- It may explain, summarize, lower confidence, or recommend waiting.
+- It may not promote a deterministic WAIT to TRADE.
+- It cannot modify credentials, risk limits, execution code, order mode, or the Kill Switch.
+- It cannot submit orders.
+- If an LLM fails, the app falls back to deterministic research and reports the fallback.
+
+Future vision: use a scanner/recommendation loop to propose company/ticker candidates, then run the deterministic strategy/risk process before any order becomes eligible.
+
+## Strategy Input Optimizer
+
+The optimizer:
+
+- Searches a bounded neighborhood of settings across all four strategies.
+- Varies entry/trendline lookback, sell exit length, ATR multiplier, trend filter, pullback average, and momentum length as relevant to each strategy.
+- Uses older and newer portions of the selected ticker history.
+- Uses completed trades consistently on both sides of the split.
+- Penalizes too few trades, negative newer returns, excessive drawdown, deterioration, and returns concentrated in one newer subperiod.
+- Caps profit-factor bonuses so a single no-loss sample cannot dominate.
+- Reports newer-period return, trades, profit factor, drawdown, profitable subperiods, confidence, and the main concern.
+- Suggests strategy risk only within the user's existing risk ceiling.
+- Never changes risk limits, credentials, order mode, or broker access automatically.
+
+Interpretation: this is bounded historical evidence for paper testing, not proof of the highest future profit or probability of success. The same newer sample is used to rank candidates, so recommendations still require paper validation and should not be described as an unbiased guarantee.
+
+## Most Recent Full Quality Audit
+
+Completed on 2026-07-10.
+
+The audit reviewed market data, indicator math, all four strategies, live/backtest parity, risk sizing, optimizer logic, Alpaca previews/submission, duplicate prevention, exits, worker behavior, persistence, research, and UI organization.
+
+Important corrections made during the audit:
+
+- Replaced simple ATR with Wilder ATR.
+- Added strict market-data validation and completed-bar handling.
+- Corrected Donchian channels to prior highs/lows.
+- Required price above a rising SMA for breakout entries.
+- Added true trendline crossings and recent-breakout expiration for retests.
+- Aligned live structural stops with historical pullback/retest stops.
+- Added gap-aware stop fills and intratrade drawdown tracking.
+- Included final open-position mark-to-market P&L.
+- Made walk-forward evaluation honor the selected strategy.
+- Made optimizer older/newer calculations closed-trade consistent.
+- Corrected Alpaca daily-loss enforcement in the UI and worker.
+- Included waiting BUY exposure in risk calculations.
+- Prevented duplicate waiting orders while allowing optional additions to filled positions.
+- Made broker reads fail closed.
+- Added atomic cross-process broker-state persistence that preserves exit settings.
+- Made break-even/trailing activation depend on highest profit reached.
+- Reorganized strategy-specific chart lines.
+- Removed duplicated daily UI panels and unrelated cross-page guidance.
+- Made Streamlit dataframe values Arrow-safe.
+- Removed the unwanted portfolio-story section from the README.
+- Pinned the requirements file to the tested environment versions.
+
+Final automated verification:
+
+`238 passed in 1.31s`
+
+Additional verification:
+
+- Python compilation passed.
+- Financial invariants passed for all four strategies.
+- Walk-forward smoke checks passed for all four strategies.
+- Desktop UI check passed with no horizontal overflow or Streamlit exceptions.
+- Compact 390-pixel UI check passed with no clipped metrics or horizontal overflow.
+- `git diff --check` passed; Windows line-ending notices were informational only.
+- `.env`, `automation_logs`, `broker_state`, and `audit_logs` are ignored and untracked.
+- No broker orders were submitted during the audit.
+
+The commit message supplied for this audit was:
+
+`Audit and harden trading logic, risk controls, automation, and UI`
+
+## What Has Been Manually Confirmed Previously
+
+Across the conversation, the user manually confirmed at various times:
+
+- Alpaca paper account connection.
+- Paper BUY submission.
+- Paper limit BUY submission.
+- Paper order cancellation.
+- Automatic stale limit-order cancellation while Streamlit was closed.
+- Filled paper position reconciliation.
+- Manual paper exit flow.
+- An automatic paper BUY.
+- An automatic paper SELL.
+- Per-position saved exit settings.
+- Post-trade review.
+- Shadow-decision recording.
+- Paper journal/performance surfaces.
+- Worker start/stop behavior after fixes.
+
+Some of those confirmations occurred before the latest quality-audit changes, so the current audited build still needs the planned multi-week paper run.
+
+## Known Limitations And Honest Uncertainty
+
+No software review can provide literal 100% certainty for unattended trading.
+
+Remaining real-world uncertainty includes:
+
+- Alpaca outages, rate limits, delayed responses, and SDK behavior.
+- Partial fills and fill timing.
+- Spread, slippage, market impact, and gap behavior beyond OHLC assumptions.
+- Free IEX market-data coverage versus consolidated volume.
+- Computer sleep, Windows restarts, internet loss, and process termination.
+- Multiple weeks of worker restart/recovery behavior.
+- Strategy performance changing after the historical sample.
+- Earnings/calendar risk is not fully connected.
+- The scanner is bounded, not an autonomous market-wide recommender.
+- Automated live entries have not been validated and should remain off.
+
+## Current Next Phase
+
+Run live Alpaca paper trading for at least two weeks.
+
+## Robust Strategy-Input Search Added (2026-07-11)
+
+The recommended strategy-input search was strengthened to reduce overfitting without adding daily workflow clutter:
+
+- Candidate settings are rewarded when nearby settings are also profitable, instead of rewarding one isolated best value.
+- The development data is checked in separate chronological rolling periods.
+- The final 20% of price history is locked while strategy and settings are selected. Only the selected winner is evaluated on that final period.
+- Completed trades are stressed at 0, 5, 10, and 20 basis points of slippage per side.
+- Results are broken down by rising, sideways, and falling trends and by higher/lower volatility.
+- Completed trade outcomes are resampled with a deterministic bootstrap to estimate a weak-case return, loss probability, and drawdown.
+- Confidence is reduced to account for the number of setting combinations searched. This is an approximate trade-level statistical check and is labeled as insufficient when there are too few completed trades.
+- A manual other-ticker test can apply the selected settings unchanged to up to eight real tickers. It never re-optimizes those comparison tickers.
+
+The normal recommendation remains one compact table. Detailed robustness evidence is under `Why this recommendation`; other-ticker validation is under `Test these settings on other tickers`. The search does not change account risk limits, broker access, order mode, credentials, the Kill Switch, or settings automatically. RSI remains a possible future deterministic strategy variable and was not added in this batch.
+
+Recommended operating mode:
+
+- Workspace: Daily Trading Screen.
+- Main page for management: Open Positions.
+- Order mode: Paper trading - send orders to Alpaca paper.
+- Automation: Auto exits - app sells paper positions.
+- Background worker: Running during the period positions should be managed.
+- Entries: normally reviewed and sent manually.
+- Kill Switch: off during intended operation; turn it on to stop new automation actions.
+
+Daily checks:
+
+1. Open Positions: confirm each position has the intended saved interval, sell exit length, original stop, profit-protection settings, and active sell trigger.
+2. Alpaca: compare app positions and waiting orders with the Alpaca dashboard.
+3. Paper Review: inspect daily activity, fills, exits, cancellations, and performance.
+4. Full Records and Evidence only when investigating a decision, trigger, or mismatch.
+5. Confirm audit logs include the exact reason for every automated action.
+
+Scenarios that should be deliberately observed during paper testing:
+
+- Automatic exit from the original stop.
+- Automatic exit from the strategy exit line.
+- Break-even activation after highest price reaches +1R.
+- ATR trailing activation after highest price reaches +2R.
+- Trigger remains tightened after price pulls back.
+- Limit BUY expiration and auto-cancel.
+- Partial fill handling.
+- App closed while worker continues.
+- Worker stop/start and computer restart recovery.
+- Temporary Alpaca/data failure causes a blocked cycle, not an order based on empty state.
+- Multiple positions with independent saved exit plans.
+- Optional addition to an existing filled ticker position without duplicate waiting orders.
+
+After the paper period:
+
+1. Review every unexpected or missing action.
+2. Compare expected trigger prices with actual order timestamps/fills.
+3. Review optimizer recommendations against realized paper behavior.
+4. Select conservative default strategy and risk settings.
+5. Run another full automated and manual regression check.
+6. Complete a live-readiness review.
+7. If proceeding, begin with very small capital, manual BUY approval, and automated exits.
+8. Do not enable automatic live entries until manual-live and auto-exit behavior have been observed reliably.
+
+## Instructions For The Next Codex Conversation
+
+1. Read this entire file before making recommendations.
+2. Inspect the current Git status and current code; do not assume this state file supersedes newer code.
+3. Do not overwrite or revert user changes.
+4. Run tests after meaningful logic changes.
+5. For strategy/risk changes, add mathematical and financial-invariant tests.
+6. For broker/worker changes, test fail-closed behavior, duplicate prevention, and persistence.
+7. Keep the daily UI concise. Put investigation records in Full Records and Evidence or collapsed sections.
+8. Use exact UI labels in all test instructions.
+9. Never expose `.env` values.
+10. Never submit an Alpaca order while testing unless the user explicitly authorizes that exact paper/live action.
+11. Treat paper trading as a practical test environment, not as a reason to build repetitive approval ceremony.
+12. Be honest about residual uncertainty before live capital.
