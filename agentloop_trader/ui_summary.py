@@ -107,7 +107,7 @@ def strategy_context_records(live: dict, entry_window: int, exit_window: int, mo
         {
             "Topic": "Trend filter",
             "Read": "Uptrend" if live.get("sma_up") else "Not an uptrend",
-            "What It Means": f"Uses the {moving_average_window}-bar moving average to avoid weak trend entries.",
+            "What It Means": f"Uses the {moving_average_window}-bar trend filter length to avoid weak trend entries.",
         },
         {
             "Topic": "Breakout",
@@ -414,6 +414,15 @@ def managed_position_records(position_records: list[dict], exit_settings_by_symb
     return rows
 
 
+def _bars(value: object) -> str:
+    try:
+        if value in (None, ""):
+            return "Not saved"
+        return f"{int(value)} bars"
+    except (TypeError, ValueError):
+        return "Not saved"
+
+
 def position_exit_plan_records(
     settings: dict | None,
     exit_ready: bool = False,
@@ -434,11 +443,15 @@ def position_exit_plan_records(
             "Field": "Auto Exit Trigger Price",
             "Value": _money(exit_trigger_price) if exit_trigger_price else "Not available",
         },
-        {"Field": "Sell Exit Length", "Value": str(settings.get("exit_window", ""))},
-        {"Field": "ATR Stop", "Value": str(settings.get("atr_stop_multiplier", ""))},
-        {"Field": "Trend Filter", "Value": str(settings.get("moving_average_window", ""))},
-        {"Field": "Pullback Average", "Value": str(settings.get("pullback_average_length", ""))},
-        {"Field": "Momentum Turn", "Value": str(settings.get("momentum_turn_length", ""))},
+        {"Field": "Price Interval", "Value": str(settings.get("interval", "Not saved"))},
+        {"Field": "Sell Exit Length", "Value": _bars(settings.get("exit_window"))},
+        {"Field": "ATR Stop Distance", "Value": str(settings.get("atr_stop_multiplier", "Not saved"))},
+        {"Field": "Trend Filter Length", "Value": _bars(settings.get("moving_average_window"))},
+        {"Field": "Pullback Average Length", "Value": _bars(settings.get("pullback_average_length"))},
+        {"Field": "Momentum Turn Length", "Value": _bars(settings.get("momentum_turn_length"))},
+        {"Field": "Move Stop To Break-Even After", "Value": f"+{settings.get('breakeven_after_r', 1.0)}R"},
+        {"Field": "Start ATR Trail After", "Value": f"+{settings.get('trail_after_r', 2.0)}R"},
+        {"Field": "Trailing ATR Distance", "Value": str(settings.get("trailing_atr_multiplier", "Not saved"))},
         {"Field": "Current Exit Check", "Value": "Exit now" if exit_ready else (exit_reason or "Hold")},
     ]
     return rows

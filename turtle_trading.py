@@ -59,6 +59,7 @@ from agentloop_trader.brokers import (
     build_alpaca_order_preview,
     broker_status_records,
 )
+from agentloop_trader.display import dataframe_for_streamlit
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
     adopt_alpaca_position,
@@ -112,6 +113,9 @@ from agentloop_trader.ops_readiness import (
 from agentloop_trader.parameter_loop import (
     candidate_records,
     evaluate_parameter_candidates,
+    optimize_strategy_inputs,
+    optimizer_candidate_records,
+    optimizer_recommendation_records,
     recommend_candidate,
     recommendation_summary,
 )
@@ -188,6 +192,18 @@ except ImportError:
 
 
 st.set_page_config(page_title="AgentLoop Trader", layout="wide")
+
+if not hasattr(st, "_agentloop_original_dataframe"):
+    st._agentloop_original_dataframe = st.dataframe
+
+
+def safe_streamlit_dataframe(data=None, *args, **kwargs):
+    if isinstance(data, pd.DataFrame):
+        data = dataframe_for_streamlit(data)
+    return st._agentloop_original_dataframe(data, *args, **kwargs)
+
+
+st.dataframe = safe_streamlit_dataframe
 
 st.markdown("""
 <style>
@@ -730,6 +746,15 @@ def pct_or_missing(value) -> str:
     return f"{number:.2f}%" if number is not None else "Not recorded"
 
 
+def bars_or_missing(value) -> str:
+    try:
+        if value is None or value == "":
+            return "Not recorded"
+        return f"{int(value)} bars"
+    except (TypeError, ValueError):
+        return "Not recorded"
+
+
 def plain_setting_name(key: str) -> str:
     replacements = {
         "atr": "ATR",
@@ -757,6 +782,11 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "Price data source", "Value": str(settings.get("price_data_source", "Not recorded"))},
         {"Field": "Price interval", "Value": str(settings.get("interval", "Not recorded"))},
         {"Field": "History used", "Value": str(settings.get("history", "Not recorded"))},
+        {"Field": "Buy breakout length", "Value": bars_or_missing(settings.get("entry_window"))},
+        {"Field": "Sell exit length", "Value": bars_or_missing(settings.get("exit_window"))},
+        {"Field": "Trend filter length", "Value": bars_or_missing(settings.get("moving_average_window"))},
+        {"Field": "Pullback average length", "Value": bars_or_missing(settings.get("pullback_average_length"))},
+        {"Field": "Momentum turn length", "Value": bars_or_missing(settings.get("momentum_turn_length"))},
         {"Field": "Sizing account", "Value": str(settings.get("sizing_account_source", "Not recorded"))},
         {"Field": "Sizing account value", "Value": money_or_missing(settings.get("sizing_account_equity"))},
         {"Field": "Sizing cash available", "Value": money_or_missing(settings.get("sizing_available_cash"))},
@@ -870,8 +900,13 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
         {"Area": "Position", "Item": "Average entry", "Status / Value": money_or_missing(position.get("Average Entry")), "Plain English": "Average entry price reported by Alpaca."},
         {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "On" if settings.get("auto_exit_enabled", True) else "Off", "Plain English": "Whether the app may sell this position automatically."},
         {"Area": "Exit plan", "Item": "Price interval", "Status / Value": str(settings.get("interval", "Not saved")), "Plain English": "Bars used to calculate ATR and exit levels."},
+        {"Area": "Exit plan", "Item": "Sell exit length", "Status / Value": bars_or_missing(settings.get("exit_window")), "Plain English": "Number of saved price bars used to calculate the strategy exit line."},
+        {"Area": "Exit plan", "Item": "Trend filter length", "Status / Value": bars_or_missing(settings.get("moving_average_window")), "Plain English": "Saved trend filter length used to confirm the broader uptrend."},
+        {"Area": "Exit plan", "Item": "Pullback average length", "Status / Value": bars_or_missing(settings.get("pullback_average_length")), "Plain English": "Saved pullback-zone average used by Trend pullback continuation."},
+        {"Area": "Exit plan", "Item": "Momentum turn length", "Status / Value": bars_or_missing(settings.get("momentum_turn_length")), "Plain English": "Saved short average used by Trend pullback continuation and Trendline retest continuation to confirm price turned back up."},
         {"Area": "Exit plan", "Item": "Strategy exit", "Status / Value": money_or_missing(exit_details.get("strategy_exit_price")), "Plain English": "Exit line from the saved strategy settings."},
         {"Area": "Exit plan", "Item": "Original stop", "Status / Value": money_or_missing(exit_details.get("original_stop_price")), "Plain English": "Initial protective stop from the saved entry."},
+        {"Area": "Exit plan", "Item": "Stop distance ATR multiplier", "Status / Value": str(settings.get("entry_stop_atr_multiplier", settings.get("atr_stop_multiplier", "Not recorded"))), "Plain English": "ATR multiplier used to set the original stop."},
         {"Area": "Profit protection", "Item": "Profit in R", "Status / Value": f"{profit_r:.2f}R" if profit_r is not None else "Not available", "Plain English": "Profit compared with original trade risk."},
         {"Area": "Profit protection", "Item": "ATR trail", "Status / Value": money_or_missing(exit_details.get("trailing_stop_price")), "Plain English": "Highest high since entry minus the trailing ATR distance."},
         {"Area": "Profit protection", "Item": "Break-even stop", "Status / Value": money_or_missing(exit_details.get("breakeven_stop_price")), "Plain English": "Turns on after the saved profit threshold."},
@@ -1410,9 +1445,9 @@ def build_chart(prices, smas, atrs, entry_w, exit_w, ma_w, labels, trade_log, se
         hovertemplate="%{x}<br>Price: $%{y:.2f}<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
-        x=x, y=smas, name=f"{ma_w}d SMA", mode="lines",
+        x=x, y=smas, name=f"{ma_w}-bar trend filter", mode="lines",
         line=dict(color="#F0A830", width=1, dash="dot"),
-        hovertemplate="%{x}<br>SMA: $%{y:.2f}<extra></extra>",
+        hovertemplate="%{x}<br>Trend filter: $%{y:.2f}<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
         x=x, y=dh, name=f"{entry_w}-bar reference high", mode="lines",
@@ -1760,6 +1795,18 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
         st.stop()
 st.session_state["last_loaded_symbol"] = ticker
 
+optimizer_apply_settings = st.session_state.pop("optimizer_apply_settings", None)
+if optimizer_apply_settings:
+    st.session_state["strategy_label_input"] = optimizer_apply_settings.get("strategy_label", "Trendline retest continuation")
+    st.session_state["entry_window_input"] = int(optimizer_apply_settings.get("entry_window", 20))
+    st.session_state["exit_window_input"] = int(optimizer_apply_settings.get("exit_window", 10))
+    st.session_state["atr_stop_multiplier_input"] = float(optimizer_apply_settings.get("atr_stop_multiplier", 2.0))
+    optimizer_risk_pct = float(optimizer_apply_settings.get("risk_per_trade_pct", 1.0))
+    st.session_state["risk_pct_input"] = max(0.5, min(3.0, round(optimizer_risk_pct * 2) / 2))
+    st.session_state["moving_average_window_input"] = int(optimizer_apply_settings.get("moving_average_window", 50))
+    st.session_state["pullback_average_length_input"] = int(optimizer_apply_settings.get("pullback_average_length", 20))
+    st.session_state["momentum_turn_length_input"] = int(optimizer_apply_settings.get("momentum_turn_length", 10))
+
 st.sidebar.markdown("### Strategy settings")
 account = st.sidebar.number_input(
     "Simulator account size ($)",
@@ -1779,7 +1826,12 @@ strategy_label = st.sidebar.selectbox(
     "Strategy type",
     list(strategy_options.keys()),
     index=3,
-    help="Choose the rule set that creates trade ideas. Channel breakout uses prior highs. Pullback uses moving averages. Trendline strategies use descending resistance lines from swing highs.",
+    key="strategy_label_input",
+    help=(
+        "Choose the rule set that creates trade ideas. Breakout continuation uses prior highs. "
+        "Trend pullback continuation uses a trend filter, a pullback average, and a momentum turn. "
+        "Trendline breakout and Trendline retest continuation use descending resistance lines from swing highs."
+    ),
 )
 strategy_type = strategy_options[strategy_label]
 entry_w = st.sidebar.slider(
@@ -1788,7 +1840,11 @@ entry_w = st.sidebar.slider(
     55,
     20,
     step=5,
-    help="Channel breakout uses this many bars for the prior high. Trendline strategies use this many bars to find descending swing-high resistance.",
+    key="entry_window_input",
+    help=(
+        "Breakout continuation uses this many bars to find the prior high. "
+        "Trendline breakout and Trendline retest continuation use this many bars to find descending swing-high resistance."
+    ),
 )
 exit_w = st.sidebar.slider(
     "Sell exit length (bars)",
@@ -1796,7 +1852,12 @@ exit_w = st.sidebar.slider(
     30,
     10,
     step=5,
-    help="Breakout strategy exit. The app sells when price falls to the lowest price from this many bars. Higher gives trades more room; lower exits faster.",
+    key="exit_window_input",
+    help=(
+        "Controls the saved strategy exit line. Breakout continuation, Trendline breakout, and Trendline retest continuation "
+        "use this many bars to find the recent low exit level. Trend pullback continuation uses this many bars to calculate "
+        "the exit average. Higher gives trades more room; lower exits faster."
+    ),
 )
 atr_mult = st.sidebar.number_input(
     "Stop distance (ATR multiplier)",
@@ -1805,6 +1866,7 @@ atr_mult = st.sidebar.number_input(
     value=2.00,
     step=0.01,
     format="%.2f",
+    key="atr_stop_multiplier_input",
     help=(
         "Sets stop distance as a multiple of ATR. Example: 1.28 means 1.28x ATR, not 1.28%. "
         "Higher means a wider stop and smaller share size. Lower means a tighter stop and larger share size."
@@ -1816,6 +1878,7 @@ risk_pct = st.sidebar.slider(
     3.0,
     1.0,
     step=0.5,
+    key="risk_pct_input",
     help="How much of the simulator account the strategy is allowed to risk on one trade before separate risk limits are applied.",
 )
 ma_w = st.sidebar.slider(
@@ -1824,7 +1887,8 @@ ma_w = st.sidebar.slider(
     300,
     50,
     step=50,
-    help="The moving average used to decide whether the ticker is in an uptrend. Higher is slower and stricter; lower reacts faster.",
+    key="moving_average_window_input",
+    help="Calculates the trend filter. The app treats the ticker as healthier when price is above this average and the average is rising.",
 )
 pullback_w = st.sidebar.slider(
     "Pullback average length (bars)",
@@ -1832,9 +1896,11 @@ pullback_w = st.sidebar.slider(
     200,
     20,
     step=5,
+    key="pullback_average_length_input",
     help=(
-        "SMA pullback strategy only. 20/50 are common pullback zones. "
-        "100/200 are deeper reset zones and usually create fewer signals."
+        "Used by Trend pullback continuation. This calculates the moving average used as the pullback zone. "
+        "The strategy looks for the recent low to touch or come near this average before buying. "
+        "Shorter values create shallower pullback zones; longer values create deeper, slower zones."
     ),
 )
 momentum_w = st.sidebar.slider(
@@ -1843,7 +1909,11 @@ momentum_w = st.sidebar.slider(
     20,
     10,
     step=1,
-    help="SMA pullback and trendline retest strategies. The app looks for price to turn back up before buying.",
+    key="momentum_turn_length_input",
+    help=(
+        "Used by Trend pullback continuation and Trendline retest continuation. This calculates the short average used to confirm "
+        "price has turned back up before buying. Shorter values react faster; longer values wait for more confirmation."
+    ),
 )
 
 st.sidebar.markdown("### Risk limits")
@@ -1903,11 +1973,11 @@ run_walk_forward = st.sidebar.checkbox(
 )
 train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step=5) / 100
 run_parameter_loop = st.sidebar.checkbox(
-    "Compare nearby strategy settings",
+    "Find recommended strategy inputs",
     value=False,
-    help="Tests small changes around your current strategy settings, such as nearby buy/sell lengths. It can suggest better settings, but it does not change your settings automatically.",
+    help="Tests bounded strategy input combinations across all four strategies, then recommends the strongest newer-data result. It does not change your sidebar settings automatically.",
 )
-max_parameter_candidates = st.sidebar.slider("Settings to compare", 4, 16, 8, step=4)
+max_parameter_candidates = st.sidebar.slider("Settings to compare per strategy", 4, 24, 12, step=4)
 
 st.sidebar.subheader(
     "Setup quality checks",
@@ -2330,6 +2400,7 @@ if start_worker_requested:
                 last_error=str(exc),
             )
         )
+    st.rerun()
 elif stop_worker_requested:
     automation_worker_status_store.write(
         replace(
@@ -2340,6 +2411,7 @@ elif stop_worker_requested:
             last_error="",
         )
     )
+    st.rerun()
 automation_worker_status = automation_worker_status_store.read()
 
 
@@ -2577,23 +2649,31 @@ def refresh_trailing_state_for_open_positions() -> bool:
 parameter_candidates = []
 recommended_candidate = None
 parameter_loop_error = None
-if run_parameter_loop and strategy_type == "breakout":
+strategy_optimizer_result = None
+if run_parameter_loop:
     try:
-        parameter_candidates = evaluate_parameter_candidates(
-            current=current_strategy_config,
-            account=account,
-            risk_pct_dec=risk_dec,
-            seed=seed,
+        strategy_optimizer_result = optimize_strategy_inputs(
             market_data=market_data,
-            train_fraction=train_fraction,
-            max_candidates=max_parameter_candidates,
+            current_settings=current_strategy_settings,
+            account_equity=float(paper_order_risk_equity),
             risk_limits=risk_limits,
+            train_fraction=train_fraction,
+            max_candidates_per_strategy=max_parameter_candidates,
         )
-        recommended_candidate = recommend_candidate(parameter_candidates)
+        if strategy_type == "breakout":
+            parameter_candidates = evaluate_parameter_candidates(
+                current=current_strategy_config,
+                account=account,
+                risk_pct_dec=risk_dec,
+                seed=seed,
+                market_data=market_data,
+                train_fraction=train_fraction,
+                max_candidates=max_parameter_candidates,
+                risk_limits=risk_limits,
+            )
+            recommended_candidate = recommend_candidate(parameter_candidates)
     except ValueError as exc:
         parameter_loop_error = str(exc)
-elif run_parameter_loop and strategy_type == "pullback":
-    parameter_loop_error = "Nearby-setting comparison is currently available for breakout continuation only."
 
 monitoring_result = monitor_paper_session(
     broker=paper_broker,
@@ -3580,12 +3660,13 @@ def render_open_positions_panel() -> None:
             help="Sets the ATR-based stop. Higher numbers give the position more room; lower numbers make the stop tighter.",
         )
         edited_trend_filter = edit_cols[2].slider(
-            "Trend filter",
+            "Trend filter length",
             50,
             300,
             int(selected_exit_settings.get("moving_average_window", ma_w)),
             step=50,
             key=f"exit_trend_filter_{selected_position_symbol}",
+            help="Calculates the trend filter for this position's saved exit plan.",
         )
         st.markdown("#### Profit protection")
         profit_protection_enabled = st.checkbox(
@@ -3624,20 +3705,22 @@ def render_open_positions_panel() -> None:
         )
         pullback_cols = st.columns(2)
         edited_pullback_length = pullback_cols[0].slider(
-            "Pullback average",
+            "Pullback average length",
             10,
             200,
             int(selected_exit_settings.get("pullback_average_length", pullback_w)),
             step=5,
             key=f"exit_pullback_length_{selected_position_symbol}",
+            help="Used by Trend pullback continuation as the pullback-zone average for this position.",
         )
         edited_momentum_length = pullback_cols[1].slider(
-            "Momentum turn",
+            "Momentum turn length",
             3,
             20,
             int(selected_exit_settings.get("momentum_turn_length", momentum_w)),
             step=1,
             key=f"exit_momentum_length_{selected_position_symbol}",
+            help="Used by Trend pullback continuation and Trendline retest continuation to confirm price turned back up.",
         )
         save_exit_settings = st.form_submit_button("Save Exit Settings For This Position")
 
@@ -4113,27 +4196,41 @@ if command_center_view == "New Trade":
                 for reason in walk_forward_result.reasons:
                     st.markdown(f"- {reason}")
         
-        st.markdown("#### Compare nearby strategy settings")
+        st.markdown("#### Recommended strategy inputs")
         if not run_parameter_loop:
-            st.caption("This is turned off. Enable it in the sidebar to compare nearby strategy settings.")
+            st.caption("This is turned off. Enable it in the sidebar to search for recommended strategy inputs.")
         elif parameter_loop_error:
             st.warning(parameter_loop_error)
+        elif strategy_optimizer_result is None:
+            st.caption("No recommendation is available yet.")
         else:
-            st.markdown(f"**Suggested setting:** {recommendation_summary(recommended_candidate)}")
-            if recommended_candidate is not None:
-                rec = recommended_candidate.config
-                rec_cols = st.columns(4)
-                metric_card(rec_cols[0], "Entry", rec.entry_window, "Bars")
-                metric_card(rec_cols[1], "Exit", rec.exit_window, "Bars")
-                metric_card(rec_cols[2], "ATR stop", rec.atr_stop_multiplier, "Multiplier")
-                metric_card(rec_cols[3], "SMA filter", rec.moving_average_window, "Bars")
+            st.info(strategy_optimizer_result.summary)
+            st.dataframe(
+                pd.DataFrame(optimizer_recommendation_records(strategy_optimizer_result)),
+                width="stretch",
+                hide_index=True,
+            )
+            if strategy_optimizer_result.best is not None and st.button("Use Recommended Inputs"):
+                apply_settings = dict(strategy_optimizer_result.best.settings)
+                apply_settings["risk_per_trade_pct"] = strategy_optimizer_result.best.recommended_risk_per_trade_percent
+                st.session_state["optimizer_apply_settings"] = apply_settings
+                st.rerun()
             if show_portfolio_evidence:
+                st.markdown("#### Top tested settings *")
                 st.dataframe(
-                    pd.DataFrame(candidate_records(parameter_candidates)),
+                    pd.DataFrame(optimizer_candidate_records(strategy_optimizer_result.candidates)),
                     width="stretch",
                     hide_index=True,
                 )
-            st.caption("This comparison can suggest strategy settings only. It cannot change risk limits, broker access, order mode, credentials, or the Kill Switch.")
+                if parameter_candidates:
+                    with st.expander("Original breakout-only nearby test *", expanded=False):
+                        st.markdown(f"**Suggested setting:** {recommendation_summary(recommended_candidate)}")
+                        st.dataframe(
+                            pd.DataFrame(candidate_records(parameter_candidates)),
+                            width="stretch",
+                            hide_index=True,
+                        )
+            st.caption("This recommends strategy inputs only. It does not change risk limits, broker access, order mode, credentials, or the Kill Switch.")
     
     if show_portfolio_evidence:
         page_section("3. Trade details *", "Full Records view only: detailed trade rules, agent notes, and risk records.")

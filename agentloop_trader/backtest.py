@@ -468,7 +468,7 @@ def simulate_turtle_strategy(
             entry_price=last_p,
             stop_loss=round(last_p - atr_mult * last_atr, 2) if last_atr else None,
             max_holding_bars=exit_w,
-            rationale=f"{entry_w}-bar breakout with upward {ma_w}-bar SMA filter.",
+            rationale=f"{entry_w}-bar breakout with rising {ma_w}-bar trend filter.",
             source_signals=[
                 f"close_above_{entry_w}_bar_high",
                 f"sma_{ma_w}_sloping_up",

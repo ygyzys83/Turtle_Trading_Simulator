@@ -5,7 +5,7 @@ A governed trading simulator, paper-trading console, and research lab for testin
 ## Features
 
 - Simulates breakout entries using an N-bar high.
-- Uses an SMA trend filter before entering trades.
+- Uses a trend filter before entering trades.
 - Calculates ATR-based stops and position sizing.
 - Exits on stop loss or an N-bar low.
 - Shows performance metrics, current signal state, live rule values, and an interactive Plotly chart.

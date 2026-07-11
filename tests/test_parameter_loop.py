@@ -7,6 +7,10 @@ from agentloop_trader.parameter_loop import (
     candidate_records,
     evaluate_parameter_candidates,
     generate_bounded_candidates,
+    generate_optimizer_settings,
+    optimize_strategy_inputs,
+    optimizer_candidate_records,
+    optimizer_recommendation_records,
     recommend_candidate,
     recommendation_summary,
 )
@@ -79,3 +83,41 @@ def test_parameter_loop_recommendation_and_records_are_display_ready():
     assert recommended is not None
     assert records
     assert "Try these settings next" in summary
+
+
+def test_optimizer_searches_all_strategies_and_returns_display_records():
+    current_settings = {
+        "strategy_label": "Trendline retest continuation",
+        "strategy_type": "trendline_retest",
+        "entry_window": 20,
+        "exit_window": 10,
+        "atr_stop_multiplier": 2.0,
+        "risk_per_trade_pct": 1.0,
+        "moving_average_window": 50,
+        "pullback_average_length": 20,
+        "momentum_turn_length": 5,
+    }
+
+    settings = generate_optimizer_settings(current_settings, max_candidates_per_strategy=2)
+    strategy_names = {row[0] for row in settings}
+
+    assert strategy_names == {
+        "Breakout continuation",
+        "Trend pullback continuation",
+        "Trendline breakout",
+        "Trendline retest continuation",
+    }
+
+    result = optimize_strategy_inputs(
+        market_data=None,
+        current_settings=current_settings,
+        account_equity=50_000,
+        train_fraction=0.65,
+        max_candidates_per_strategy=2,
+    )
+
+    assert result.tested_candidates > 0
+    assert result.best is not None
+    assert result.candidates == sorted(result.candidates, key=lambda row: row.score, reverse=True)
+    assert optimizer_recommendation_records(result)
+    assert optimizer_candidate_records(result.candidates)

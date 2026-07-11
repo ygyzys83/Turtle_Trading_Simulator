@@ -37,7 +37,7 @@ def generate_research_thesis(
         f"Volatility: {atr_pct:.2f}% ATR" if atr_pct else "Volatility unavailable",
         f"Breakout distance: {breakout_note}" if breakout_level and last_price else "Breakout distance unavailable",
         f"Exit cushion: {_gap_note(exit_gap, 'above', 'below')}" if exit_level and last_price else "Exit cushion unavailable",
-        f"SMA trend filter: {'upward' if sma_up else 'not upward'}",
+        f"Trend filter: {'rising' if sma_up else 'not rising'}",
         f"Backtest return: {stats.get('return_pct')}%",
         f"Win rate: {stats.get('win_rate')}%",
         f"Max drawdown: {stats.get('max_drawdown_pct')}%",

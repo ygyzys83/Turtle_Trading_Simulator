@@ -292,6 +292,10 @@ def test_position_exit_plan_records_summarize_saved_exit_settings():
 
     assert records["Exit Strategy"] == "Trend pullback continuation"
     assert records["Auto Exit"] == "On"
+    assert records["Sell Exit Length"] == "10 bars"
+    assert records["Trend Filter Length"] == "200 bars"
+    assert records["Pullback Average Length"] == "20 bars"
+    assert records["Momentum Turn Length"] == "5 bars"
     assert records["Current Exit Check"] == "Hold because price is above the pullback average."
 
 
