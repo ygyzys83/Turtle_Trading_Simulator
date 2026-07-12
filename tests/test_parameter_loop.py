@@ -1,20 +1,26 @@
-from agentloop_trader.models import StrategyConfig
+import pandas as pd
+
+from agentloop_trader.models import RiskLimits, StrategyConfig
 from agentloop_trader.evaluation import synthetic_ohlc_frame
 from agentloop_trader.parameter_loop import (
     BOUNDED_ATR_MULTIPLIERS,
     BOUNDED_ENTRY_WINDOWS,
     BOUNDED_EXIT_WINDOWS,
     BOUNDED_MA_WINDOWS,
+    buy_and_hold_benchmark,
     candidate_records,
     evaluate_parameter_candidates,
     generate_bounded_candidates,
     generate_optimizer_settings,
     optimize_strategy_inputs,
+    optimize_strategy_intervals,
     optimizer_candidate_records,
+    optimizer_interval_records,
     optimizer_regime_records,
     optimizer_recommendation_records,
     optimizer_robustness_records,
     optimizer_stress_records,
+    recommendation_evidence_status,
     recommend_candidate,
     recommendation_summary,
     validate_settings_across_tickers,
@@ -155,6 +161,15 @@ def test_optimizer_candidate_subset_varies_more_than_one_input_dimension():
     assert len({row["moving_average_window"] for row in breakout}) > 1
 
 
+def test_optimizer_tests_each_setting_with_rsi_entry_rule_off_and_on():
+    rows = generate_optimizer_settings(CURRENT_SETTINGS, max_candidates_per_strategy=2)
+
+    for strategy_type in {row[1] for row in rows}:
+        strategy_rows = [settings for _, row_type, settings in rows if row_type == strategy_type]
+        assert {settings["rsi_entry_filter_enabled"] for settings in strategy_rows} == {False, True}
+        assert len(strategy_rows) == 4
+
+
 def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():
     result = optimize_strategy_inputs(
         market_data=synthetic_ohlc_frame(seed=19),
@@ -196,3 +211,74 @@ def test_cross_ticker_check_uses_the_selected_settings_without_reoptimizing():
     assert len(cross_result.rows) == 3
     assert selected_settings == result.best.settings
     assert all(row["Ticker"] in other_tickers for row in cross_result.rows)
+
+
+def test_buy_and_hold_benchmark_uses_the_exact_requested_price_range():
+    market_data = pd.DataFrame({"Close": [100.0, 110.0, 90.0, 120.0]})
+
+    result = buy_and_hold_benchmark(market_data, 10_000)
+    subset = buy_and_hold_benchmark(market_data, 10_000, start=1)
+
+    assert result.return_percent == 20.0
+    assert result.max_drawdown_percent == 18.18
+    assert result.final_equity == 12_000.0
+    assert subset.return_percent == 9.09
+    assert subset.bars == 3
+
+
+def test_optimizer_reports_newer_and_locked_results_against_buy_and_hold():
+    result = optimize_strategy_inputs(
+        market_data=synthetic_ohlc_frame(seed=31),
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=2,
+        bootstrap_samples=100,
+    )
+
+    assert result.best is not None
+    assert result.best.excess_return_percent == round(
+        result.best.test_return_percent - result.best.benchmark_return_percent,
+        2,
+    )
+    locked = result.robustness.locked_test
+    assert locked.excess_return_percent == round(
+        locked.return_percent - locked.benchmark_return_percent,
+        2,
+    )
+    record_names = {row["Item"] for row in optimizer_recommendation_records(result)}
+    assert {"Recommendation status", "Buy-and-hold comparison", "RSI entry rule", "Next step"} <= record_names
+    assert recommendation_evidence_status(result) in {"Research only", "Ready for paper test"}
+
+
+def test_optimizer_ranks_allocated_return_but_preserves_account_impact():
+    result = optimize_strategy_inputs(
+        market_data=synthetic_ohlc_frame(seed=12),
+        current_settings=CURRENT_SETTINGS,
+        account_equity=100_000,
+        risk_limits=RiskLimits(max_symbol_concentration_pct=5.0),
+        max_candidates_per_strategy=1,
+        bootstrap_samples=50,
+    )
+
+    assert result.best.allocated_capital == 5_000
+    assert abs(result.best.test_account_return_percent - result.best.test_return_percent * 0.05) <= 0.02
+    assert abs(result.best.benchmark_account_return_percent - result.best.benchmark_return_percent * 0.05) <= 0.02
+
+
+def test_interval_optimizer_returns_one_ranked_result_per_interval():
+    result = optimize_strategy_intervals(
+        market_data_by_interval={
+            "1d": ("5y", synthetic_ohlc_frame(n=500, seed=4)),
+            "4h": ("2y", synthetic_ohlc_frame(n=500, seed=5)),
+        },
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=1,
+        bootstrap_samples=50,
+    )
+
+    rows = optimizer_interval_records(result)
+    assert result.best_interval in {"1d", "4h"}
+    assert len(rows) == 2
+    assert {row["Interval"] for row in rows} == {"1d", "4h"}
+    assert all("Equal-Capital Buy and Hold %" in row and "Excess Return %" in row for row in rows)

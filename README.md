@@ -46,6 +46,8 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Full Records and Evidence holds the detailed audit trail, lifecycle tables, readiness reports, and deployment proof.
 - Hard blockers prevent obvious mechanical mistakes. Warnings inform the operator without adding ceremony.
 - Button labels should describe the actual action in plain language, such as review, send, refresh, track, exit, or cancel.
+- The visual system uses a deep-navy trading-console theme with compact controls and semantic color: green for approved actions and positive states, blue for research and selection, amber for warnings and strategy exits, and red for losses, blocks, stops, and the Kill Switch.
+- Shared UI colors and component styling live in `agentloop_trader/ui_theme.py`; Streamlit theme defaults live in `.streamlit/config.toml`.
 
 ## Backtest Assumptions
 
@@ -57,6 +59,9 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Results include unrealized profit or loss from a simulated position still open on the final bar.
 - Newer-data and optimizer comparisons use completed trades on both sides of the split so open-position P&L cannot skew one side.
 - Normal backtest results do not deduct commission, spread, market impact, or slippage. The strategy-input recommendation separately shows 5, 10, and 20 basis-point-per-side stress results; paper and live fills remain the final execution test.
+- For real tickers, the strategy-input search compares daily, 4-hour, and 1-hour results and measures each newer-data and locked-period result against adjusted-price buy-and-hold over the same bars. A result is labeled ready for paper testing only when it beats that benchmark in both periods and passes the minimum trade, rolling-period, and slippage checks.
+- `Require RSI 50-70 for BUY` is the only optional setup-quality read that currently becomes a hard entry rule. When enabled, all four strategies require 14-bar RSI between 50 and 70 in historical and current BUY decisions. The optimizer tests every bounded setting combination with this rule off and on; RSI does not control exits.
+- Strategy quality is measured against a stable per-ticker capital allocation set by `Max symbol concentration`. The UI keeps whole-account return for portfolio impact, while allocated return, allocated drawdown, and equal-capital buy-and-hold are used for strategy comparison and optimizer evidence. Annualized allocated and buy-and-hold returns use actual timestamps and appear only when the measured period exceeds one year. Return on average capital deployed is intentionally not used.
 - Alpaca and Yahoo price data are validated, sorted, deduplicated, and checked for impossible OHLC values before use.
 
 ## Current Modules

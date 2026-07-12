@@ -322,14 +322,22 @@ Future vision: use a scanner/recommendation loop to propose company/ticker candi
 The optimizer:
 
 - Searches a bounded neighborhood of settings across all four strategies.
+- For real tickers, runs that bounded search on daily, 4-hour, and 1-hour bars, then recommends the strongest durable interval and its history period.
 - Varies entry/trendline lookback, sell exit length, ATR multiplier, trend filter, pullback average, and momentum length as relevant to each strategy.
 - Uses older and newer portions of the selected ticker history.
+- Compares strategy return and drawdown with adjusted-price buy-and-hold over the exact same newer and locked bars.
 - Uses completed trades consistently on both sides of the split.
 - Penalizes too few trades, negative newer returns, excessive drawdown, deterioration, and returns concentrated in one newer subperiod.
 - Caps profit-factor bonuses so a single no-loss sample cannot dominate.
 - Reports newer-period return, trades, profit factor, drawdown, profitable subperiods, confidence, and the main concern.
 - Suggests strategy risk only within the user's existing risk ceiling.
 - Never changes risk limits, credentials, order mode, or broker access automatically.
+
+The concise recommendation is labeled `Ready for paper test` only when it has Medium/High confidence, enough newer-data trades, profitable results in at least half of rolling periods, a passing 10-basis-point-per-side stress test, and positive excess return versus buy-and-hold in both the newer-data and untouched locked periods. Otherwise it is labeled `Research only`; the candidate remains inspectable and can still be applied deliberately. Applying a real-ticker recommendation also applies its recommended interval and supported history period.
+
+Most setup-quality reads remain research and explanation inputs. RSI is the one explicit exception: `Require RSI 50-70 for BUY` applies a fixed 14-bar RSI rule to historical entries, current BUY intents, scanner/worker strategy runs, walk-forward evaluation, and paper-entry automation. It does not control exits. The optimizer compares every bounded strategy-setting combination with this RSI rule off and on, accounts for the larger number of trials, and displays the winning RSI choice in the existing recommendation table. RSI length and thresholds are intentionally fixed to avoid multiplying the search space. Volume, market condition, liquidity, and the other setup reads remain informational.
+
+Strategy performance now separates account impact from strategy quality. `Max symbol concentration` defines the stable capital allocation for one ticker and defaults to 5%, matching the default `Max new order size`. Backtests show account return, allocated-capital return, allocated-capital worst drop, equal-capital buy-and-hold return, and excess return. Optimizer scoring, rolling evidence, locked-period checks, slippage stress, regime results, bootstrap results, and cross-ticker tests use allocated-capital return and drawdown. Buy-and-hold invests the same ticker allocation while the rest of the account remains idle in both views. Annualized allocated and buy-and-hold returns use CAGR over actual timestamps and appear only for periods longer than one year; annualization is unavailable when the allocated sleeve is exhausted. Return on average capital deployed was deliberately excluded because highly variable time in position makes it harder to interpret.
 
 Interpretation: this is bounded historical evidence for paper testing, not proof of the highest future profit or probability of success. The same newer sample is used to rank candidates, so recommendations still require paper validation and should not be described as an unbiased guarantee.
 
@@ -440,6 +448,10 @@ The recommended strategy-input search was strengthened to reduce overfitting wit
 The normal recommendation remains one compact table. Detailed robustness evidence is under `Why this recommendation`; other-ticker validation is under `Test these settings on other tickers`. The search does not change account risk limits, broker access, order mode, credentials, the Kill Switch, or settings automatically. RSI remains a possible future deterministic strategy variable and was not added in this batch.
 
 The optimizer is now run explicitly with `Run Strategy Input Search` instead of a persistent checkbox. Its result is saved through ordinary Streamlit reruns and marked stale when the ticker, source, interval, history, market bars, strategy inputs, material account-equity bucket, risk limits, older-data split, or candidate count changes. A stale recommendation cannot be applied or tested on other tickers until the search is run again. Alpaca history choices now extend through `2y` for `1h` bars and `5y` for `4h` bars; Yahoo intraday choices remain shorter.
+
+## Visual Design System (2026-07-11)
+
+The app uses a professional trading-console design system built around a deep-navy background, compact spacing, thin borders, restrained six-pixel corners, and one semantic palette. Green is used for approved actions and positive states; blue for research and selection; amber for warnings and strategy exits; red for blocks, losses, stops, and the Kill Switch; teal for ATR information. Main command navigation reads as tabs, the daily account state uses one compact status strip, cards and controls use dense typography, and chart colors follow the same semantics. The sidebar remains a slim home for global controls while ticker-, trade-, and position-specific work stays on the relevant main page. Numbered workflow headings were removed where tabs and visual hierarchy already provide orientation. Shared styling and chart colors live in `agentloop_trader/ui_theme.py`; base Streamlit colors live in `.streamlit/config.toml`. The overhaul intentionally changed presentation rather than trading, risk, or broker logic.
 
 Recommended operating mode:
 

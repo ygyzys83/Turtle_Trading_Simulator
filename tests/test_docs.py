@@ -57,3 +57,59 @@ def test_strategy_input_search_is_explicit_and_alpaca_intraday_history_is_bounde
     assert '["1mo", "3mo", "6mo", "1y", "2y", "5y"]' in text
     assert '["1mo", "3mo", "6mo", "1y", "2y"]' in text
     assert '"Inputs changed. Run the search again."' in text
+
+
+def test_ui_theme_uses_one_semantic_palette_and_streamlit_theme_file():
+    theme_module = (ROOT / "agentloop_trader" / "ui_theme.py").read_text(encoding="utf-8")
+    streamlit_theme = (ROOT / ".streamlit" / "config.toml").read_text(encoding="utf-8")
+
+    assert "TRADING_CONSOLE_CSS" in theme_module
+    assert '"price": "#D8E0E9"' in theme_module
+    assert '"entry": "#35C46A"' in theme_module
+    assert '"exit": "#E3AA42"' in theme_module
+    assert '"sell": "#FF6262"' in theme_module
+    assert 'primaryColor = "#35C46A"' in streamlit_theme
+    assert 'backgroundColor = "#0B1420"' in streamlit_theme
+    assert "baseFontSize = 13" in streamlit_theme
+    assert '--sidebar-bg: #0D1824' in theme_module
+    assert 'background: #1F7A45' in theme_module
+    assert '[data-testid="stToolbar"]' in theme_module
+    assert 'height: 0 !important' in theme_module
+    assert '[data-testid="stSidebarHeader"]' in theme_module
+    assert 'initial_sidebar_state="expanded"' in (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+    assert '[data-testid="stSidebarCollapsedControl"]' in theme_module
+    assert 'transform: none !important' in theme_module
+    assert '[class*="st-"]' not in theme_module
+    assert '[data-testid="stIconMaterial"]' in theme_module
+    assert 'font-family: "Material Symbols Rounded"' in theme_module
+
+
+def test_daily_workspace_titles_are_not_numbered():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert "import re" in text
+    assert 'page_section("1. Daily command center"' not in text
+    assert 'sub_section("1.1 Open positions"' not in text
+    assert 'sub_section("1.3 New trade"' not in text
+    assert 'page_section("2. Backtest"' not in text
+
+
+def test_main_navigation_is_sticky_and_precedes_status_strip():
+    app_text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+    theme_text = (ROOT / "agentloop_trader" / "ui_theme.py").read_text(encoding="utf-8")
+
+    assert 'with st.container(key="top_navigation")' in app_text
+    assert app_text.index('with st.container(key="top_navigation")') < app_text.index("status_rows = compact_status_records(")
+    assert app_text.count('"Command center page"') == 1
+    assert ".st-key-top_navigation" in theme_text
+    assert "position: sticky" in theme_text
+    assert '[data-testid="stLayoutWrapper"]:has(> .st-key-top_navigation)' in theme_text
+    assert '[data-testid="stMarkdownContainer"]:has(h1)' in theme_text
+
+
+def test_strategy_decision_sections_have_plain_language_helpers():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert "It answers which strategy fits the ticker now; it does not search for better settings." in text
+    assert "This table does not search for better settings" in text
+    assert "Use this as the strongest candidate for paper testing" in text

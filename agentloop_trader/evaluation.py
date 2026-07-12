@@ -6,6 +6,7 @@ import pandas as pd
 
 from agentloop_trader.data import generate_synthetic_prices
 from agentloop_trader.models import RiskLimits
+from agentloop_trader.performance import allocation_metrics, elapsed_years
 from agentloop_trader.strategy_runtime import _run_one
 
 
@@ -35,7 +36,13 @@ def synthetic_ohlc_frame(n: int = 700, seed: int | None = None) -> pd.DataFrame:
     return data
 
 
-def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -> dict:
+def _closed_trade_stats(
+    account: float,
+    trade_log: list[dict],
+    eval_bars: int,
+    risk_limits: RiskLimits | None = None,
+    years: float | None = None,
+) -> dict:
     wins = [t for t in trade_log if t["pnl"] > 0]
     losses = [t for t in trade_log if t["pnl"] <= 0]
     total_pnl = round(sum(t["pnl"] for t in trade_log), 2)
@@ -43,20 +50,25 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
     gross_losses = abs(sum(t["pnl"] for t in losses))
     equity = account
     peak = account
-    max_drawdown = 0.0
+    max_drawdown_dollars = 0.0
     for trade in trade_log:
         adverse_equity = equity + float(trade.get("max_adverse_pnl", 0))
-        if peak > 0:
-            max_drawdown = min(max_drawdown, (adverse_equity - peak) / peak)
+        max_drawdown_dollars = max(max_drawdown_dollars, peak - adverse_equity)
         equity += trade["pnl"]
         peak = max(peak, equity)
-        if peak > 0:
-            max_drawdown = min(max_drawdown, (equity - peak) / peak)
+        max_drawdown_dollars = max(max_drawdown_dollars, peak - equity)
 
     exposure_bars = sum(max(0, t["exit_bar"] - t["entry_bar"]) for t in trade_log)
     avg_loss = round(sum(t["pnl"] for t in losses) / len(losses), 2) if losses else 0
     avg_win = round(gross_wins / len(wins), 2) if wins else 0
 
+    capital = allocation_metrics(
+        account_equity=account,
+        total_pnl=total_pnl,
+        max_drawdown_dollars=max_drawdown_dollars,
+        risk_limits=risk_limits,
+        years=years,
+    )
     return {
         "final_equity": round(account + total_pnl),
         "total_pnl": round(total_pnl),
@@ -69,8 +81,9 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
         "avg_loss": avg_loss,
         "rr_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss else (99.0 if avg_win > 0 else 0),
         "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else (99.0 if gross_wins > 0 else 0),
-        "max_drawdown_pct": round(abs(max_drawdown) * 100, 2),
+        "max_drawdown_pct": round(max_drawdown_dollars / account * 100, 2) if account else 0,
         "exposure_pct": round(exposure_bars / eval_bars * 100, 2) if eval_bars else 0,
+        **capital,
     }
 
 
@@ -88,6 +101,7 @@ def evaluate_walk_forward(
     strategy_type: str = "breakout",
     pullback_w: int = 20,
     momentum_w: int = 10,
+    rsi_entry_filter_enabled: bool = False,
 ) -> WalkForwardResult:
     warmup_bars = max(entry_w, exit_w, ma_w, pullback_w, momentum_w, 14) + 4
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=seed)
@@ -113,9 +127,16 @@ def evaluate_walk_forward(
         "moving_average_window": ma_w,
         "pullback_average_length": pullback_w,
         "momentum_turn_length": momentum_w,
+        "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
     }
     train_trade_log = _run_one(strategy_type, train_data, settings, account, risk_limits)["trade_log"]
-    train_stats = _closed_trade_stats(account, train_trade_log, split_index)
+    train_stats = _closed_trade_stats(
+        account,
+        train_trade_log,
+        split_index,
+        risk_limits,
+        elapsed_years(train_data.index),
+    )
 
     oos_start = max(0, split_index - warmup_bars)
     warmup_offset = split_index - oos_start
@@ -127,7 +148,13 @@ def evaluate_walk_forward(
         for trade in oos_trade_log
         if trade["entry_bar"] >= warmup_offset
     ]
-    oos_stats = _closed_trade_stats(account, oos_trades, total_bars - split_index)
+    oos_stats = _closed_trade_stats(
+        account,
+        oos_trades,
+        total_bars - split_index,
+        risk_limits,
+        elapsed_years(data.index, start=split_index),
+    )
 
     verdict, reasons = _walk_forward_verdict(train_stats, oos_stats)
     return WalkForwardResult(
@@ -146,14 +173,14 @@ def _walk_forward_verdict(train_stats: dict, oos_stats: dict) -> tuple[str, list
     reasons = []
     if oos_stats["total_trades"] == 0:
         reasons.append("No trades happened in the newer test data.")
-    if oos_stats["return_pct"] < 0:
+    if oos_stats["allocated_return_pct"] < 0:
         reasons.append("The newer test data lost money.")
     if train_stats["total_trades"] > 0 and oos_stats["total_trades"] > 0:
         if oos_stats["profit_factor"] and train_stats["profit_factor"]:
             if oos_stats["profit_factor"] < train_stats["profit_factor"] * 0.5:
                 reasons.append("The newer test data made much less per dollar lost than the older data.")
-    if oos_stats["max_drawdown_pct"] > max(5.0, train_stats["max_drawdown_pct"] * 1.5):
-        reasons.append("The newer test data had a larger account drop than the older data.")
+    if oos_stats["allocated_max_drawdown_pct"] > max(5.0, train_stats["allocated_max_drawdown_pct"] * 1.5):
+        reasons.append("The newer test data had a larger allocated-capital drop than the older data.")
 
     if not reasons:
         return "Pass", ["The newer test data looks broadly similar to the older data."]
@@ -167,9 +194,10 @@ def walk_forward_records(result: WalkForwardResult) -> list[dict]:
         {"Metric": "Result", "Older Data": "", "Newer Data": result.verdict},
         {"Metric": "Bars", "Older Data": result.train_bars, "Newer Data": result.oos_bars},
         {"Metric": "Trades", "Older Data": result.train_stats["total_trades"], "Newer Data": result.oos_stats["total_trades"]},
-        {"Metric": "Return %", "Older Data": result.train_stats["return_pct"], "Newer Data": result.oos_stats["return_pct"]},
+        {"Metric": "Allocated return %", "Older Data": result.train_stats["allocated_return_pct"], "Newer Data": result.oos_stats["allocated_return_pct"]},
+        {"Metric": "Account return %", "Older Data": result.train_stats["return_pct"], "Newer Data": result.oos_stats["return_pct"]},
         {"Metric": "Win rate %", "Older Data": result.train_stats["win_rate"], "Newer Data": result.oos_stats["win_rate"]},
         {"Metric": "Profit factor", "Older Data": result.train_stats["profit_factor"], "Newer Data": result.oos_stats["profit_factor"]},
-        {"Metric": "Worst drop %", "Older Data": result.train_stats["max_drawdown_pct"], "Newer Data": result.oos_stats["max_drawdown_pct"]},
+        {"Metric": "Allocated worst drop %", "Older Data": result.train_stats["allocated_max_drawdown_pct"], "Newer Data": result.oos_stats["allocated_max_drawdown_pct"]},
         {"Metric": "Time in trade %", "Older Data": result.train_stats["exposure_pct"], "Newer Data": result.oos_stats["exposure_pct"]},
     ]

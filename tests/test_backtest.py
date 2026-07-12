@@ -1,4 +1,5 @@
 from agentloop_trader.backtest import (
+    _build_stats,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
     simulate_trend_pullback_strategy,
@@ -6,6 +7,7 @@ from agentloop_trader.backtest import (
     strategy_comparison_records,
 )
 from agentloop_trader.models import RiskLimits
+import agentloop_trader.backtest as backtest_module
 import pandas as pd
 
 
@@ -427,4 +429,81 @@ def test_strategy_comparison_records_are_display_ready():
     })
 
     assert rows[0]["Strategy"] == "Breakout continuation"
-    assert rows[1]["Return"] == "2.4%"
+    assert rows[1]["Allocated Return"] == "2.4%"
+    assert rows[1]["Account Return"] == "2.4%"
+
+
+def test_rsi_entry_rule_blocks_historical_and_current_entries_when_extended(monkeypatch):
+    prices = list(range(100, 150))
+    market_data = pd.DataFrame(
+        {
+            "Close": prices,
+            "High": [p + 0.25 for p in prices],
+            "Low": [p - 0.25 for p in prices],
+            "Volume": [1_000_000] * len(prices),
+        },
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="D"),
+    )
+    market_data.attrs["symbol"] = "RSI"
+    monkeypatch.setattr(backtest_module, "calc_rsi", lambda values, length: [80.0] * len(values))
+
+    without_filter = simulate_turtle_strategy(
+        50_000, 5, 3, 2.0, 0.01, 5, market_data=market_data,
+        rsi_entry_filter_enabled=False,
+    )[4]
+    with_filter = simulate_turtle_strategy(
+        50_000, 5, 3, 2.0, 0.01, 5, market_data=market_data,
+        rsi_entry_filter_enabled=True,
+    )[4]
+
+    assert without_filter["in_simulated_trade"] is True
+    assert without_filter["trade_intent"] is not None
+    assert with_filter["in_simulated_trade"] is False
+    assert with_filter["trade_intent"] is None
+    assert "RSI(14)" in with_filter["no_trade_reason"]
+    assert any("required 50-70" in label for label in with_filter["buy_requirements"])
+
+
+def test_backtest_stats_report_account_and_allocated_capital_separately():
+    market_data = pd.DataFrame(
+        {"Close": [100.0, 101.0]},
+        index=pd.to_datetime(["2023-01-01", "2025-01-02"]),
+    )
+    stats = _build_stats(
+        account=100_000,
+        final_balance=100_500,
+        trade_log=[],
+        equity_curve=[100_000, 99_500, 100_500],
+        exposure_bars=0,
+        total_bars=2,
+        risk_limits=RiskLimits(max_symbol_concentration_pct=5),
+        market_data=market_data,
+    )
+
+    assert stats["return_pct"] == 0.5
+    assert stats["allocated_capital"] == 5_000
+    assert stats["allocated_return_pct"] == 10.0
+    assert stats["allocated_max_drawdown_pct"] == 10.0
+    assert stats["annualized_allocated_return_pct"] is not None
+
+
+def test_all_four_strategies_call_the_same_rsi_entry_gate(monkeypatch):
+    calls = []
+
+    def reject_rsi(rsis, index, enabled):
+        calls.append(enabled)
+        return not enabled
+
+    monkeypatch.setattr(backtest_module, "_rsi_entry_allowed", reject_rsi)
+    runners = [
+        lambda: simulate_turtle_strategy(50_000, 20, 10, 2.0, 0.01, 50, seed=42, rsi_entry_filter_enabled=True),
+        lambda: simulate_trend_pullback_strategy(50_000, 20, 10, 2.0, 0.01, 50, 5, seed=42, rsi_entry_filter_enabled=True),
+        lambda: simulate_trendline_breakout_strategy(50_000, 20, 10, 2.0, 0.01, 50, seed=42, rsi_entry_filter_enabled=True),
+        lambda: simulate_trendline_retest_strategy(50_000, 20, 10, 2.0, 0.01, 50, 5, seed=42, rsi_entry_filter_enabled=True),
+    ]
+
+    for runner in runners:
+        calls.clear()
+        runner()
+        assert calls
+        assert all(calls)

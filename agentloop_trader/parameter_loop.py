@@ -11,6 +11,12 @@ import pandas as pd
 
 from agentloop_trader.evaluation import WalkForwardResult, evaluate_walk_forward, synthetic_ohlc_frame
 from agentloop_trader.models import RiskLimits, StrategyConfig
+from agentloop_trader.performance import (
+    allocation_metrics,
+    annualized_return_percent,
+    elapsed_years,
+    ticker_allocated_capital,
+)
 from agentloop_trader.strategy_runtime import STRATEGY_TYPES, _run_one
 
 
@@ -51,6 +57,15 @@ class OptimizerCandidate:
     rolling_median_return_percent: float = 0.0
     rolling_worst_drawdown_percent: float = 0.0
     validation_trade_returns: tuple[float, ...] = ()
+    benchmark_return_percent: float = 0.0
+    benchmark_max_drawdown_percent: float = 0.0
+    excess_return_percent: float = 0.0
+    drawdown_advantage_percent: float = 0.0
+    test_account_return_percent: float = 0.0
+    test_annualized_return_percent: float | None = None
+    benchmark_account_return_percent: float = 0.0
+    benchmark_annualized_return_percent: float | None = None
+    allocated_capital: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -62,6 +77,12 @@ class LockedTestResult:
     max_drawdown_percent: float
     passed: bool
     detail: str
+    benchmark_return_percent: float = 0.0
+    benchmark_max_drawdown_percent: float = 0.0
+    excess_return_percent: float = 0.0
+    account_return_percent: float = 0.0
+    annualized_return_percent: float | None = None
+    benchmark_annualized_return_percent: float | None = None
 
 
 @dataclass(frozen=True)
@@ -103,6 +124,38 @@ class StrategyInputRecommendation:
     train_fraction: float
     locked_fraction: float = 0.20
     robustness: RobustnessEvidence | None = None
+
+
+@dataclass(frozen=True)
+class BuyAndHoldBenchmark:
+    return_percent: float
+    max_drawdown_percent: float
+    final_equity: float
+    start_price: float
+    end_price: float
+    bars: int
+    account_return_percent: float = 0.0
+    annualized_return_percent: float | None = None
+    allocated_capital: float = 0.0
+    period_years: float | None = None
+
+
+@dataclass(frozen=True)
+class IntervalOptimizationResult:
+    interval: str
+    history: str
+    recommendation: StrategyInputRecommendation
+    selection_score: float
+    evidence_status: str
+
+
+@dataclass(frozen=True)
+class MultiIntervalRecommendation:
+    best_interval: str
+    best_history: str
+    best_result: StrategyInputRecommendation
+    interval_results: tuple[IntervalOptimizationResult, ...]
+    summary: str
 
 
 @dataclass(frozen=True)
@@ -223,14 +276,14 @@ def score_evaluation(evaluation: WalkForwardResult) -> float:
     oos = evaluation.oos_stats
     train = evaluation.train_stats
     trade_bonus = min(oos["total_trades"], 5) * 0.5
-    drawdown_penalty = oos["max_drawdown_pct"] * 0.35
+    drawdown_penalty = oos["allocated_max_drawdown_pct"] * 0.35
     fragility_penalty = 0.0
     if train["profit_factor"] and oos["profit_factor"]:
         fragility_penalty = max(0.0, train["profit_factor"] - oos["profit_factor"]) * 1.5
     insufficient_trade_penalty = 8.0 if oos["total_trades"] < 2 else 0.0
     verdict_bonus = {"Pass": 5.0, "Inconclusive": -1.0, "Needs review": -3.0}.get(evaluation.verdict, 0.0)
     return round(
-        oos["return_pct"]
+        oos["allocated_return_pct"]
         + min(float(oos["profit_factor"]), 3.0)
         + trade_bonus
         + verdict_bonus
@@ -258,10 +311,10 @@ def candidate_records(candidates: list[ParameterCandidate]) -> list[dict]:
             "Exit": config.exit_window,
             "ATR": config.atr_stop_multiplier,
             "Trend Filter": config.moving_average_window,
-            "Newer Data Return %": "" if evaluation is None else evaluation.oos_stats["return_pct"],
+            "Newer Allocated Return %": "" if evaluation is None else evaluation.oos_stats["allocated_return_pct"],
             "Newer Data Trades": "" if evaluation is None else evaluation.oos_stats["total_trades"],
             "Profit Factor": "" if evaluation is None else evaluation.oos_stats["profit_factor"],
-            "Worst Drop %": "" if evaluation is None else evaluation.oos_stats["max_drawdown_pct"],
+            "Allocated Worst Drop %": "" if evaluation is None else evaluation.oos_stats["allocated_max_drawdown_pct"],
             "Reason": candidate.reason,
         })
     return records
@@ -359,9 +412,13 @@ def optimize_strategy_inputs(
         )
         full_result = _run_one(best.strategy_type, data, best.settings, account_equity, risk_limits)
         full_trades = list(full_result["trade_log"])
-        stress_rows = _execution_stress_rows(full_trades, account_equity)
-        regime_rows = _regime_rows(data, full_trades, account_equity, best.settings)
-        bootstrap = _bootstrap_trades(full_trades, account_equity, samples=bootstrap_samples)
+        stress_rows = _execution_stress_rows(full_trades, account_equity, risk_limits)
+        regime_rows = _regime_rows(data, full_trades, account_equity, best.settings, risk_limits)
+        bootstrap = _bootstrap_trades(
+            full_trades,
+            ticker_allocated_capital(account_equity, risk_limits),
+            samples=bootstrap_samples,
+        )
         trial_adjustment = _trial_adjustment(best, ranked)
         parameter_range = _parameter_plateau_range(best, ranked)
         final_confidence, final_stability = _final_confidence(
@@ -391,6 +448,138 @@ def optimize_strategy_inputs(
         train_fraction=train_fraction,
         locked_fraction=locked_fraction,
         robustness=robustness,
+    )
+
+
+def buy_and_hold_benchmark(
+    market_data: pd.DataFrame,
+    account_equity: float,
+    *,
+    start: int = 0,
+    end: int | None = None,
+    allocated_capital: float | None = None,
+) -> BuyAndHoldBenchmark:
+    """Return an adjusted-price buy-and-hold baseline for the requested bar range."""
+    close = market_data["Close"].astype(float).iloc[start:end].dropna()
+    allocation = float(account_equity) if allocated_capital is None else max(0.0, float(allocated_capital))
+    years = elapsed_years(market_data.index, start=start, end=end)
+    if len(close) < 2 or account_equity <= 0 or allocation <= 0:
+        return BuyAndHoldBenchmark(
+            0.0, 0.0, float(account_equity), 0.0, 0.0, len(close),
+            allocated_capital=allocation, period_years=years,
+        )
+    start_price = float(close.iloc[0])
+    end_price = float(close.iloc[-1])
+    if start_price <= 0:
+        return BuyAndHoldBenchmark(
+            0.0, 0.0, float(account_equity), start_price, end_price, len(close),
+            allocated_capital=allocation, period_years=years,
+        )
+    sleeve_curve = close.to_numpy(dtype=float) / start_price * allocation
+    equity_curve = float(account_equity) - allocation + sleeve_curve
+    peaks = np.maximum.accumulate(equity_curve)
+    sleeve_peaks = np.maximum.accumulate(sleeve_curve)
+    sleeve_drawdowns = np.where(sleeve_peaks > 0, (sleeve_peaks - sleeve_curve) / sleeve_peaks * 100, 0.0)
+    raw_return = (end_price / start_price - 1) * 100
+    account_return = (equity_curve[-1] / float(account_equity) - 1) * 100
+    return BuyAndHoldBenchmark(
+        return_percent=round(raw_return, 2),
+        max_drawdown_percent=round(float(np.max(sleeve_drawdowns)), 2),
+        final_equity=round(float(equity_curve[-1]), 2),
+        start_price=round(start_price, 4),
+        end_price=round(end_price, 4),
+        bars=len(close),
+        account_return_percent=round(account_return, 2),
+        annualized_return_percent=annualized_return_percent(raw_return, years),
+        allocated_capital=round(allocation, 2),
+        period_years=round(years, 4) if years is not None else None,
+    )
+
+
+def recommendation_evidence_status(result: StrategyInputRecommendation) -> str:
+    candidate = result.best
+    evidence = result.robustness
+    locked = evidence.locked_test if evidence else None
+    if candidate is None or locked is None:
+        return "Research only"
+    rolling_ratio = candidate.rolling_profitable_windows / max(1, candidate.rolling_windows)
+    stress_10 = next(
+        (row for row in evidence.stress_rows if row["Round-trip slippage"] == "10 bps per side"),
+        {},
+    )
+    credible = bool(
+        candidate.confidence in {"Medium", "High"}
+        and candidate.test_trades >= 2
+        and candidate.excess_return_percent > 0
+        and locked.passed
+        and locked.excess_return_percent > 0
+        and rolling_ratio >= 0.5
+        and stress_10.get("Passed")
+    )
+    return "Ready for paper test" if credible else "Research only"
+
+
+def optimize_strategy_intervals(
+    market_data_by_interval: dict[str, tuple[str, pd.DataFrame]],
+    current_settings: dict[str, Any],
+    account_equity: float,
+    risk_limits: RiskLimits | None = None,
+    *,
+    train_fraction: float = 0.65,
+    max_candidates_per_strategy: int = 12,
+    bootstrap_samples: int = 1000,
+) -> MultiIntervalRecommendation:
+    """Compare robust strategy searches across a small, explicit interval set."""
+    interval_rows: list[IntervalOptimizationResult] = []
+    for interval, (history, market_data) in market_data_by_interval.items():
+        settings = dict(current_settings)
+        settings["interval"] = interval
+        result = optimize_strategy_inputs(
+            market_data=market_data,
+            current_settings=settings,
+            account_equity=account_equity,
+            risk_limits=risk_limits,
+            train_fraction=train_fraction,
+            max_candidates_per_strategy=max_candidates_per_strategy,
+            bootstrap_samples=bootstrap_samples,
+        )
+        candidate = result.best
+        locked = result.robustness.locked_test if result.robustness else None
+        confidence_bonus = {"High": 4.0, "Medium": 2.0, "Low": -2.0}.get(
+            candidate.confidence if candidate else "Low", -2.0
+        )
+        selection_score = -9999.0 if candidate is None else (
+            candidate.score
+            + confidence_bonus
+            + (3.0 if locked and locked.passed else -3.0)
+            + max(-5.0, min(5.0, candidate.excess_return_percent * 0.25))
+        )
+        interval_rows.append(IntervalOptimizationResult(
+            interval=interval,
+            history=history,
+            recommendation=result,
+            selection_score=round(selection_score, 2),
+            evidence_status=recommendation_evidence_status(result),
+        ))
+    if not interval_rows:
+        raise ValueError("No interval data was available for the strategy input search.")
+    interval_rows.sort(
+        key=lambda row: (row.evidence_status == "Ready for paper test", row.selection_score),
+        reverse=True,
+    )
+    best_row = interval_rows[0]
+    best = best_row.recommendation.best
+    summary = (
+        f"Best interval: {best_row.interval}. {best_row.recommendation.summary}"
+        if best is not None
+        else "No interval produced enough evidence to recommend settings."
+    )
+    return MultiIntervalRecommendation(
+        best_interval=best_row.interval,
+        best_history=best_row.history,
+        best_result=best_row.recommendation,
+        interval_results=tuple(interval_rows),
+        summary=summary,
     )
 
 
@@ -451,7 +640,12 @@ def generate_optimizer_settings(
 
         strategy_rows.sort(key=lambda row: _settings_distance(base, row))
         for row in strategy_rows[:max_candidates_per_strategy]:
-            rows.append((strategy_label, strategy_type, row))
+            for rsi_enabled in (False, True):
+                rows.append((
+                    strategy_label,
+                    strategy_type,
+                    row | {"rsi_entry_filter_enabled": rsi_enabled},
+                ))
     return rows
 
 
@@ -461,8 +655,9 @@ def optimizer_summary(candidate: OptimizerCandidate | None) -> str:
     return (
         f"Best current fit: {candidate.strategy_label}. "
         f"Suggested settings: {_settings_text(candidate.settings)}. "
-        f"Validation return was {candidate.test_return_percent:.2f}% with a "
-        f"{candidate.test_max_drawdown_percent:.2f}% worst drop. Confidence: {candidate.confidence}."
+        f"Newer-data allocated return was {candidate.test_return_percent:.2f}% with a "
+        f"{candidate.test_max_drawdown_percent:.2f}% allocated-capital worst drop and "
+        f"{candidate.excess_return_percent:+.2f}% versus buy-and-hold. Confidence: {candidate.confidence}."
     )
 
 
@@ -478,10 +673,53 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
         (row for row in evidence.stress_rows if row["Round-trip slippage"] == "10 bps per side"),
         None,
     ) if evidence else None
+    evidence_status = recommendation_evidence_status(result)
+    benchmark_read = (
+        "Beat buy-and-hold"
+        if candidate.excess_return_percent > 0 and locked and locked.excess_return_percent > 0
+        else "Lower return, lower drawdown"
+        if candidate.excess_return_percent <= 0 and candidate.drawdown_advantage_percent > 0
+        else "Did not beat buy-and-hold"
+    )
+    best_condition = _best_market_condition(evidence.regime_rows if evidence else [])
+    next_step = (
+        "Paper-test these settings before considering live use."
+        if evidence_status == "Ready for paper test"
+        else "Keep this as a research candidate and collect more evidence."
+    )
     return [
+        {"Item": "Recommendation status", "Value": evidence_status, "Plain English": next_step},
         {"Item": "Best strategy", "Value": candidate.strategy_label, "Plain English": candidate.reason},
         {"Item": "Suggested settings", "Value": _settings_text(settings), "Plain English": "The single setting combination to paper test first."},
+        {"Item": "Ticker allocation", "Value": f"${candidate.allocated_capital:,.2f}", "Plain English": "Stable capital budget set by Max symbol concentration."},
+        {"Item": "Newer-data allocated return", "Value": f"{candidate.test_return_percent:.2f}%", "Plain English": f"Account impact was {candidate.test_account_return_percent:.2f}%."},
+        {
+            "Item": "Annualized allocated return",
+            "Value": _annualized_text(candidate.test_annualized_return_percent),
+            "Plain English": "Shown only when this test period is longer than one year.",
+        },
+        {
+            "Item": "RSI entry rule",
+            "Value": "Require RSI 50-70" if settings.get("rsi_entry_filter_enabled", False) else "Off",
+            "Plain English": "The search tested the same strategy settings with this rule both off and on.",
+        },
         {"Item": "Strong nearby range", "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}), "Plain English": "Nearby profitable settings. A useful result should not depend on one exact number."},
+        {"Item": "Buy-and-hold comparison", "Value": benchmark_read, "Plain English": f"Newer-data advantage {candidate.excess_return_percent:+.2f}%; locked-period advantage {locked.excess_return_percent:+.2f}%" if locked else "Locked-period comparison is unavailable."},
+        {
+            "Item": "Annualized buy-and-hold return",
+            "Value": _annualized_text(candidate.benchmark_annualized_return_percent),
+            "Plain English": "Equal-capital buy-and-hold over the newer-data period.",
+        },
+        {
+            "Item": "Annualized excess return",
+            "Value": (
+                "Not shown (period is 1 year or less)"
+                if candidate.test_annualized_return_percent is None or candidate.benchmark_annualized_return_percent is None
+                else f"{candidate.test_annualized_return_percent - candidate.benchmark_annualized_return_percent:+.2f}%"
+            ),
+            "Plain English": "Annualized allocated return minus annualized equal-capital buy-and-hold.",
+        },
+        {"Item": "Best market conditions", "Value": best_condition, "Plain English": "The historical condition where these unchanged settings performed best."},
         {"Item": "Suggested strategy risk", "Value": f"{candidate.recommended_risk_per_trade_percent:.2f}%", "Plain English": "Risk size suggested by validation-period drawdown. Account risk limits still apply."},
         {"Item": "Rolling periods profitable", "Value": f"{candidate.rolling_profitable_windows}/{candidate.rolling_windows}", "Plain English": "How often the unchanged settings made money across separate chronological periods."},
         {"Item": "Locked final test", "Value": _locked_text(locked), "Plain English": "This final period was not used to choose the strategy or settings."},
@@ -489,6 +727,7 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
         {"Item": "Trial-adjusted confidence", "Value": _trial_text(trial), "Plain English": "Reduces confidence when many setting combinations were searched."},
         {"Item": "Overall confidence", "Value": candidate.confidence, "Plain English": candidate.stability},
         {"Item": "Main concern", "Value": candidate.concern, "Plain English": "What to watch before trusting this setting."},
+        {"Item": "Next step", "Value": next_step, "Plain English": "The appropriate action for the current evidence level."},
     ]
 
 
@@ -530,10 +769,16 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Trend Filter": candidate.settings["moving_average_window"],
             "Pullback Average": candidate.settings["pullback_average_length"],
             "Momentum Turn": candidate.settings["momentum_turn_length"],
-            "Newer Return %": candidate.test_return_percent,
+            "RSI Entry Rule": "On" if candidate.settings.get("rsi_entry_filter_enabled", False) else "Off",
+            "Newer Allocated Return %": candidate.test_return_percent,
+            "Newer Account Return %": candidate.test_account_return_percent,
+            "Annualized Allocated Return %": candidate.test_annualized_return_percent,
+            "Equal-Capital Buy and Hold %": candidate.benchmark_return_percent,
+            "Annualized Buy and Hold %": candidate.benchmark_annualized_return_percent,
+            "Excess Return %": candidate.excess_return_percent,
             "Newer Trades": candidate.test_trades,
             "Profit Factor": candidate.test_profit_factor,
-            "Worst Drop %": candidate.test_max_drawdown_percent,
+            "Allocated Worst Drop %": candidate.test_max_drawdown_percent,
             "Profitable Periods": f"{candidate.profitable_test_periods}/{candidate.tested_periods}",
             "Nearby Settings": candidate.plateau_neighbors,
             "Nearby Profitable %": candidate.plateau_profitable_percent,
@@ -542,6 +787,26 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
         }
         for index, candidate in enumerate(candidates[:limit])
     ]
+
+
+def optimizer_interval_records(result: MultiIntervalRecommendation) -> list[dict[str, Any]]:
+    rows = []
+    for interval_result in result.interval_results:
+        candidate = interval_result.recommendation.best
+        locked = interval_result.recommendation.robustness.locked_test if interval_result.recommendation.robustness else None
+        rows.append({
+            "Interval": interval_result.interval,
+            "History": interval_result.history,
+            "Status": interval_result.evidence_status,
+            "Strategy": candidate.strategy_label if candidate else "No candidate",
+            "Newer Allocated Return %": candidate.test_return_percent if candidate else 0.0,
+            "Equal-Capital Buy and Hold %": candidate.benchmark_return_percent if candidate else 0.0,
+            "Excess Return %": candidate.excess_return_percent if candidate else 0.0,
+            "Locked Excess %": locked.excess_return_percent if locked else 0.0,
+            "Allocated Worst Drop %": candidate.test_max_drawdown_percent if candidate else 0.0,
+            "Confidence": candidate.confidence if candidate else "Low",
+        })
+    return rows
 
 
 def _settings_text(settings: dict[str, Any]) -> str:
@@ -558,6 +823,11 @@ def _settings_text(settings: dict[str, Any]) -> str:
         parts.append(f"pullback average {int(settings['pullback_average_length'])}")
     if strategy_type in {"pullback", "trendline_retest"}:
         parts.append(f"momentum turn {int(settings['momentum_turn_length'])}")
+    parts.append(
+        "require RSI 50-70"
+        if settings.get("rsi_entry_filter_enabled", False)
+        else "RSI entry rule off"
+    )
     return "; ".join(parts)
 
 
@@ -591,14 +861,29 @@ def _locked_text(locked: LockedTestResult | None) -> str:
     if locked is None:
         return "Not available"
     status = "Passed" if locked.passed else "Did not pass"
-    return f"{status}: {locked.return_percent:.2f}% return, {locked.trades} trades, {locked.max_drawdown_percent:.2f}% worst drop"
+    return (
+        f"{status}: {locked.return_percent:.2f}% allocated return, {locked.trades} trades, "
+        f"{locked.max_drawdown_percent:.2f}% allocated worst drop, {locked.excess_return_percent:+.2f}% vs buy-and-hold"
+    )
+
+
+def _annualized_text(value: float | None) -> str:
+    return "Not shown (period is 1 year or less)" if value is None else f"{value:.2f}%"
+
+
+def _best_market_condition(rows: list[dict[str, Any]]) -> str:
+    eligible = [row for row in rows if int(row.get("Trades", 0)) > 0]
+    if not eligible:
+        return "Not enough trades"
+    best = max(eligible, key=lambda row: float(row.get("Return Percent", 0)))
+    return f"{best['Market condition']} ({float(best['Return Percent']):+.2f}%)"
 
 
 def _stress_text(row: dict[str, Any] | None) -> str:
     if not row:
         return "Not available"
     status = "Passed" if row["Passed"] else "Did not pass"
-    return f"{status}: {float(row['Return Percent']):.2f}% return"
+    return f"{status}: {float(row['Return Percent']):.2f}% allocated return"
 
 
 def _trial_text(trial: TrialAdjustment | None) -> str:
@@ -613,7 +898,7 @@ def _bootstrap_text(bootstrap: BootstrapResult | None) -> str:
     if bootstrap is None:
         return "Not enough completed trades"
     return (
-        f"{bootstrap.fifth_percentile_return_percent:.2f}% fifth-percentile return; "
+        f"{bootstrap.fifth_percentile_return_percent:.2f}% fifth-percentile allocated return; "
         f"{bootstrap.loss_probability_percent:.1f}% chance of loss"
     )
 
@@ -642,7 +927,13 @@ def _evaluate_optimizer_candidate(
     train_data = data.iloc[:split_index].copy()
     train_data.attrs["symbol"] = data.attrs.get("symbol", "MARKET")
     train_result = _run_one(strategy_type, train_data, settings, account_equity, risk_limits)
-    train_stats = _closed_trade_stats(account_equity, train_result["trade_log"], split_index)
+    train_stats = _closed_trade_stats(
+        account_equity,
+        train_result["trade_log"],
+        split_index,
+        risk_limits,
+        elapsed_years(train_data.index),
+    )
 
     oos_start = max(0, split_index - warmup_bars)
     warmup_offset = split_index - oos_start
@@ -654,7 +945,21 @@ def _evaluate_optimizer_candidate(
         if int(trade.get("entry_bar", 0)) >= warmup_offset
     ]
     validation_bars = locked_start - split_index
-    oos_stats = _closed_trade_stats(account_equity, oos_trades, validation_bars)
+    oos_stats = _closed_trade_stats(
+        account_equity,
+        oos_trades,
+        validation_bars,
+        risk_limits,
+        elapsed_years(data.index, start=split_index, end=locked_start),
+    )
+    allocation = ticker_allocated_capital(account_equity, risk_limits)
+    benchmark = buy_and_hold_benchmark(
+        data,
+        account_equity,
+        start=split_index,
+        end=locked_start,
+        allocated_capital=allocation,
+    )
 
     tested_periods = min(3, max(1, validation_bars // 30))
     period_pnl = [0.0] * tested_periods
@@ -666,11 +971,11 @@ def _evaluate_optimizer_candidate(
         period_pnl[bucket] += float(trade.get("pnl", 0))
 
     test_trades = int(oos_stats["total_trades"])
-    return_pct = float(oos_stats["return_pct"])
+    return_pct = float(oos_stats["allocated_return_pct"])
     profit_factor = float(oos_stats["profit_factor"])
-    drawdown = float(oos_stats["max_drawdown_pct"])
+    drawdown = float(oos_stats["allocated_max_drawdown_pct"])
     win_rate = float(oos_stats["win_rate"])
-    train_return = float(train_stats["return_pct"])
+    train_return = float(train_stats["allocated_return_pct"])
     train_trades = int(train_stats["total_trades"])
     profitable_periods = sum(value > 0 for value in period_pnl)
     trade_penalty = 8.0 if test_trades < min_test_trades else 0.0
@@ -680,17 +985,21 @@ def _evaluate_optimizer_candidate(
     trade_bonus = min(test_trades, 8) * 0.4
     stability_bonus = profitable_periods * 1.25
     concentration_penalty = 3.0 if tested_periods > 1 and profitable_periods <= 1 else 0.0
+    excess_return = return_pct - benchmark.return_percent
+    drawdown_advantage = benchmark.max_drawdown_percent - drawdown
     score = round(
         return_pct + profit_factor_bonus + trade_bonus + stability_bonus
+        + excess_return * 0.65 + drawdown_advantage * 0.20
         - drawdown * 0.35 - drawdown_penalty - degradation_penalty - trade_penalty - concentration_penalty,
         2,
     )
     confidence = _optimizer_confidence(score, test_trades, drawdown, return_pct, profitable_periods, tested_periods)
     concern = _optimizer_concern(test_trades, drawdown, return_pct, train_return, min_test_trades)
     reason = (
-        f"Newer-data return {return_pct:.2f}%, {test_trades} trades, "
-        f"profit factor {profit_factor:.2f}, worst drop {drawdown:.2f}%, "
-        f"profitable in {profitable_periods}/{tested_periods} newer periods."
+        f"Newer-data allocated return {return_pct:.2f}%, {test_trades} trades, "
+        f"profit factor {profit_factor:.2f}, allocated worst drop {drawdown:.2f}%, "
+        f"profitable in {profitable_periods}/{tested_periods} newer periods, "
+        f"{excess_return:+.2f}% versus buy-and-hold."
     )
     recommended_risk = _recommended_risk(settings, drawdown, target_max_drawdown_percent)
     trade_returns = tuple(
@@ -718,6 +1027,15 @@ def _evaluate_optimizer_candidate(
         stability=_stability_read(score, test_trades, drawdown, train_return, return_pct, profitable_periods, tested_periods),
         recommended_risk_per_trade_percent=recommended_risk,
         validation_trade_returns=trade_returns,
+        benchmark_return_percent=benchmark.return_percent,
+        benchmark_max_drawdown_percent=benchmark.max_drawdown_percent,
+        excess_return_percent=round(excess_return, 2),
+        drawdown_advantage_percent=round(drawdown_advantage, 2),
+        test_account_return_percent=float(oos_stats["return_pct"]),
+        test_annualized_return_percent=oos_stats["annualized_allocated_return_pct"],
+        benchmark_account_return_percent=benchmark.account_return_percent,
+        benchmark_annualized_return_percent=benchmark.annualized_return_percent,
+        allocated_capital=allocation,
     )
 
 
@@ -737,7 +1055,13 @@ def _evaluate_range(
     result = _run_one(strategy_type, segment, settings, account_equity, risk_limits)
     offset = start - warm_start
     trades = [trade for trade in result["trade_log"] if int(trade.get("entry_bar", 0)) >= offset]
-    return _closed_trade_stats(account_equity, trades, max(1, end - start)), trades
+    return _closed_trade_stats(
+        account_equity,
+        trades,
+        max(1, end - start),
+        risk_limits,
+        elapsed_years(data.index, start=start, end=end),
+    ), trades
 
 
 def _attach_plateau_scores(candidates: list[OptimizerCandidate]) -> list[OptimizerCandidate]:
@@ -790,12 +1114,12 @@ def _rolling_evidence(
         except ValueError:
             continue
         rows.append(stats)
-    returns = [float(row["return_pct"]) for row in rows]
+    returns = [float(row["allocated_return_pct"]) for row in rows]
     return {
         "windows": len(rows),
         "profitable_windows": sum(value > 0 for value in returns),
         "median_return_percent": round(float(median(returns)), 2) if returns else 0.0,
-        "worst_drawdown_percent": round(max((float(row["max_drawdown_pct"]) for row in rows), default=0.0), 2),
+        "worst_drawdown_percent": round(max((float(row["allocated_max_drawdown_pct"]) for row in rows), default=0.0), 2),
     }
 
 
@@ -840,11 +1164,19 @@ def _locked_test(
     stats, trades = _evaluate_range(
         strategy_type, settings, data, start, len(data), account_equity, risk_limits
     )
+    benchmark = buy_and_hold_benchmark(
+        data,
+        account_equity,
+        start=start,
+        end=len(data),
+        allocated_capital=ticker_allocated_capital(account_equity, risk_limits),
+    )
+    excess_return = float(stats["allocated_return_pct"]) - benchmark.return_percent
     passed = bool(
         stats["total_trades"] >= min_trades
-        and stats["return_pct"] > 0
+        and stats["allocated_return_pct"] > 0
         and stats["profit_factor"] >= 1.0
-        and stats["max_drawdown_pct"] <= 10.0
+        and stats["allocated_max_drawdown_pct"] <= 10.0
     )
     if stats["total_trades"] < min_trades:
         detail = "Not enough completed trades in the locked period."
@@ -853,17 +1185,27 @@ def _locked_test(
     else:
         detail = "The untouched final period did not confirm every profitability and drawdown requirement."
     return LockedTestResult(
-        return_percent=float(stats["return_pct"]),
+        return_percent=float(stats["allocated_return_pct"]),
         trades=int(stats["total_trades"]),
         win_rate_percent=float(stats["win_rate"]),
         profit_factor=float(stats["profit_factor"]),
-        max_drawdown_percent=float(stats["max_drawdown_pct"]),
+        max_drawdown_percent=float(stats["allocated_max_drawdown_pct"]),
         passed=passed,
         detail=detail,
+        benchmark_return_percent=benchmark.return_percent,
+        benchmark_max_drawdown_percent=benchmark.max_drawdown_percent,
+        excess_return_percent=round(excess_return, 2),
+        account_return_percent=float(stats["return_pct"]),
+        annualized_return_percent=stats["annualized_allocated_return_pct"],
+        benchmark_annualized_return_percent=benchmark.annualized_return_percent,
     ), trades
 
 
-def _execution_stress_rows(trades: list[dict], account_equity: float) -> list[dict[str, Any]]:
+def _execution_stress_rows(
+    trades: list[dict],
+    account_equity: float,
+    risk_limits: RiskLimits | None,
+) -> list[dict[str, Any]]:
     rows = []
     for basis_points in (0, 5, 10, 20):
         adjusted = []
@@ -876,13 +1218,13 @@ def _execution_stress_rows(trades: list[dict], account_equity: float) -> list[di
             record["pnl"] = float(trade.get("pnl", 0)) - execution_cost
             record["max_adverse_pnl"] = float(trade.get("max_adverse_pnl", 0)) - execution_cost
             adjusted.append(record)
-        stats = _closed_trade_stats(account_equity, adjusted, max(1, len(adjusted)))
+        stats = _closed_trade_stats(account_equity, adjusted, max(1, len(adjusted)), risk_limits)
         rows.append({
             "Round-trip slippage": f"{basis_points} bps per side",
-            "Return Percent": stats["return_pct"],
+            "Return Percent": stats["allocated_return_pct"],
             "Profit Factor": stats["profit_factor"],
-            "Worst Drop Percent": stats["max_drawdown_pct"],
-            "Passed": bool(stats["total_trades"] > 0 and stats["return_pct"] > 0),
+            "Worst Drop Percent": stats["allocated_max_drawdown_pct"],
+            "Passed": bool(stats["total_trades"] > 0 and stats["allocated_return_pct"] > 0),
         })
     return rows
 
@@ -892,6 +1234,7 @@ def _regime_rows(
     trades: list[dict],
     account_equity: float,
     settings: dict[str, Any],
+    risk_limits: RiskLimits | None,
 ) -> list[dict[str, Any]]:
     if data.empty or not trades:
         return []
@@ -931,14 +1274,14 @@ def _regime_rows(
         groups["Higher volatility" if pd.notna(volatility) and volatility > volatility_cutoff else "Lower volatility"].append(trade)
     rows = []
     for name, group in groups.items():
-        stats = _closed_trade_stats(account_equity, group, max(1, len(group)))
+        stats = _closed_trade_stats(account_equity, group, max(1, len(group)), risk_limits)
         rows.append({
             "Market condition": name,
             "Trades": stats["total_trades"],
-            "Return Percent": stats["return_pct"],
+            "Return Percent": stats["allocated_return_pct"],
             "Win Rate Percent": stats["win_rate"],
             "Profit Factor": stats["profit_factor"],
-            "Worst Drop Percent": stats["max_drawdown_pct"],
+            "Worst Drop Percent": stats["allocated_max_drawdown_pct"],
         })
     return rows
 
@@ -1059,14 +1402,20 @@ def validate_settings_across_tickers(
     for symbol, data in market_data_by_symbol.items():
         try:
             result = _run_one(strategy_type, data, settings, account_equity, risk_limits)
-            stats = _closed_trade_stats(account_equity, result["trade_log"], len(data))
+            stats = _closed_trade_stats(
+                account_equity,
+                result["trade_log"],
+                len(data),
+                risk_limits,
+                elapsed_years(data.index),
+            )
             rows.append({
                 "Ticker": str(symbol).upper(),
                 "Trades": stats["total_trades"],
-                "Return Percent": stats["return_pct"],
+                "Return Percent": stats["allocated_return_pct"],
                 "Profit Factor": stats["profit_factor"],
-                "Worst Drop Percent": stats["max_drawdown_pct"],
-                "Profitable": bool(stats["total_trades"] >= 2 and stats["return_pct"] > 0),
+                "Worst Drop Percent": stats["allocated_max_drawdown_pct"],
+                "Profitable": bool(stats["total_trades"] >= 2 and stats["allocated_return_pct"] > 0),
             })
         except ValueError as exc:
             rows.append({
@@ -1084,7 +1433,13 @@ def validate_settings_across_tickers(
     )
 
 
-def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -> dict[str, Any]:
+def _closed_trade_stats(
+    account: float,
+    trade_log: list[dict],
+    eval_bars: int,
+    risk_limits: RiskLimits | None = None,
+    years: float | None = None,
+) -> dict[str, Any]:
     wins = [trade for trade in trade_log if float(trade.get("pnl", 0)) > 0]
     losses = [trade for trade in trade_log if float(trade.get("pnl", 0)) <= 0]
     total_pnl = round(sum(float(trade.get("pnl", 0)) for trade in trade_log), 2)
@@ -1092,18 +1447,23 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
     gross_losses = abs(sum(float(trade.get("pnl", 0)) for trade in losses))
     equity = account
     peak = account
-    max_drawdown = 0.0
+    max_drawdown_dollars = 0.0
     for trade in trade_log:
         adverse_equity = equity + float(trade.get("max_adverse_pnl", 0))
-        if peak > 0:
-            max_drawdown = min(max_drawdown, (adverse_equity - peak) / peak)
+        max_drawdown_dollars = max(max_drawdown_dollars, peak - adverse_equity)
         equity += float(trade.get("pnl", 0))
         peak = max(peak, equity)
-        if peak > 0:
-            max_drawdown = min(max_drawdown, (equity - peak) / peak)
+        max_drawdown_dollars = max(max_drawdown_dollars, peak - equity)
     exposure_bars = sum(max(0, int(trade.get("exit_bar", 0)) - int(trade.get("entry_bar", 0))) for trade in trade_log)
     avg_loss = round(sum(float(trade.get("pnl", 0)) for trade in losses) / len(losses), 2) if losses else 0
     avg_win = round(gross_wins / len(wins), 2) if wins else 0
+    capital = allocation_metrics(
+        account_equity=account,
+        total_pnl=total_pnl,
+        max_drawdown_dollars=max_drawdown_dollars,
+        risk_limits=risk_limits,
+        years=years,
+    )
     return {
         "final_equity": round(account + total_pnl),
         "total_pnl": round(total_pnl),
@@ -1116,8 +1476,9 @@ def _closed_trade_stats(account: float, trade_log: list[dict], eval_bars: int) -
         "avg_loss": avg_loss,
         "rr_ratio": round(abs(avg_win / avg_loss), 2) if avg_loss else (99.0 if avg_win > 0 else 0),
         "profit_factor": round(gross_wins / gross_losses, 2) if gross_losses else (99.0 if gross_wins > 0 else 0),
-        "max_drawdown_pct": round(abs(max_drawdown) * 100, 2),
+        "max_drawdown_pct": round(max_drawdown_dollars / account * 100, 2) if account else 0,
         "exposure_pct": round(exposure_bars / eval_bars * 100, 2) if eval_bars else 0,
+        **capital,
     }
 
 
@@ -1132,6 +1493,7 @@ def _normal_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "moving_average_window": int(settings.get("moving_average_window", 50)),
         "pullback_average_length": int(settings.get("pullback_average_length", 20)),
         "momentum_turn_length": int(settings.get("momentum_turn_length", 10)),
+        "rsi_entry_filter_enabled": bool(settings.get("rsi_entry_filter_enabled", False)),
     }
 
 
@@ -1143,6 +1505,7 @@ def _settings_distance(base: dict[str, Any], row: dict[str, Any]) -> float:
         abs(row["moving_average_window"] - base["moving_average_window"]) / 50,
         abs(row["pullback_average_length"] - base["pullback_average_length"]) / 20,
         abs(row["momentum_turn_length"] - base["momentum_turn_length"]) / 5,
+        1.0 if row.get("rsi_entry_filter_enabled", False) != base.get("rsi_entry_filter_enabled", False) else 0.0,
     )
     return float(sum(distances))
 

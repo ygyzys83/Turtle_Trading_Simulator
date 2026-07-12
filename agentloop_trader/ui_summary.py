@@ -335,7 +335,7 @@ def optional_quality_input_records(enabled_inputs: dict[str, bool] | None = None
         "market_condition": "Checks whether the broad market supports new long trades when connected.",
         "liquidity": "Checks whether the ticker trades enough dollar volume for clean fills.",
         "event_risk": "Flags earnings or news risk when an event calendar is connected.",
-        "rsi": "Shows whether momentum is weak, healthy, strong, or stretched.",
+        "rsi": "Always shows current RSI. It becomes a required BUY rule only when Require RSI 50-70 for BUY is on.",
     }
     labels = {
         "breakout_strength": "Breakout strength",
@@ -355,7 +355,7 @@ def optional_quality_input_records(enabled_inputs: dict[str, bool] | None = None
             rows.append(
                 {
                     "Quality Input": labels[key],
-                    "Creates BUY?": "No",
+                    "Creates BUY?": "Optional rule" if key == "rsi" else "No",
                     "Plain English": description,
                 }
             )

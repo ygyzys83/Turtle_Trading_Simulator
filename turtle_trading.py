@@ -4,9 +4,11 @@ import plotly.graph_objects as go
 import streamlit as st
 from dataclasses import asdict, replace
 from datetime import datetime
+from html import escape
 from pathlib import Path
 import hashlib
 import json
+import re
 
 from agentloop_trader.audit import build_audit_events, events_to_records
 from agentloop_trader.audit_store import JsonlAuditStore
@@ -108,14 +110,18 @@ from agentloop_trader.ops_readiness import (
     strategy_state_snapshot_records,
 )
 from agentloop_trader.parameter_loop import (
+    buy_and_hold_benchmark,
+    optimize_strategy_intervals,
     optimize_strategy_inputs,
     optimizer_candidate_records,
+    optimizer_interval_records,
     optimizer_regime_records,
     optimizer_recommendation_records,
     optimizer_robustness_records,
     optimizer_stress_records,
     validate_settings_across_tickers,
 )
+from agentloop_trader.performance import ticker_allocated_capital
 from agentloop_trader.research_agent import (
     build_research_agent_report,
     research_agent_records,
@@ -179,8 +185,9 @@ from agentloop_trader.ui_summary import (
     strategy_context_records,
     trade_evidence_summary_records,
 )
+from agentloop_trader.ui_theme import CHART_COLORS, TRADING_CONSOLE_CSS
 
-st.set_page_config(page_title="AgentLoop Trader", layout="wide")
+st.set_page_config(page_title="AgentLoop Trader", layout="wide", initial_sidebar_state="expanded")
 
 if not hasattr(st, "_agentloop_original_dataframe"):
     st._agentloop_original_dataframe = st.dataframe
@@ -194,55 +201,7 @@ def safe_streamlit_dataframe(data=None, *args, **kwargs):
 
 st.dataframe = safe_streamlit_dataframe
 
-st.markdown("""
-<style>
-    .metric-card {
-        background-color: rgba(128,128,128,0.08);
-        border-radius: 8px;
-        padding: 14px 18px;
-        margin-bottom: 8px;
-    }
-    .metric-label { font-size: 12px; color: rgba(128,128,128,0.85); margin-bottom: 4px; }
-    .metric-value {
-        font-size: 16px;
-        font-weight: 600;
-        line-height: 1.25;
-        color: inherit;
-        overflow-wrap: anywhere;
-    }
-    .metric-sub { font-size: 11px; color: rgba(128,128,128,0.7); margin-top: 2px; }
-    .pos { color: #3B6D11; }
-    .neg { color: #A32D2D; }
-    .rule-box {
-        border-left: 3px solid rgba(128,128,128,0.25);
-        padding: 8px 14px;
-        margin-bottom: 8px;
-        font-size: 14px;
-        line-height: 1.6;
-    }
-    .signal-long {
-        background: #EAF3DE; color: #3B6D11;
-        padding: 8px 16px; border-radius: 8px;
-        font-weight: 500; display: inline-block;
-    }
-    .signal-exit {
-        background: #FCEBEB; color: #A32D2D;
-        padding: 8px 16px; border-radius: 8px;
-        font-weight: 500; display: inline-block;
-    }
-    .signal-flat {
-        background: rgba(128,128,128,0.12); color: rgba(128,128,128,0.9);
-        padding: 8px 16px; border-radius: 8px;
-        font-weight: 500; display: inline-block;
-    }
-    .ui-section-caption {
-        color: rgba(128,128,128,0.85);
-        font-size: 0.95rem;
-        margin-top: -0.6rem;
-        margin-bottom: 1rem;
-    }
-</style>
-""", unsafe_allow_html=True)
+st.markdown(TRADING_CONSOLE_CSS, unsafe_allow_html=True)
 
 
 @st.cache_data(ttl=300, show_spinner=False)
@@ -271,14 +230,46 @@ def metric_card(col, label, value, sub, color_class=""):
     </div>""", unsafe_allow_html=True)
 
 
+def status_strip(rows: list[dict]) -> None:
+    items = []
+    for row in rows:
+        state = str(row.get("State", "")).strip().lower()
+        value = str(row.get("Value", "")).strip().lower()
+        semantic_class = (
+            "status-negative"
+            if state in {"block", "blocked", "error", "failed"}
+            or value in {"block", "blocked", "rejected", "failed"}
+            else "status-warning"
+            if state in {"warning", "stale", "review"}
+            else "status-positive"
+            if state in {"ok", "ready", "pass", "approved"}
+            else ""
+        )
+        items.append(
+            "<div class='status-strip-item {semantic}'>"
+            "<div class='status-strip-label'>{label}</div>"
+            "<div class='status-strip-value'>{value}</div>"
+            "<div class='status-strip-state'>{state}</div>"
+            "</div>".format(
+                semantic=semantic_class,
+                label=escape(str(row.get("Status", ""))),
+                value=escape(str(row.get("Value", ""))),
+                state=escape(str(row.get("State", ""))),
+            )
+        )
+    st.markdown("<div class='status-strip'>" + "".join(items) + "</div>", unsafe_allow_html=True)
+
+
 def page_section(title: str, caption: str | None = None) -> None:
-    st.markdown(f"## {title}")
+    clean_title = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", title).strip()
+    st.markdown(f"## {clean_title}")
     if caption:
         st.markdown(f"<div class='ui-section-caption'>{caption}</div>", unsafe_allow_html=True)
 
 
 def sub_section(title: str, caption: str | None = None) -> None:
-    st.markdown(f"### {title}")
+    clean_title = re.sub(r"^\d+(?:\.\d+)*\.?\s+", "", title).strip()
+    st.markdown(f"### {clean_title}")
     if caption:
         st.markdown(f"<div class='ui-section-caption'>{caption}</div>", unsafe_allow_html=True)
 
@@ -656,6 +647,7 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "Trend filter length", "Value": bars_or_missing(settings.get("moving_average_window"))},
         {"Field": "Pullback average length", "Value": bars_or_missing(settings.get("pullback_average_length"))},
         {"Field": "Momentum turn length", "Value": bars_or_missing(settings.get("momentum_turn_length"))},
+        {"Field": "RSI entry rule", "Value": "Require RSI 50-70" if settings.get("rsi_entry_filter_enabled", False) else "Off"},
         {"Field": "Sizing account", "Value": str(settings.get("sizing_account_source", "Not recorded"))},
         {"Field": "Sizing account value", "Value": money_or_missing(settings.get("sizing_account_equity"))},
         {"Field": "Sizing cash available", "Value": money_or_missing(settings.get("sizing_available_cash"))},
@@ -1075,8 +1067,10 @@ def decision_ticket_records() -> list[dict]:
     ]
 
 
-def required_setup_reads(selected_strategy_type: str) -> set[str]:
+def required_setup_reads(selected_strategy_type: str, require_rsi: bool = False) -> set[str]:
     base = {"Trend", "Risk approval"}
+    if require_rsi:
+        base.add("RSI condition")
     if selected_strategy_type == "pullback":
         return base | {"Pullback", "Momentum turn"}
     if selected_strategy_type == "trendline":
@@ -1111,7 +1105,7 @@ def trade_read_records() -> list[dict]:
             ]
         )
 
-    required_reads = required_setup_reads(strategy_type)
+    required_reads = required_setup_reads(strategy_type, rsi_entry_filter_enabled)
     for source in setup_scorecard_rows:
         read = str(source.get("Read", ""))
         if read == "Overall":
@@ -1333,12 +1327,12 @@ def build_chart(
 
     fig.add_trace(go.Scatter(
         x=x, y=prices.tolist(), name="Price", mode="lines",
-        line=dict(color="#4C9BE8", width=1.5),
+        line=dict(color=CHART_COLORS["price"], width=1.6),
         hovertemplate="%{x}<br>Price: $%{y:.2f}<extra></extra>",
     ))
     fig.add_trace(go.Scatter(
         x=x, y=smas, name=f"{ma_w}-bar trend filter", mode="lines",
-        line=dict(color="#F0A830", width=1, dash="dot"),
+        line=dict(color=CHART_COLORS["trend"], width=1.2, dash="dot"),
         hovertemplate="%{x}<br>Trend filter: $%{y:.2f}<extra></extra>",
     ))
     if strategy_type == "breakout":
@@ -1346,12 +1340,12 @@ def build_chart(
         exit_line = [float(np.min(lows[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
         fig.add_trace(go.Scatter(
             x=x, y=entry_line, name=f"{entry_w}-bar entry high", mode="lines",
-            line=dict(color="#5DBF8A", width=1, dash="dash"),
+            line=dict(color=CHART_COLORS["entry"], width=1.1, dash="dash"),
             hovertemplate="%{x}<br>Entry high: $%{y:.2f}<extra></extra>",
         ))
         fig.add_trace(go.Scatter(
             x=x, y=exit_line, name=f"{exit_w}-bar exit low", mode="lines",
-            line=dict(color="#E8645A", width=1, dash="dash"),
+            line=dict(color=CHART_COLORS["exit"], width=1.1, dash="dash"),
             hovertemplate="%{x}<br>Exit low: $%{y:.2f}<extra></extra>",
         ))
     elif strategy_type == "pullback":
@@ -1359,22 +1353,22 @@ def build_chart(
         exit_line = [float(np.mean(prices[i - exit_w + 1:i + 1])) if i + 1 >= exit_w else None for i in range(len(prices))]
         fig.add_trace(go.Scatter(
             x=x, y=pullback_line, name=f"{pullback_w}-bar pullback average", mode="lines",
-            line=dict(color="#5DBF8A", width=1, dash="dash"),
+            line=dict(color=CHART_COLORS["entry"], width=1.1, dash="dash"),
         ))
         fig.add_trace(go.Scatter(
             x=x, y=exit_line, name=f"{exit_w}-bar exit average", mode="lines",
-            line=dict(color="#E8645A", width=1, dash="dash"),
+            line=dict(color=CHART_COLORS["exit"], width=1.1, dash="dash"),
         ))
     else:
         exit_line = [float(np.min(lows[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
         fig.add_trace(go.Scatter(
             x=x, y=exit_line, name=f"{exit_w}-bar exit low", mode="lines",
-            line=dict(color="#E8645A", width=1, dash="dash"),
+            line=dict(color=CHART_COLORS["exit"], width=1.1, dash="dash"),
             hovertemplate="%{x}<br>Exit low: $%{y:.2f}<extra></extra>",
         ))
     fig.add_trace(go.Scatter(
         x=x, y=atrs, name="ATR (14 bars)", mode="lines",
-        line=dict(color="#B07FE8", width=1, dash="dot"),
+        line=dict(color=CHART_COLORS["atr"], width=1, dash="dot"),
         yaxis="y2",
         hovertemplate="%{x}<br>ATR: $%{y:.2f}<extra></extra>",
     ))
@@ -1384,7 +1378,7 @@ def build_chart(
             x=[t["entry_date"] for t in trade_log],
             y=[t["entry"] for t in trade_log],
             name="Entry", mode="markers",
-            marker=dict(symbol="triangle-up", size=10, color="#5DBF8A", opacity=0.55),
+            marker=dict(symbol="triangle-up", size=9, color=CHART_COLORS["entry"], opacity=0.75),
             customdata=[t["trade"] for t in trade_log],
             hovertemplate="Entry #%{customdata}<br>%{x}: $%{y:.2f}<extra></extra>",
         ))
@@ -1392,7 +1386,7 @@ def build_chart(
             x=[t["exit_date"] for t in trade_log],
             y=[t["exit"] for t in trade_log],
             name="Exit", mode="markers",
-            marker=dict(symbol="triangle-down", size=10, color="#E8645A", opacity=0.55),
+            marker=dict(symbol="triangle-down", size=9, color=CHART_COLORS["sell"], opacity=0.75),
             customdata=[t["trade"] for t in trade_log],
             hovertemplate="Exit #%{customdata}<br>%{x}: $%{y:.2f}<extra></extra>",
         ))
@@ -1412,26 +1406,40 @@ def build_chart(
         ))
         fig.add_trace(go.Scatter(
             x=[t["entry_date"]], y=[t["entry"]], mode="markers+text",
-            marker=dict(symbol="triangle-up", size=18, color="#5DBF8A"),
+            marker=dict(symbol="triangle-up", size=16, color=CHART_COLORS["entry"]),
             text=[f" BUY #{t['trade']}"], textposition="middle right",
             showlegend=False,
         ))
         fig.add_trace(go.Scatter(
             x=[t["exit_date"]], y=[t["exit"]], mode="markers+text",
-            marker=dict(symbol="triangle-down", size=18, color="#E8645A"),
+            marker=dict(symbol="triangle-down", size=16, color=CHART_COLORS["sell"]),
             text=[f" SELL #{t['trade']}"], textposition="middle right",
             showlegend=False,
         ))
 
     fig.update_layout(
-        height=380,
-        margin=dict(l=0, r=0, t=10, b=40),
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, bgcolor="rgba(0,0,0,0)"),
-        xaxis=dict(title="Time", showgrid=False, type="category", nticks=10),
-        yaxis=dict(tickprefix="$", gridcolor="rgba(128,128,128,0.15)"),
-        yaxis2=dict(tickprefix="$", overlaying="y", side="right", showgrid=False),
-        plot_bgcolor="rgba(0,0,0,0)",
-        paper_bgcolor="rgba(0,0,0,0)",
+        height=410,
+        margin=dict(l=18, r=18, t=42, b=38),
+        font=dict(color=CHART_COLORS["text"], family="Inter, Segoe UI, sans-serif", size=11),
+        legend=dict(
+            orientation="h", yanchor="bottom", y=1.01, x=0,
+            bgcolor="rgba(0,0,0,0)", font=dict(size=10, color=CHART_COLORS["text"]),
+        ),
+        xaxis=dict(
+            title=None, showgrid=False, type="category", nticks=10,
+            linecolor=CHART_COLORS["border"], tickfont=dict(color=CHART_COLORS["text"]),
+        ),
+        yaxis=dict(
+            tickprefix="$", gridcolor=CHART_COLORS["grid"], zeroline=False,
+            tickfont=dict(color=CHART_COLORS["text"]),
+        ),
+        yaxis2=dict(
+            tickprefix="$", overlaying="y", side="right", showgrid=False, zeroline=False,
+            tickfont=dict(color=CHART_COLORS["text"]),
+        ),
+        plot_bgcolor=CHART_COLORS["surface"],
+        paper_bgcolor=CHART_COLORS["surface"],
+        hoverlabel=dict(bgcolor="#202730", bordercolor=CHART_COLORS["border"], font_color="#E8EDF3"),
         hovermode="x unified",
     )
     return fig
@@ -1439,7 +1447,7 @@ def build_chart(
 
 alpaca_config = AlpacaConfig.from_env()
 
-st.sidebar.markdown("### Kill Switch")
+st.sidebar.markdown('<div class="sidebar-kill-title">Kill Switch</div>', unsafe_allow_html=True)
 kill_switch = st.sidebar.checkbox(
     "Enabled",
     value=False,
@@ -1457,7 +1465,7 @@ if not sidebar_worker_active:
     st.session_state["worker_stop_pending"] = False
 if kill_switch:
     st.session_state["background_worker_enabled"] = False
-st.sidebar.markdown("### Background Automation")
+st.sidebar.markdown("### :material/smart_toy: Background Automation")
 worker_status_text = "Running" if sidebar_worker_active else "Stopped"
 st.sidebar.caption(f"Worker: {worker_status_text}. {sidebar_worker_status.last_action or 'No recent action.'}")
 worker_control_cols = st.sidebar.columns(2)
@@ -1483,7 +1491,7 @@ if worker_control_cols[1].button("Stop Worker", disabled=not sidebar_worker_acti
         )
     )
 
-st.sidebar.markdown("### Navigation")
+st.sidebar.markdown("### :material/space_dashboard: Navigation")
 workspace_mode = st.sidebar.radio(
     "Workspace",
     ["Daily Trading Screen", "Full Records and Evidence *"],
@@ -1525,7 +1533,7 @@ active_automation_level = resolve_active_automation_level(
     kill_switch_enabled=kill_switch,
 )
 
-st.sidebar.markdown("### Paper trading")
+st.sidebar.markdown("### :material/account_balance_wallet: Paper trading")
 mode_options = {
     "Backtest only - no orders are sent": "backtest_only",
     "Paper trading - send orders to Alpaca paper": "paper",
@@ -1665,7 +1673,7 @@ elif paper_buy_order_style == "Custom limit price":
 )
 reset_paper_broker = False
 
-st.sidebar.markdown("### Ticker and price data")
+st.sidebar.markdown("### :material/candlestick_chart: Ticker and price data")
 data_source = st.sidebar.radio(
     "Prices to use",
     ["Synthetic", "Ticker (Alpaca)", "Ticker (yfinance)"],
@@ -1679,7 +1687,11 @@ period = "synthetic"
 
 if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
     ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
-    interval = st.sidebar.selectbox("Interval", ["1d", "4h", "1h", "30m", "15m", "5m", "1m"], index=2)
+    interval_options = ["1d", "4h", "1h", "30m", "15m", "5m", "1m"]
+    optimizer_interval_to_apply = st.session_state.pop("optimizer_apply_interval", None)
+    if optimizer_interval_to_apply in interval_options:
+        st.session_state["price_interval_input"] = optimizer_interval_to_apply
+    interval = st.sidebar.selectbox("Interval", interval_options, index=2, key="price_interval_input")
     if interval == "1d":
         period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"], 5
     elif interval == "4h" and data_source == "Ticker (Alpaca)":
@@ -1692,7 +1704,12 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
         period_options, period_index = ["1mo", "3mo", "6mo"], 2
     else:
         period_options, period_index = ["1d", "5d", "1mo"], 2
-    period = st.sidebar.selectbox("History period", period_options, index=period_index)
+    optimizer_history_to_apply = st.session_state.pop("optimizer_apply_history", None)
+    if optimizer_history_to_apply in period_options:
+        st.session_state["history_period_input"] = optimizer_history_to_apply
+    elif st.session_state.get("history_period_input") not in period_options:
+        st.session_state["history_period_input"] = period_options[period_index]
+    period = st.sidebar.selectbox("History period", period_options, index=period_index, key="history_period_input")
     if st.sidebar.button("Refresh stock data", type="primary"):
         fetch_alpaca_stock_data.clear()
         fetch_stock_data.clear()
@@ -1723,8 +1740,9 @@ if optimizer_apply_settings:
     st.session_state["moving_average_window_input"] = int(optimizer_apply_settings.get("moving_average_window", 50))
     st.session_state["pullback_average_length_input"] = int(optimizer_apply_settings.get("pullback_average_length", 20))
     st.session_state["momentum_turn_length_input"] = int(optimizer_apply_settings.get("momentum_turn_length", 10))
+    st.session_state["rsi_entry_filter_input"] = bool(optimizer_apply_settings.get("rsi_entry_filter_enabled", False))
 
-st.sidebar.markdown("### Strategy settings")
+st.sidebar.markdown("### :material/tune: Strategy settings")
 account = st.sidebar.number_input(
     "Simulator account size ($)",
     min_value=1000,
@@ -1832,8 +1850,18 @@ momentum_w = st.sidebar.slider(
         "price has turned back up before buying. Shorter values react faster; longer values wait for more confirmation."
     ),
 )
+rsi_entry_filter_enabled = st.sidebar.checkbox(
+    "Require RSI 50-70 for BUY",
+    value=False,
+    key="rsi_entry_filter_input",
+    help=(
+        "When on, every historical and current BUY must also have 14-bar RSI between 50 and 70. "
+        "This changes simulated trades, backtest results, recommendations, and automated entries. "
+        "It never creates a BUY by itself and does not control exits."
+    ),
+)
 
-st.sidebar.markdown("### Risk limits")
+st.sidebar.markdown("### :material/shield: Risk limits")
 max_risk_limit = st.sidebar.slider(
     "Max risk per trade (%)",
     0.25,
@@ -1862,7 +1890,7 @@ max_symbol_concentration = st.sidebar.slider(
     "Max symbol concentration (%)",
     5.0,
     100.0,
-    10.0,
+    5.0,
     step=5.0,
     help="Hard cap on exposure to one ticker. This prevents one symbol from becoming too large relative to the account.",
 )
@@ -1882,17 +1910,30 @@ max_open_positions = st.sidebar.slider(
     step=1,
     help="Maximum number of positions the app can have open or tracked at the same time.",
 )
-st.sidebar.markdown("### Research options")
+st.sidebar.markdown("### :material/query_stats: Research options")
 run_walk_forward = st.sidebar.checkbox(
     "Test on newer price data",
     value=True,
     help="Splits the price history into older data and newer data. The app checks whether the selected strategy still works on the newer bars instead of only fitting the older bars.",
 )
 train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step=5) / 100
-max_parameter_candidates = st.sidebar.slider("Settings to compare per strategy", 4, 24, 12, step=4)
+max_parameter_candidates = st.sidebar.slider(
+    "Settings to compare per strategy",
+    4,
+    24,
+    12,
+    step=4,
+    help=(
+        "How many nearby strategy-setting combinations to inspect. Each combination is tested twice: "
+        "once without the RSI entry rule and once requiring RSI 50-70."
+    ),
+)
 run_strategy_input_search = st.sidebar.button(
     "Run Strategy Input Search",
-    help="Runs the four-strategy input search once and saves the result. Ordinary page refreshes do not rerun it.",
+    help=(
+        "Runs the four-strategy input search once and saves the result. For real tickers it compares daily, 4-hour, "
+        "and 1-hour data against buy-and-hold. Ordinary page refreshes do not rerun it."
+    ),
 )
 optimizer_sidebar_status = st.sidebar.empty()
 
@@ -1944,11 +1985,7 @@ setup_inputs = {
         value=False,
         help="Flags upcoming earnings or major news risk when an event calendar is connected.",
     ),
-    "rsi": st.sidebar.checkbox(
-        "RSI condition",
-        value=True,
-        help="Shows whether momentum looks weak, healthy, strong, or stretched. A stretched reading is a caution flag against chasing.",
-    ),
+    "rsi": True,
 }
 
 with st.sidebar.expander("Files, records, and simulator reset", expanded=False):
@@ -2119,7 +2156,8 @@ risk_limits = RiskLimits(
 
 try:
     breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = simulate_turtle_strategy(
-        account, entry_w, exit_w, atr_mult, risk_dec, ma_w, seed, market_data, risk_limits
+        account, entry_w, exit_w, atr_mult, risk_dec, ma_w, seed, market_data, risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
     pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = simulate_trend_pullback_strategy(
         account=account,
@@ -2132,6 +2170,7 @@ try:
         seed=seed,
         market_data=market_data,
         risk_limits=risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
     trendline_prices, trendline_smas, trendline_atrs, trendline_trade_log, trendline_live, trendline_stats, trendline_labels = simulate_trendline_breakout_strategy(
         account=account,
@@ -2143,6 +2182,7 @@ try:
         seed=seed,
         market_data=market_data,
         risk_limits=risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
     retest_prices, retest_smas, retest_atrs, retest_trade_log, retest_live, retest_stats, retest_labels = simulate_trendline_retest_strategy(
         account=account,
@@ -2155,6 +2195,7 @@ try:
         seed=seed,
         market_data=market_data,
         risk_limits=risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
 except ValueError as exc:
     st.error(str(exc))
@@ -2220,6 +2261,28 @@ comparison_rows = strategy_comparison_records({
 })
 for row in comparison_rows:
     row["Exit Style"] = "Strategy exit + break-even + ATR trail"
+benchmark = None
+if market_data is not None:
+    benchmark = buy_and_hold_benchmark(
+        market_data,
+        float(account),
+        allocated_capital=ticker_allocated_capital(float(account), risk_limits),
+    )
+    comparison_rows.append({
+        "Strategy": "Buy and hold benchmark",
+        "Allocated Return": f"{benchmark.return_percent:.2f}%",
+        "Annualized Return": (
+            "Not shown (period is 1 year or less)"
+            if benchmark.annualized_return_percent is None
+            else f"{benchmark.annualized_return_percent:.2f}%"
+        ),
+        "Account Return": f"{benchmark.account_return_percent:.2f}%",
+        "Trades": "1 holding",
+        "Win Rate": "Not applicable",
+        "Allocated Worst Drop": f"{benchmark.max_drawdown_percent:.2f}%",
+        "Profit Factor": "Not applicable",
+        "Exit Style": "Held from first adjusted close to last adjusted close",
+    })
 
 walk_forward_result = None
 walk_forward_error = None
@@ -2239,6 +2302,7 @@ if run_walk_forward:
             strategy_type=strategy_type,
             pullback_w=pullback_w,
             momentum_w=momentum_w,
+            rsi_entry_filter_enabled=rsi_entry_filter_enabled,
         )
     except ValueError as exc:
         walk_forward_error = str(exc)
@@ -2266,6 +2330,7 @@ current_strategy_settings = {
     "moving_average_window": ma_w,
     "pullback_average_length": pullback_w,
     "momentum_turn_length": momentum_w,
+    "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
     "paper_buy_order_type": paper_buy_order_style,
     "paper_buy_limit_adjustment_pct": paper_buy_limit_adjustment_pct,
     "paper_buy_custom_limit_price": paper_buy_custom_limit_price,
@@ -2621,6 +2686,7 @@ optimizer_setting_keys = (
     "moving_average_window",
     "pullback_average_length",
     "momentum_turn_length",
+    "rsi_entry_filter_enabled",
 )
 optimizer_market_fingerprint = "synthetic-default"
 if market_data is not None:
@@ -2659,17 +2725,52 @@ optimizer_search_completed = False
 if run_strategy_input_search:
     try:
         with st.spinner("Searching strategy inputs..."):
-            fresh_optimizer_result = optimize_strategy_inputs(
-                market_data=market_data,
-                current_settings=current_strategy_settings,
-                account_equity=float(paper_order_risk_equity),
-                risk_limits=risk_limits,
-                train_fraction=train_fraction,
-                max_candidates_per_strategy=max_parameter_candidates,
-            )
+            interval_result = None
+            interval_errors = []
+            if data_source == "Synthetic":
+                fresh_optimizer_result = optimize_strategy_inputs(
+                    market_data=market_data,
+                    current_settings=current_strategy_settings,
+                    account_equity=float(paper_order_risk_equity),
+                    risk_limits=risk_limits,
+                    train_fraction=train_fraction,
+                    max_candidates_per_strategy=max_parameter_candidates,
+                )
+            else:
+                interval_histories = (
+                    {"1d": "10y", "4h": "5y", "1h": "2y"}
+                    if data_source == "Ticker (Alpaca)"
+                    else {"1d": "10y", "4h": "1y", "1h": "1y"}
+                )
+                interval_market_data = {}
+                for search_interval, search_history in interval_histories.items():
+                    try:
+                        if search_interval == interval and search_history == period and market_data is not None:
+                            search_data = market_data
+                        else:
+                            search_data = fetch_price_data_for_source(
+                                ticker,
+                                search_history,
+                                search_interval,
+                                data_source,
+                            )
+                        interval_market_data[search_interval] = (search_history, search_data)
+                    except Exception as exc:
+                        interval_errors.append(f"{search_interval}: {exc}")
+                interval_result = optimize_strategy_intervals(
+                    market_data_by_interval=interval_market_data,
+                    current_settings=current_strategy_settings,
+                    account_equity=float(paper_order_risk_equity),
+                    risk_limits=risk_limits,
+                    train_fraction=train_fraction,
+                    max_candidates_per_strategy=max_parameter_candidates,
+                )
+                fresh_optimizer_result = interval_result.best_result
         st.session_state["strategy_optimizer_search"] = {
             "signature": optimizer_signature,
             "result": fresh_optimizer_result,
+            "interval_result": interval_result,
+            "interval_errors": interval_errors,
             "error": None,
             "completed_at": pd.Timestamp.now(tz="America/Los_Angeles").isoformat(),
         }
@@ -2678,6 +2779,8 @@ if run_strategy_input_search:
         st.session_state["strategy_optimizer_search"] = {
             "signature": optimizer_signature,
             "result": None,
+            "interval_result": None,
+            "interval_errors": [],
             "error": str(exc),
             "completed_at": pd.Timestamp.now(tz="America/Los_Angeles").isoformat(),
         }
@@ -2685,6 +2788,12 @@ if run_strategy_input_search:
 optimizer_search_state = st.session_state.get("strategy_optimizer_search")
 strategy_optimizer_result = (
     optimizer_search_state.get("result") if optimizer_search_state else None
+)
+strategy_optimizer_interval_result = (
+    optimizer_search_state.get("interval_result") if optimizer_search_state else None
+)
+strategy_optimizer_interval_errors = (
+    optimizer_search_state.get("interval_errors", []) if optimizer_search_state else []
 )
 parameter_loop_error = (
     optimizer_search_state.get("error") if optimizer_search_state else None
@@ -2854,10 +2963,15 @@ if optimizer_search_completed and strategy_optimizer_result is not None:
     if persist_audit_log:
         audit_store.append(parameter_event)
 
-st.title("AgentLoop Trader")
-st.caption(f"Research, risk checks, and paper trading. Prices: {source_caption}")
+with st.container(key="top_navigation"):
+    st.title("AgentLoop Trader")
+    command_center_view = st.radio(
+        "Command center page",
+        ["Open Positions", "Ideas", "New Trade", "Alpaca", "Paper Review"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
 
-page_section("1. Daily command center", "Start here. This shows the current trading state and the next action.")
 status_rows = compact_status_records(
     mode_label=mode_label,
     risk_approved=risk_check.approved,
@@ -2866,10 +2980,7 @@ status_rows = compact_status_records(
     kill_switch_enabled=effective_kill_switch,
     live_writes_blocked=not (not alpaca_adapter.config.paper and alpaca_status.can_submit_orders),
 )
-status_cols = st.columns(len(status_rows))
-for col, row in zip(status_cols, status_rows):
-    state_label = str(row["Value"])
-    metric_card(col, row["Status"], state_label, row["State"])
+status_strip(status_rows)
 
 tracked_alpaca_orders = st.session_state.get("tracked_alpaca_orders", [])
 alpaca_preview = build_alpaca_order_preview(intent, execution_decision, alpaca_adapter.config)
@@ -3425,7 +3536,7 @@ session_snapshot = PaperSessionSnapshot(
 
 
 def render_automation_status() -> None:
-    sub_section("4.3 Automation status")
+    sub_section("Automation status")
     status_label, status_detail, status_kind = automation_status_text()
     if status_kind == "ok":
         st.success(f"{status_label}: {status_detail}")
@@ -3790,17 +3901,11 @@ def render_open_positions_panel() -> None:
             st.caption("No saved entry settings found for this position.")
 
 
-command_center_view = st.radio(
-    "Command center page",
-    ["Open Positions", "Ideas", "New Trade", "Alpaca", "Paper Review"],
-    horizontal=True,
-    label_visibility="collapsed",
-)
 if command_center_view == "Open Positions":
-    sub_section("1.1 Open positions", "Manage each Alpaca paper position and its own exit settings.")
+    sub_section("Open positions", "Manage each Alpaca paper position and its own exit settings.")
     render_open_positions_panel()
 elif command_center_view == "Ideas":
-    sub_section("1.2 Ideas", "Scan tickers, compare strategy fit, and create a simple research read.")
+    sub_section("Ideas", "Scan tickers, compare strategy fit, and create a simple research read.")
     scanner_store = ScannerCandidateStore()
     default_scan_text = ", ".join(DEFAULT_SCAN_SYMBOLS)
     scan_symbols_text = st.text_input("Tickers to scan", value=default_scan_text)
@@ -3855,7 +3960,13 @@ elif command_center_view == "Ideas":
             }
             st.rerun()
         if st.session_state.get("latest_llm_research"):
-            st.markdown("#### Research read")
+            st.markdown(
+                "#### Research read",
+                help=(
+                    "Summarizes the selected ticker from the scanner, deterministic research, and the optional research writer. "
+                    "Use it to understand the idea before opening the ticker in New Trade. It cannot send an order."
+                ),
+            )
             latest_result = LLMResearchResult(**st.session_state["latest_llm_research"])
             st.dataframe(pd.DataFrame(llm_research_records(latest_result)), width="stretch", hide_index=True)
             if st.session_state.get("latest_company_context"):
@@ -3868,14 +3979,21 @@ elif command_center_view == "Ideas":
         with st.expander("Scanner errors *", expanded=False):
             st.dataframe(pd.DataFrame(saved_scan_errors), width="stretch", hide_index=True)
 elif command_center_view == "New Trade":
-    sub_section("1.3 New trade", "Research the ticker, review the setup, and decide whether to send a paper buy.")
+    sub_section("New trade", "Research the ticker, review the setup, and decide whether to send a paper buy.")
     desk_cols = st.columns(4)
     metric_card(desk_cols[0], "Final Answer", final_answer, final_detail)
     metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
     metric_card(desk_cols[2], "Strategy", strategy_label, "Selected in the sidebar")
     metric_card(desk_cols[3], "Account P&L today", f"${paper_order_session_pnl:,.2f}", paper_order_account_source, "pos" if paper_order_session_pnl >= 0 else "neg")
     st.info(f"Next action: {new_trade_next_action}")
-    st.markdown("#### Research read")
+    st.markdown(
+        "#### Research read",
+        help=(
+            "Summarizes the selected ticker's current setup. Best strategy fit ranks the four strategies using today's BUY-rule progress, "
+            "the backtest from the current sidebar settings, trade count, return, win rate, profit factor, and worst drop. "
+            "It answers which strategy fits the ticker now; it does not search for better settings."
+        ),
+    )
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
     st.markdown("#### Automation readiness")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("New trade")), width="stretch", hide_index=True)
@@ -3944,7 +4062,7 @@ elif command_center_view == "New Trade":
                 hide_index=True,
             )
 elif command_center_view == "Alpaca":
-    sub_section("1.4 Alpaca account", "Check broker connection, paper account status, and current Alpaca counts.")
+    sub_section("Alpaca account", "Check broker connection, paper account status, and current Alpaca counts.")
     if show_portfolio_evidence:
         st.markdown("#### Broker details *")
         st.dataframe(pd.DataFrame(broker_status_records(broker_statuses)), width="stretch", hide_index=True)
@@ -4023,7 +4141,7 @@ elif command_center_view == "Alpaca":
             )
             st.caption("These checks are local only. The lock file does not enable live trading.")
 elif command_center_view == "Paper Review":
-    sub_section("1.5 Paper review", "Review paper trading progress, account activity, and what needs attention.")
+    sub_section("Paper review", "Review paper trading progress, account activity, and what needs attention.")
     st.markdown("#### Daily paper review")
     st.dataframe(
         pd.DataFrame(
@@ -4066,8 +4184,7 @@ elif command_center_view == "Paper Review":
             st.caption("No paper activity recorded in this app session yet.")
     
 if command_center_view == "New Trade":
-    page_section("2. Backtest", "Review the chart and past simulated results for the selected strategy settings.")
-    sub_section("2.1 Chart and past trades", "Click a past simulated trade to highlight it on the chart.")
+    page_section("Chart and past trades", "Review the selected strategy on historical prices. Click a trade below to highlight it on the chart.")
     selected_idx = st.session_state.get("selected_trade_idx", None)
     selected_trade = trade_log[selected_idx] if selected_idx is not None and 0 <= selected_idx < len(trade_log) else None
     st.plotly_chart(
@@ -4109,7 +4226,7 @@ if command_center_view == "New Trade":
         } for t in trade_log]).set_index("#")
     
         def color_pnl(val):
-            return "color: #3B6D11" if val > 0 else "color: #A32D2D"
+            return "color: #35C46A" if val > 0 else "color: #FF6262"
     
         event = st.dataframe(
             display_df.style.map(color_pnl, subset=["P&L $", "% Account"]),
@@ -4134,19 +4251,31 @@ if command_center_view == "New Trade":
     else:
         st.caption("No trades happened in this simulation run.")
     
-    sub_section("2.2 Backtest results")
+    sub_section("Backtest results")
     st.info(f"Current trading rule: {strategy_label}. Only the selected strategy can create the trade idea shown in this run.")
     c1, c2, c3, c4 = st.columns(4)
     pnl_color = "pos" if stats["total_pnl"] >= 0 else "neg"
-    metric_card(c1, "Final equity", f"${stats['final_equity']:,}", "Includes any open simulated trade")
-    metric_card(c2, "Total P&L", f"${stats['total_pnl']:,}", f"{stats['return_pct']}% return", pnl_color)
-    metric_card(c3, "Win rate", f"{stats['win_rate']}%", f"{stats['wins']}W / {stats['losses']}L of {stats['total_trades']} trades")
-    metric_card(c4, "Avg win/loss", f"{stats['rr_ratio']}x", "Average winner vs loser")
+    metric_card(c1, "Final equity", f"${stats['final_equity']:,}", f"P&L ${stats['total_pnl']:,}", pnl_color)
+    metric_card(c2, "Account return", f"{stats['return_pct']}%", "Impact on the complete account", pnl_color)
+    annualized_allocated = stats.get("annualized_allocated_return_pct")
+    allocated_sub = f"${stats.get('allocated_capital', account):,.0f} ticker allocation"
+    if annualized_allocated is not None:
+        allocated_sub += f"; {annualized_allocated:.2f}% annualized"
+    metric_card(c3, "Allocated return", f"{stats.get('allocated_return_pct', stats['return_pct'])}%", allocated_sub, pnl_color)
+    if benchmark is not None:
+        excess = stats.get("allocated_return_pct", stats["return_pct"]) - benchmark.return_percent
+        excess_sub = f"Buy and hold {benchmark.return_percent:.2f}%"
+        if annualized_allocated is not None and benchmark.annualized_return_percent is not None:
+            excess_sub += f"; {annualized_allocated - benchmark.annualized_return_percent:+.2f}% annualized excess"
+        metric_card(c4, "Excess vs buy and hold", f"{excess:+.2f}%", excess_sub, "pos" if excess >= 0 else "neg")
+    else:
+        metric_card(c4, "Annualized return", "Not shown" if annualized_allocated is None else f"{annualized_allocated:.2f}%", "Shown for periods longer than one year")
     
-    c5, c6, c7 = st.columns(3)
-    metric_card(c5, "Worst drop", f"{stats['max_drawdown_pct']}%", "Largest equity pullback")
-    metric_card(c6, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
-    metric_card(c7, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
+    c5, c6, c7, c8 = st.columns(4)
+    metric_card(c5, "Win rate", f"{stats['win_rate']}%", f"{stats['wins']}W / {stats['losses']}L of {stats['total_trades']} trades")
+    metric_card(c6, "Allocated worst drop", f"{stats.get('allocated_max_drawdown_pct', stats['max_drawdown_pct'])}%", "Largest drop versus ticker allocation")
+    metric_card(c7, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
+    metric_card(c8, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
     with st.expander("Backtest assumptions and exit model", expanded=False):
         st.markdown(
             "Historical signals use completed bars. Entries use the signal-bar close. "
@@ -4156,9 +4285,20 @@ if command_center_view == "New Trade":
         st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
     
     with st.expander("Optional strategy tests" + (" *" if show_portfolio_evidence else ""), expanded=False):
-        st.markdown("#### Strategy comparison")
+        st.markdown(
+            "#### Strategy comparison",
+            help=(
+                "Runs all four strategies on the same ticker, interval, history, account size, risk limits, and current sidebar settings. "
+                "Compare return, completed trades, win rate, worst drop, and profit factor. This table does not search for better settings "
+                "and does not change the selected strategy."
+            ),
+        )
         st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
-        st.caption("This compares all four strategies on the same ticker. Each uses the same profit-protection exit model.")
+        st.caption(
+            "This compares all four strategies and buy-and-hold using the same ticker allocation set by Max symbol concentration. "
+            "Account return remains visible separately. Buy and hold uses adjusted closing prices; taxes, idle-cash interest, "
+            "and trading costs are not included."
+        )
         
         st.markdown("#### Test on newer price data")
         if walk_forward_result is None:
@@ -4192,7 +4332,15 @@ if command_center_view == "New Trade":
                 for reason in walk_forward_result.reasons:
                     st.markdown(f"- {reason}")
         
-        st.markdown("#### Recommended strategy inputs")
+        st.markdown(
+            "#### Recommended strategy inputs",
+            help=(
+                "Searches nearby input combinations for all four strategies, then favors settings that also hold up on newer data, "
+                "nearby settings, separate time periods, an untouched final period, and simulated trading friction. "
+                "Every setting combination is tested with the RSI 50-70 BUY rule off and on. "
+                "Use this as the strongest candidate for paper testing, not as a promise of future profit."
+            ),
+        )
         if optimizer_search_state is None:
             st.caption("Click Run Strategy Input Search in the sidebar when you want a recommendation.")
         elif parameter_loop_error:
@@ -4202,20 +4350,60 @@ if command_center_view == "New Trade":
         else:
             if optimizer_result_stale:
                 st.warning("Inputs changed since this result was created. Run Strategy Input Search again before using the recommendation.")
-            st.info(strategy_optimizer_result.summary)
+            recommendation_summary_text = (
+                strategy_optimizer_interval_result.summary
+                if strategy_optimizer_interval_result is not None
+                else strategy_optimizer_result.summary
+            )
+            st.info(recommendation_summary_text)
+            recommendation_rows = optimizer_recommendation_records(strategy_optimizer_result)
+            if strategy_optimizer_interval_result is not None:
+                recommendation_rows.insert(0, {
+                    "Item": "Recommended interval",
+                    "Value": strategy_optimizer_interval_result.best_interval,
+                    "Plain English": (
+                        f"Best durable result among daily, 4-hour, and 1-hour tests. "
+                        f"The search used {strategy_optimizer_interval_result.best_history} of price history."
+                    ),
+                })
             st.dataframe(
-                pd.DataFrame(optimizer_recommendation_records(strategy_optimizer_result)),
+                pd.DataFrame(recommendation_rows),
                 width="stretch",
                 hide_index=True,
             )
+            recommendation_status = next(
+                (row["Value"] for row in recommendation_rows if row["Item"] == "Recommendation status"),
+                "Research only",
+            )
+            apply_button_label = (
+                "Use Recommended Inputs"
+                if recommendation_status == "Ready for paper test"
+                else "Use Research Candidate Inputs"
+            )
             if strategy_optimizer_result.best is not None and st.button(
-                "Use Recommended Inputs",
+                apply_button_label,
                 disabled=optimizer_result_stale,
             ):
                 apply_settings = dict(strategy_optimizer_result.best.settings)
                 apply_settings["risk_per_trade_pct"] = strategy_optimizer_result.best.recommended_risk_per_trade_percent
                 st.session_state["optimizer_apply_settings"] = apply_settings
+                if strategy_optimizer_interval_result is not None:
+                    st.session_state["optimizer_apply_interval"] = strategy_optimizer_interval_result.best_interval
+                    st.session_state["optimizer_apply_history"] = strategy_optimizer_interval_result.best_history
                 st.rerun()
+            if strategy_optimizer_interval_result is not None:
+                with st.expander("Compare daily, 4-hour, and 1-hour results", expanded=False):
+                    st.dataframe(
+                        pd.DataFrame(optimizer_interval_records(strategy_optimizer_interval_result)),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.caption(
+                        "The app chooses the strongest result that survives newer-data, locked-period, nearby-setting, "
+                        "and trading-cost checks. It does not simply choose the highest historical profit."
+                    )
+                    if strategy_optimizer_interval_errors:
+                        st.warning("Some intervals could not be tested: " + "; ".join(strategy_optimizer_interval_errors))
             with st.expander("Why this recommendation", expanded=False):
                 st.dataframe(
                     pd.DataFrame(optimizer_robustness_records(strategy_optimizer_result)),
@@ -4305,7 +4493,7 @@ if command_center_view == "New Trade":
             )
     
     if show_portfolio_evidence:
-        page_section("3. Trade details *", "Full Records view only: detailed trade rules, agent notes, and risk records.")
+        page_section("Trade details *", "Full Records view only: detailed trade rules, agent notes, and risk records.")
         detail_tabs = st.tabs(["Rules *", "Agent notes *", "Risk records *"])
         with detail_tabs[0]:
             sig = live["signal"]
@@ -5249,8 +5437,8 @@ if command_center_view == "Alpaca":
     )
     recent_automation_records = automation_store.read_recent(limit=100)
     if show_portfolio_evidence:
-        page_section("5. Saved records *", "Detailed session records, local simulator results, Alpaca paper history, and export tools.")
-        sub_section("5.1 Records overview *")
+        page_section("Saved records *", "Detailed session records, local simulator results, Alpaca paper history, and export tools.")
+        sub_section("Records overview *")
         st.dataframe(
             pd.DataFrame(
                 saved_records_overview_records(
@@ -5262,7 +5450,7 @@ if command_center_view == "Alpaca":
             width="stretch",
             hide_index=True,
         )
-        sub_section("5.2 This session *")
+        sub_section("This session *")
         st.dataframe(pd.DataFrame(session_summary_records(session_snapshot)), width="stretch", hide_index=True)
         timeline_rows = session_timeline_records(session_audit_records)
         if timeline_rows:
@@ -5270,7 +5458,7 @@ if command_center_view == "Alpaca":
         else:
             st.caption("No session events recorded yet.")
     
-        sub_section("5.3 Local simulator results *")
+        sub_section("Local simulator results *")
         st.dataframe(pd.DataFrame(paper_performance_records(session_snapshot)), width="stretch", hide_index=True)
         if st.button("Save Paper Performance Review", key="save_records_paper_review"):
             performance_event = AuditEvent(
@@ -5284,11 +5472,11 @@ if command_center_view == "Alpaca":
             st.rerun()
         st.caption("This uses the sidebar account size and local simulator records. Alpaca account balance is shown above under Alpaca Account.")
     
-        sub_section("5.4 Alpaca paper order history *")
+        sub_section("Alpaca paper order history *")
         st.dataframe(pd.DataFrame(alpaca_paper_activity_records(session_snapshot)), width="stretch", hide_index=True)
         st.caption("This is saved Alpaca paper order history. It does not affect simulator cash or simulator equity.")
     
-        sub_section("5.5 Risk details *")
+        sub_section("Risk details *")
         st.dataframe(
             pd.DataFrame(
                 daily_risk_records(
@@ -5303,7 +5491,7 @@ if command_center_view == "Alpaca":
             width="stretch",
             hide_index=True,
         )
-        sub_section("5.6 Current blocks *")
+        sub_section("Current blocks *")
         st.dataframe(pd.DataFrame(current_risk_halt_rows), width="stretch", hide_index=True)
     
     readiness_event_types = {record.get("event_type", "") for record in current_evidence_records}
@@ -5327,7 +5515,7 @@ if command_center_view == "Alpaca":
     current_approval_ledger_rows = approval_ledger_records(current_evidence_records)
     
     if show_portfolio_evidence:
-        sub_section("5.7 Activity log *")
+        sub_section("Activity log *")
         st.dataframe(
             pd.DataFrame(events_to_records(st.session_state["session_audit_events"])),
             width="stretch",

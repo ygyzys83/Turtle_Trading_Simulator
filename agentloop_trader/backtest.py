@@ -6,6 +6,7 @@ from agentloop_trader.data import generate_synthetic_prices
 from agentloop_trader.indicators import calc_atr, calc_rsi, calc_sma
 from agentloop_trader.market_data import validate_price_bars
 from agentloop_trader.models import BacktestResult, RiskLimits, StrategyConfig, TradeIntent
+from agentloop_trader.performance import allocation_metrics, elapsed_years
 
 
 def _max_drawdown_pct(equity_curve: list[float]) -> float:
@@ -20,6 +21,17 @@ def _max_drawdown_pct(equity_curve: list[float]) -> float:
     return round(abs(max_dd) * 100, 2)
 
 
+def _max_drawdown_dollars(equity_curve: list[float]) -> float:
+    if not equity_curve:
+        return 0.0
+    peak = float(equity_curve[0])
+    worst = 0.0
+    for equity in equity_curve:
+        peak = max(peak, float(equity))
+        worst = max(worst, peak - float(equity))
+    return round(worst, 2)
+
+
 def _build_stats(
     account: float,
     final_balance: float,
@@ -27,6 +39,8 @@ def _build_stats(
     equity_curve: list[float],
     exposure_bars: int,
     total_bars: int,
+    risk_limits: RiskLimits | None = None,
+    market_data=None,
 ) -> dict:
     account = float(account)
     final_balance = float(final_balance)
@@ -58,6 +72,18 @@ def _build_stats(
         max_drawdown_pct=_max_drawdown_pct(equity_curve),
         exposure_pct=exposure_pct,
     )
+    period_years = (
+        elapsed_years(market_data.index)
+        if market_data is not None and hasattr(market_data, "index")
+        else total_bars / 252.0 if total_bars > 0 else None
+    )
+    capital = allocation_metrics(
+        account_equity=account,
+        total_pnl=total_pnl,
+        max_drawdown_dollars=_max_drawdown_dollars(equity_curve),
+        risk_limits=risk_limits,
+        years=period_years,
+    )
 
     return {
         "final_equity": round(result.final_equity),
@@ -74,6 +100,7 @@ def _build_stats(
         "max_drawdown_pct": result.max_drawdown_pct,
         "exposure_pct": result.exposure_pct,
         "result": result,
+        **capital,
     }
 
 
@@ -306,6 +333,29 @@ def _rsi_status(rsi: float | None) -> str:
     return "Extended"
 
 
+RSI_ENTRY_LENGTH = 14
+RSI_ENTRY_MIN = 50.0
+RSI_ENTRY_MAX = 70.0
+
+
+def _rsi_entry_allowed(rsis, index: int, enabled: bool) -> bool:
+    """Allow long entries only when 14-bar RSI is healthy but not extended."""
+    if not enabled:
+        return True
+    value = rsis[index] if rsis and 0 <= index < len(rsis) else None
+    return bool(value is not None and RSI_ENTRY_MIN <= float(value) <= RSI_ENTRY_MAX)
+
+
+def _rsi_entry_requirement(rsis, index: int) -> tuple[str, bool]:
+    value = rsis[index] if rsis and 0 <= index < len(rsis) else None
+    label = (
+        f"RSI({RSI_ENTRY_LENGTH}) between {RSI_ENTRY_MIN:.0f} and {RSI_ENTRY_MAX:.0f}"
+        if value is None
+        else f"RSI({RSI_ENTRY_LENGTH}) is {float(value):.1f}; required {RSI_ENTRY_MIN:.0f}-{RSI_ENTRY_MAX:.0f}"
+    )
+    return label, _rsi_entry_allowed(rsis, index, True)
+
+
 def _liquidity_status(prices, volumes, index: int, window: int = 20) -> str:
     if volumes is None or index < window:
         return "Unknown"
@@ -412,6 +462,7 @@ def simulate_turtle_strategy(
     seed: int | None = None,
     market_data=None,
     risk_limits: RiskLimits | None = None,
+    rsi_entry_filter_enabled: bool = False,
 ):
     config = StrategyConfig(
         entry_window=entry_w,
@@ -460,7 +511,7 @@ def simulate_turtle_strategy(
         ma_up = bool(p > sma and sma > prior_sma)
 
         if not in_trade:
-            if p > don_high and ma_up:
+            if p > don_high and ma_up and _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled):
                 stop = round(float(p - atr_mult * atr), 2)
                 risk = p - stop
                 raw_size = int((balance * risk_pct_dec) / risk) if risk > 0 else 0
@@ -557,7 +608,8 @@ def simulate_turtle_strategy(
         limits=risk_limits,
     )
 
-    entry_setup_ready = bool(last_p > dh_last and sma_up)
+    rsi_entry_ready = _rsi_entry_allowed(rsis, live_bar, rsi_entry_filter_enabled)
+    entry_setup_ready = bool(last_p > dh_last and sma_up and rsi_entry_ready)
     strategy_exit_ready = bool(last_p <= dl_last)
     simulated_exit_ready = bool(in_trade and strategy_exit_ready)
 
@@ -581,7 +633,7 @@ def simulate_turtle_strategy(
                 f"close_above_{entry_w}_bar_high",
                 f"sma_{ma_w}_sloping_up",
                 "atr_position_sizing",
-            ],
+            ] + (["rsi_14_between_50_and_70"] if rsi_entry_filter_enabled else []),
         )
 
     buy_requirements = {
@@ -589,12 +641,17 @@ def simulate_turtle_strategy(
         f"Price above rising {ma_w}-bar trend filter": sma_up,
         "Position size above zero": pos_size > 0,
     }
+    if rsi_entry_filter_enabled:
+        rsi_label, rsi_passed = _rsi_entry_requirement(rsis, live_bar)
+        buy_requirements[rsi_label] = rsi_passed
     if proposed_trade_intent is not None:
         no_trade_reason = "BUY intent is present."
     elif last_p <= dh_last:
         no_trade_reason = f"No BUY because price is not above the {entry_w}-bar entry level."
     elif not sma_up:
         no_trade_reason = f"No BUY because the {ma_w}-bar trend filter is not rising."
+    elif not rsi_entry_ready:
+        no_trade_reason = f"No BUY because RSI({RSI_ENTRY_LENGTH}) is outside the required {RSI_ENTRY_MIN:.0f}-{RSI_ENTRY_MAX:.0f} range."
     elif pos_size <= 0:
         no_trade_reason = "No BUY because calculated share size is zero."
     else:
@@ -633,7 +690,7 @@ def simulate_turtle_strategy(
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
+    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
     return prices, smas, atrs, trade_log, live, stats, labels
 
 
@@ -648,6 +705,7 @@ def simulate_trend_pullback_strategy(
     seed: int | None = None,
     market_data=None,
     risk_limits: RiskLimits | None = None,
+    rsi_entry_filter_enabled: bool = False,
 ):
     config = StrategyConfig(
         name="Trend Pullback Continuation",
@@ -682,21 +740,22 @@ def simulate_trend_pullback_strategy(
     start = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window)
     live_bar = n_bars - 1
 
-    def setup_at(i: int) -> tuple[bool, float | None, bool, bool, bool]:
+    def setup_at(i: int) -> tuple[bool, float | None, bool, bool, bool, bool]:
         p = float(prices[i])
         trend_sma = trend_smas[i]
         pullback_sma = pullback_smas[i]
         momentum_sma = momentum_smas[i]
         prev_momentum_sma = momentum_smas[i - 1] if i > 0 else None
         if trend_sma is None or pullback_sma is None or momentum_sma is None or prev_momentum_sma is None:
-            return False, None, False, False, False
+            return False, None, False, False, False, False
         prev_trend = trend_smas[i - 1] if i > 0 else trend_sma
         trend_ok = bool(p > trend_sma and trend_sma >= (prev_trend or trend_sma))
         recent_low = float(np.min(prices[max(0, i - pullback_w):i + 1]))
         pullback_depth = (p - recent_low) / p * 100 if p else None
         touched_pullback = recent_low <= pullback_sma * 1.02
         momentum_turn = bool(p > momentum_sma and momentum_sma >= prev_momentum_sma and p > prices[i - 1])
-        return trend_ok and touched_pullback and momentum_turn, pullback_depth, trend_ok, touched_pullback, momentum_turn
+        rsi_ok = _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled)
+        return trend_ok and touched_pullback and momentum_turn and rsi_ok, pullback_depth, trend_ok, touched_pullback, momentum_turn, rsi_ok
 
     for i in range(start, live_bar):
         p = float(prices[i])
@@ -704,7 +763,7 @@ def simulate_trend_pullback_strategy(
         if atr is None:
             equity_curve.append(balance)
             continue
-        setup_ready, _, _, _, _ = setup_at(i)
+        setup_ready, _, _, _, _, _ = setup_at(i)
         exit_sma = exit_smas[i]
 
         if not in_trade:
@@ -789,7 +848,7 @@ def simulate_trend_pullback_strategy(
     last_atr = atrs[-1]
     pullback_level = float(pullback_smas[-1]) if pullback_smas[-1] is not None else last_p
     exit_level = float(exit_smas[-1]) if exit_smas[-1] is not None else last_p
-    setup_ready, pullback_depth, trend_ok, touched_pullback, momentum_turn = setup_at(live_bar)
+    setup_ready, pullback_depth, trend_ok, touched_pullback, momentum_turn, rsi_entry_ready = setup_at(live_bar)
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
     atr_stop = last_p - atr_mult * last_atr if last_atr else last_p
@@ -830,7 +889,7 @@ def simulate_trend_pullback_strategy(
                 f"pullback_near_{pullback_w}_bar_average",
                 f"momentum_turn_{momentum_w}_bar_average",
                 "atr_position_sizing",
-            ],
+            ] + (["rsi_14_between_50_and_70"] if rsi_entry_filter_enabled else []),
         )
 
     buy_requirements = {
@@ -839,6 +898,9 @@ def simulate_trend_pullback_strategy(
         f"Momentum turned up above {momentum_w}-bar average": momentum_turn,
         "Position size above zero": pos_size > 0,
     }
+    if rsi_entry_filter_enabled:
+        rsi_label, rsi_passed = _rsi_entry_requirement(rsis, live_bar)
+        buy_requirements[rsi_label] = rsi_passed
     if proposed_trade_intent is not None:
         no_trade_reason = "BUY intent is present."
     elif not trend_ok:
@@ -847,6 +909,8 @@ def simulate_trend_pullback_strategy(
         no_trade_reason = f"No BUY because price has not pulled back near the {pullback_w}-bar average."
     elif not momentum_turn:
         no_trade_reason = f"No BUY because momentum has not turned back up above the {momentum_w}-bar average."
+    elif not rsi_entry_ready:
+        no_trade_reason = f"No BUY because RSI({RSI_ENTRY_LENGTH}) is outside the required {RSI_ENTRY_MIN:.0f}-{RSI_ENTRY_MAX:.0f} range."
     elif pos_size <= 0:
         no_trade_reason = "No BUY because calculated share size is zero."
     else:
@@ -890,7 +954,7 @@ def simulate_trend_pullback_strategy(
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
+    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
     return prices, trend_smas, atrs, trade_log, live, stats, labels
 
 
@@ -904,6 +968,7 @@ def simulate_trendline_breakout_strategy(
     seed: int | None = None,
     market_data=None,
     risk_limits: RiskLimits | None = None,
+    rsi_entry_filter_enabled: bool = False,
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
     opens = _bar_open_prices(prices, market_data)
@@ -945,7 +1010,7 @@ def simulate_trendline_breakout_strategy(
         exit_level = float(np.min(exit_source[i - exit_w:i]))
 
         if not in_trade:
-            if trendline_level is not None and crossed_trendline and trend_ok:
+            if trendline_level is not None and crossed_trendline and trend_ok and _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled):
                 stop = round(float(p - atr_mult * atr), 2)
                 raw_size = int((balance * risk_pct_dec) / (p - stop)) if p > stop else 0
                 size = _backtest_limited_quantity(
@@ -1041,13 +1106,14 @@ def simulate_trendline_breakout_strategy(
         strategy_name="Trendline breakout",
         setup_type="trendline",
         require_retest=False,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
     live["in_simulated_trade"] = in_trade
     live_balance = float(live["balance"])
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
+    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
     return prices, smas, atrs, trade_log, live, stats, labels
 
 
@@ -1062,6 +1128,7 @@ def simulate_trendline_retest_strategy(
     seed: int | None = None,
     market_data=None,
     risk_limits: RiskLimits | None = None,
+    rsi_entry_filter_enabled: bool = False,
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
     opens = _bar_open_prices(prices, market_data)
@@ -1125,7 +1192,7 @@ def simulate_trendline_retest_strategy(
                 if low_value <= level + atr * 0.5 and p >= level:
                     retest_seen = True
                 momentum_turn = bool(retest_seen and p > momentum_sma and p > float(prices[i - 1]) and trend_ok)
-                if momentum_turn:
+                if momentum_turn and _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled):
                     stop = round(min(level - atr * 0.25, p - atr_mult * atr), 2)
                     raw_size = int((balance * risk_pct_dec) / (p - stop)) if p > stop else 0
                     size = _backtest_limited_quantity(
@@ -1227,13 +1294,14 @@ def simulate_trendline_retest_strategy(
         require_retest=True,
         momentum_w=momentum_w,
         momentum_smas=momentum_smas,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
     live["in_simulated_trade"] = in_trade
     live_balance = float(live["balance"])
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars)
+    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
     return prices, smas, atrs, trade_log, live, stats, labels
 
 
@@ -1261,6 +1329,7 @@ def _trendline_live_fields(
     require_retest: bool,
     momentum_w: int = 5,
     momentum_smas=None,
+    rsi_entry_filter_enabled: bool = False,
 ) -> dict:
     last_p = float(prices[index])
     last_atr = atrs[index]
@@ -1286,7 +1355,9 @@ def _trendline_live_fields(
             trendline_level = retest_level
             trendline_slope = retest_slope
         retest_ready = bool(retest_ready and trend_ok)
-    entry_ready = retest_ready if require_retest else trendline_break
+    structural_entry_ready = retest_ready if require_retest else trendline_break
+    rsi_entry_ready = _rsi_entry_allowed(rsis, index, rsi_entry_filter_enabled)
+    entry_ready = bool(structural_entry_ready and rsi_entry_ready)
     atr_stop = last_p - atr_mult * last_atr if last_atr else last_p
     stop_loss = (
         min(float(trendline_level) - float(last_atr) * 0.25, atr_stop)
@@ -1323,7 +1394,7 @@ def _trendline_live_fields(
                 "close_above_trendline" if not require_retest else "trendline_retest_continuation",
                 f"sma_{ma_w}_trend_context",
                 "atr_position_sizing",
-            ],
+            ] + (["rsi_14_between_50_and_70"] if rsi_entry_filter_enabled else []),
         )
 
     buy_requirements = {
@@ -1333,11 +1404,16 @@ def _trendline_live_fields(
         "Retest held trendline": True if not require_retest else retest_ready,
         "Position size above zero": pos_size > 0,
     }
+    if rsi_entry_filter_enabled:
+        rsi_label, rsi_passed = _rsi_entry_requirement(rsis, index)
+        buy_requirements[rsi_label] = rsi_passed
     if proposed_trade_intent is not None:
         no_trade_reason = "BUY intent is present."
     elif trendline_level is None:
         no_trade_reason = f"No BUY because a clean descending trendline was not found in the last {lookback} bars."
-    elif not trendline_break:
+    elif structural_entry_ready and not rsi_entry_ready:
+        no_trade_reason = f"No BUY because RSI({RSI_ENTRY_LENGTH}) is outside the required {RSI_ENTRY_MIN:.0f}-{RSI_ENTRY_MAX:.0f} range."
+    elif not require_retest and not trendline_break:
         no_trade_reason = "No BUY because price has not broken above the descending trendline."
     elif require_retest and not retest_ready:
         no_trade_reason = "No BUY because price has not retested the broken trendline and turned back up."
@@ -1389,10 +1465,16 @@ def strategy_comparison_records(results: dict[str, dict]) -> list[dict]:
     for name, stats in results.items():
         rows.append({
             "Strategy": name,
-            "Return": f"{stats.get('return_pct', 0)}%",
+            "Allocated Return": f"{stats.get('allocated_return_pct', stats.get('return_pct', 0))}%",
+            "Annualized Return": (
+                "Not shown (period is 1 year or less)"
+                if stats.get("annualized_allocated_return_pct") is None
+                else f"{stats['annualized_allocated_return_pct']}%"
+            ),
+            "Account Return": f"{stats.get('return_pct', 0)}%",
             "Trades": stats.get("total_trades", 0),
             "Win Rate": f"{stats.get('win_rate', 0)}%",
-            "Worst Drop": f"{stats.get('max_drawdown_pct', 0)}%",
+            "Allocated Worst Drop": f"{stats.get('allocated_max_drawdown_pct', stats.get('max_drawdown_pct', 0))}%",
             "Profit Factor": stats.get("profit_factor", 0),
         })
     return rows

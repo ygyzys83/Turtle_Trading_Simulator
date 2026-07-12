@@ -231,7 +231,8 @@ def test_optional_quality_input_records_do_not_claim_to_create_buy():
     inputs = {row["Quality Input"]: row for row in rows}
 
     assert inputs["Volume"]["Creates BUY?"] == "No"
-    assert inputs["RSI"]["Creates BUY?"] == "No"
+    assert inputs["RSI"]["Creates BUY?"] == "Optional rule"
+    assert "Require RSI 50-70 for BUY" in inputs["RSI"]["Plain English"]
     assert "Market condition" not in inputs
 
 

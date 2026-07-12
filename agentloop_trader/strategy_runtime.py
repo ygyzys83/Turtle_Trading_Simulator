@@ -46,7 +46,16 @@ def _run_one(
     ma_w = int(settings.get("moving_average_window", 50))
     pullback_w = int(settings.get("pullback_average_length", 20))
     momentum_w = int(settings.get("momentum_turn_length", 10))
-    common = {"account": account_equity, "exit_w": exit_w, "atr_mult": atr_mult, "risk_pct_dec": risk_dec, "market_data": market_data, "risk_limits": risk_limits}
+    rsi_entry_filter_enabled = bool(settings.get("rsi_entry_filter_enabled", False))
+    common = {
+        "account": account_equity,
+        "exit_w": exit_w,
+        "atr_mult": atr_mult,
+        "risk_pct_dec": risk_dec,
+        "market_data": market_data,
+        "risk_limits": risk_limits,
+        "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+    }
     if strategy_type == "pullback":
         result = simulate_trend_pullback_strategy(pullback_w=pullback_w, trend_w=ma_w, momentum_w=momentum_w, **common)
     elif strategy_type == "trendline":

@@ -42,7 +42,8 @@ def test_walk_forward_records_include_verdict_and_core_metrics():
 
     assert records[0]["Metric"] == "Result"
     assert any(row["Metric"] == "Profit factor" for row in records)
-    assert any(row["Metric"] == "Worst drop %" for row in records)
+    assert any(row["Metric"] == "Allocated return %" for row in records)
+    assert any(row["Metric"] == "Allocated worst drop %" for row in records)
 
 
 def test_walk_forward_rejects_insufficient_history():
