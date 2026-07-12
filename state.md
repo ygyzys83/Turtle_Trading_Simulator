@@ -291,7 +291,7 @@ The deterministic research loop is authoritative for trade eligibility:
 The concise Research read includes:
 
 - Final answer.
-- Best strategy fit.
+- Selected strategy, using the exact sidebar name, and a separate best current fit across all four exactly named strategies.
 - Trend.
 - Setup.
 - Volatility.
@@ -322,7 +322,7 @@ Future vision: use a scanner/recommendation loop to propose company/ticker candi
 The optimizer:
 
 - Searches a bounded neighborhood of settings across all four strategies.
-- For real tickers, runs that bounded search on daily, 4-hour, and 1-hour bars, then recommends the strongest durable interval and its history period.
+- For real tickers, ranks daily, 4-hour, and 1-hour searches over the same latest two-year calendar period (or the shorter period common to all available intervals). It separately checks each interval's winning settings, unchanged, over its longer available history: daily up to 10 years, 4-hour up to 5 years, and 1-hour up to 2 years with Alpaca.
 - Varies entry/trendline lookback, sell exit length, ATR multiplier, trend filter, pullback average, and momentum length as relevant to each strategy.
 - Uses older and newer portions of the selected ticker history.
 - Compares strategy return and drawdown with adjusted-price buy-and-hold over the exact same newer and locked bars.
@@ -337,7 +337,7 @@ The concise recommendation is labeled `Ready for paper test` only when it has Me
 
 Most setup-quality reads remain research and explanation inputs. RSI is the one explicit exception: `Require RSI 50-70 for BUY` applies a fixed 14-bar RSI rule to historical entries, current BUY intents, scanner/worker strategy runs, walk-forward evaluation, and paper-entry automation. It does not control exits. The optimizer compares every bounded strategy-setting combination with this RSI rule off and on, accounts for the larger number of trials, and displays the winning RSI choice in the existing recommendation table. RSI length and thresholds are intentionally fixed to avoid multiplying the search space. Volume, market condition, liquidity, and the other setup reads remain informational.
 
-Strategy performance now separates account impact from strategy quality. `Max symbol concentration` defines the stable capital allocation for one ticker and defaults to 5%, matching the default `Max new order size`. Backtests show account return, allocated-capital return, allocated-capital worst drop, equal-capital buy-and-hold return, and excess return. Optimizer scoring, rolling evidence, locked-period checks, slippage stress, regime results, bootstrap results, and cross-ticker tests use allocated-capital return and drawdown. Buy-and-hold invests the same ticker allocation while the rest of the account remains idle in both views. Annualized allocated and buy-and-hold returns use CAGR over actual timestamps and appear only for periods longer than one year; annualization is unavailable when the allocated sleeve is exhausted. Return on average capital deployed was deliberately excluded because highly variable time in position makes it harder to interpret.
+Strategy performance now separates account impact from strategy quality. `Max symbol concentration` defines the stable capital allocation for one ticker and defaults to 5%, matching the default `Max new order size`. Backtests show account return, allocated-capital return, allocated-capital worst drop, equal-capital buy-and-hold return, and excess return. Optimizer scoring, rolling evidence, locked-period checks, slippage stress, regime results, bootstrap results, and cross-ticker tests use allocated-capital return and drawdown. Buy-and-hold invests the same ticker allocation while the rest of the account remains idle in both views. Strategy and buy-and-hold worst-drop percentages now use the same denominator: the original ticker allocation. Annualized allocated and buy-and-hold returns use CAGR over actual timestamps and appear only for periods longer than one year; annualization is unavailable when the allocated sleeve is exhausted. Return on average capital deployed was deliberately excluded because highly variable time in position makes it harder to interpret.
 
 Interpretation: this is bounded historical evidence for paper testing, not proof of the highest future profit or probability of success. The same newer sample is used to rank candidates, so recommendations still require paper validation and should not be described as an unbiased guarantee.
 
@@ -448,6 +448,8 @@ The recommended strategy-input search was strengthened to reduce overfitting wit
 The normal recommendation remains one compact table. Detailed robustness evidence is under `Why this recommendation`; other-ticker validation is under `Test these settings on other tickers`. The search does not change account risk limits, broker access, order mode, credentials, the Kill Switch, or settings automatically. RSI remains a possible future deterministic strategy variable and was not added in this batch.
 
 The optimizer is now run explicitly with `Run Strategy Input Search` instead of a persistent checkbox. Its result is saved through ordinary Streamlit reruns and marked stale when the ticker, source, interval, history, market bars, strategy inputs, material account-equity bucket, risk limits, older-data split, or candidate count changes. A stale recommendation cannot be applied or tested on other tickers until the search is run again. Alpaca history choices now extend through `2y` for `1h` bars and `5y` for `4h` bars; Yahoo intraday choices remain shorter.
+
+Alpaca's 4-hour bars may arrive in small pages even when a large page limit is requested. The market-data fetcher now follows up to 200 pages and refuses to use a silently truncated dataset. This fixed an optimizer failure where five-year 4-hour history stopped in 2023, causing the shared interval-comparison period to display as 0.0 years and produce no candidates.
 
 ## Visual Design System (2026-07-11)
 

@@ -110,6 +110,6 @@ def test_main_navigation_is_sticky_and_precedes_status_strip():
 def test_strategy_decision_sections_have_plain_language_helpers():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 
-    assert "It answers which strategy fits the ticker now; it does not search for better settings." in text
+    assert "It answers which of those four exact strategies fits the ticker now; it does not search for better settings." in text
     assert "This table does not search for better settings" in text
     assert "Use this as the strongest candidate for paper testing" in text

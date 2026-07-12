@@ -142,7 +142,8 @@ def fetch_alpaca_bars(
     all_bars: list[dict[str, Any]] = []
     page_token = ""
     start_time = period_start_time(period).isoformat().replace("+00:00", "Z")
-    for _ in range(20):
+    max_pages = 200
+    for _ in range(max_pages):
         params: dict[str, Any] = {
             "symbols": clean,
             "timeframe": alpaca_timeframe(interval),
@@ -167,6 +168,10 @@ def fetch_alpaca_bars(
         page_token = str(payload.get("next_page_token") or "")
         if not page_token:
             break
+    if page_token:
+        raise RuntimeError(
+            f"Alpaca price history for {clean} exceeded {max_pages} pages; no partial dataset was used."
+        )
 
     if not all_bars:
         raise ValueError(f"No Alpaca price data returned for {clean}.")

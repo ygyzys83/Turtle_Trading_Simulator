@@ -3989,15 +3989,17 @@ elif command_center_view == "New Trade":
     st.markdown(
         "#### Research read",
         help=(
-            "Summarizes the selected ticker's current setup. Best strategy fit ranks the four strategies using today's BUY-rule progress, "
+            "Summarizes the selected ticker's current setup. Selected strategy is the exact strategy chosen in the sidebar and used for "
+            "the TRADE or WAIT decision. Best current fit across all strategies separately compares Breakout continuation, "
+            "Trend pullback continuation, Trendline breakout, and Trendline retest continuation using today's BUY-rule progress, "
             "the backtest from the current sidebar settings, trade count, return, win rate, profit factor, and worst drop. "
-            "It answers which strategy fits the ticker now; it does not search for better settings."
+            "It answers which of those four exact strategies fits the ticker now; it does not search for better settings."
         ),
     )
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
     st.markdown("#### Automation readiness")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("New trade")), width="stretch", hide_index=True)
-    with st.expander("Compare the four strategies", expanded=False):
+    with st.expander("Compare all four current strategy fits", expanded=False):
         st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         with st.expander("Detailed research records *", expanded=False):
@@ -4362,8 +4364,10 @@ if command_center_view == "New Trade":
                     "Item": "Recommended interval",
                     "Value": strategy_optimizer_interval_result.best_interval,
                     "Plain English": (
-                        f"Best durable result among daily, 4-hour, and 1-hour tests. "
-                        f"The search used {strategy_optimizer_interval_result.best_history} of price history."
+                        "Best result when daily, 4-hour, and 1-hour data were compared over the same "
+                        f"{strategy_optimizer_interval_result.interval_results[0].comparison_history.lower()}. "
+                        f"The winning settings were then checked without changes on "
+                        f"{strategy_optimizer_interval_result.best_history} of available history."
                     ),
                 })
             st.dataframe(
@@ -4399,8 +4403,9 @@ if command_center_view == "New Trade":
                         hide_index=True,
                     )
                     st.caption(
-                        "The app chooses the strongest result that survives newer-data, locked-period, nearby-setting, "
-                        "and trading-cost checks. It does not simply choose the highest historical profit."
+                        "The interval ranking uses the same calendar period for a fair comparison. Long-history columns "
+                        "then show how each interval's unchanged winning settings behaved over all available data. "
+                        "The app also considers newer data, the untouched final period, nearby settings, and trading costs."
                     )
                     if strategy_optimizer_interval_errors:
                         st.warning("Some intervals could not be tested: " + "; ".join(strategy_optimizer_interval_errors))

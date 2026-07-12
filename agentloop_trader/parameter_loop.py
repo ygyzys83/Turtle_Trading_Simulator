@@ -147,6 +147,12 @@ class IntervalOptimizationResult:
     recommendation: StrategyInputRecommendation
     selection_score: float
     evidence_status: str
+    comparison_history: str = "Latest 2 years"
+    durability_return_percent: float = 0.0
+    durability_benchmark_return_percent: float = 0.0
+    durability_excess_return_percent: float = 0.0
+    durability_max_drawdown_percent: float = 0.0
+    durability_trades: int = 0
 
 
 @dataclass(frozen=True)
@@ -477,14 +483,13 @@ def buy_and_hold_benchmark(
         )
     sleeve_curve = close.to_numpy(dtype=float) / start_price * allocation
     equity_curve = float(account_equity) - allocation + sleeve_curve
-    peaks = np.maximum.accumulate(equity_curve)
     sleeve_peaks = np.maximum.accumulate(sleeve_curve)
-    sleeve_drawdowns = np.where(sleeve_peaks > 0, (sleeve_peaks - sleeve_curve) / sleeve_peaks * 100, 0.0)
+    max_drawdown_dollars = float(np.max(sleeve_peaks - sleeve_curve))
     raw_return = (end_price / start_price - 1) * 100
     account_return = (equity_curve[-1] / float(account_equity) - 1) * 100
     return BuyAndHoldBenchmark(
         return_percent=round(raw_return, 2),
-        max_drawdown_percent=round(float(np.max(sleeve_drawdowns)), 2),
+        max_drawdown_percent=round(max_drawdown_dollars / allocation * 100, 2),
         final_equity=round(float(equity_curve[-1]), 2),
         start_price=round(start_price, 4),
         end_price=round(end_price, 4),
@@ -528,14 +533,20 @@ def optimize_strategy_intervals(
     train_fraction: float = 0.65,
     max_candidates_per_strategy: int = 12,
     bootstrap_samples: int = 1000,
+    comparison_years: int = 2,
 ) -> MultiIntervalRecommendation:
-    """Compare robust strategy searches across a small, explicit interval set."""
+    """Rank intervals on one calendar window, then check fixed settings on longer data."""
     interval_rows: list[IntervalOptimizationResult] = []
+    shared_start, shared_end, shared_label = _shared_calendar_window(
+        [market_data for _, market_data in market_data_by_interval.values()],
+        comparison_years,
+    )
     for interval, (history, market_data) in market_data_by_interval.items():
         settings = dict(current_settings)
         settings["interval"] = interval
+        comparison_data = _calendar_slice(market_data, shared_start, shared_end)
         result = optimize_strategy_inputs(
-            market_data=market_data,
+            market_data=comparison_data,
             current_settings=settings,
             account_equity=account_equity,
             risk_limits=risk_limits,
@@ -554,12 +565,46 @@ def optimize_strategy_intervals(
             + (3.0 if locked and locked.passed else -3.0)
             + max(-5.0, min(5.0, candidate.excess_return_percent * 0.25))
         )
+        durability_return = 0.0
+        durability_benchmark = 0.0
+        durability_drawdown = 0.0
+        durability_trades = 0
+        if candidate is not None:
+            durability_result = _run_one(
+                candidate.strategy_type,
+                market_data,
+                candidate.settings,
+                account_equity,
+                risk_limits,
+            )
+            durability_stats = _closed_trade_stats(
+                account_equity,
+                list(durability_result["trade_log"]),
+                len(market_data),
+                risk_limits,
+                elapsed_years(market_data.index),
+            )
+            durability_hold = buy_and_hold_benchmark(
+                market_data,
+                account_equity,
+                allocated_capital=ticker_allocated_capital(account_equity, risk_limits),
+            )
+            durability_return = float(durability_stats["allocated_return_pct"])
+            durability_benchmark = durability_hold.return_percent
+            durability_drawdown = float(durability_stats["allocated_max_drawdown_pct"])
+            durability_trades = int(durability_stats["total_trades"])
         interval_rows.append(IntervalOptimizationResult(
             interval=interval,
             history=history,
             recommendation=result,
             selection_score=round(selection_score, 2),
             evidence_status=recommendation_evidence_status(result),
+            comparison_history=shared_label,
+            durability_return_percent=round(durability_return, 2),
+            durability_benchmark_return_percent=round(durability_benchmark, 2),
+            durability_excess_return_percent=round(durability_return - durability_benchmark, 2),
+            durability_max_drawdown_percent=round(durability_drawdown, 2),
+            durability_trades=durability_trades,
         ))
     if not interval_rows:
         raise ValueError("No interval data was available for the strategy input search.")
@@ -570,7 +615,10 @@ def optimize_strategy_intervals(
     best_row = interval_rows[0]
     best = best_row.recommendation.best
     summary = (
-        f"Best interval: {best_row.interval}. {best_row.recommendation.summary}"
+        f"Best comparable interval: {best_row.interval}, based on the same latest "
+        f"{shared_label.lower()} used for every interval. "
+        f"Its unchanged settings were also checked on {best_row.history} of available history. "
+        f"{best_row.recommendation.summary}"
         if best is not None
         else "No interval produced enough evidence to recommend settings."
     )
@@ -581,6 +629,37 @@ def optimize_strategy_intervals(
         interval_results=tuple(interval_rows),
         summary=summary,
     )
+
+
+def _shared_calendar_window(
+    frames: list[pd.DataFrame],
+    years: int,
+) -> tuple[pd.Timestamp | None, pd.Timestamp | None, str]:
+    """Return a common recent calendar range for every dated interval."""
+    dated = [frame for frame in frames if not frame.empty and isinstance(frame.index, pd.DatetimeIndex)]
+    if len(dated) != len(frames) or not dated:
+        return None, None, "Available data"
+    common_end = min(frame.index.max() for frame in dated)
+    available_start = max(frame.index.min() for frame in dated)
+    requested_start = common_end - pd.DateOffset(years=max(1, int(years)))
+    common_start = max(available_start, requested_start)
+    actual_years = max(0.0, (common_end - common_start).total_seconds() / (365.2425 * 24 * 3600))
+    label = f"Latest {actual_years:.1f} years" if actual_years < years - 0.05 else f"Latest {years} years"
+    return common_start, common_end, label
+
+
+def _calendar_slice(
+    market_data: pd.DataFrame,
+    start: pd.Timestamp | None,
+    end: pd.Timestamp | None,
+) -> pd.DataFrame:
+    """Apply a shared date range while preserving non-date test fixtures."""
+    data = market_data.copy()
+    if start is None or end is None or not isinstance(data.index, pd.DatetimeIndex):
+        return data
+    subset = data.loc[(data.index > start) & (data.index <= end)].copy()
+    subset.attrs.update(data.attrs)
+    return subset
 
 
 def generate_optimizer_settings(
@@ -796,15 +875,21 @@ def optimizer_interval_records(result: MultiIntervalRecommendation) -> list[dict
         locked = interval_result.recommendation.robustness.locked_test if interval_result.recommendation.robustness else None
         rows.append({
             "Interval": interval_result.interval,
-            "History": interval_result.history,
+            "Fair Comparison Period": interval_result.comparison_history,
             "Status": interval_result.evidence_status,
             "Strategy": candidate.strategy_label if candidate else "No candidate",
-            "Newer Allocated Return %": candidate.test_return_percent if candidate else 0.0,
-            "Equal-Capital Buy and Hold %": candidate.benchmark_return_percent if candidate else 0.0,
-            "Excess Return %": candidate.excess_return_percent if candidate else 0.0,
+            "Comparable Newer Return %": candidate.test_return_percent if candidate else 0.0,
+            "Comparable Buy and Hold %": candidate.benchmark_return_percent if candidate else 0.0,
+            "Comparable Excess %": candidate.excess_return_percent if candidate else 0.0,
             "Locked Excess %": locked.excess_return_percent if locked else 0.0,
-            "Allocated Worst Drop %": candidate.test_max_drawdown_percent if candidate else 0.0,
+            "Comparable Worst Drop %": candidate.test_max_drawdown_percent if candidate else 0.0,
             "Confidence": candidate.confidence if candidate else "Low",
+            "Long-History Check": interval_result.history,
+            "Long-History Return %": interval_result.durability_return_percent,
+            "Long-History Buy and Hold %": interval_result.durability_benchmark_return_percent,
+            "Long-History Excess %": interval_result.durability_excess_return_percent,
+            "Long-History Worst Drop %": interval_result.durability_max_drawdown_percent,
+            "Long-History Trades": interval_result.durability_trades,
         })
     return rows
 

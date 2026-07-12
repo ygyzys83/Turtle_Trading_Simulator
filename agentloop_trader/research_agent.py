@@ -139,7 +139,16 @@ def build_research_agent_report(
     )
     rows = [
         {"Area": "Final answer", "Read": final_read, "Plain English": decision_detail},
-        {"Area": "Best strategy fit", "Read": best.strategy, "Plain English": best.reason},
+        {
+            "Area": "Selected strategy",
+            "Read": selected_strategy,
+            "Plain English": "The exact strategy selected in the sidebar and used for the TRADE or WAIT decision.",
+        },
+        {
+            "Area": "Best current fit across all strategies",
+            "Read": best.strategy,
+            "Plain English": f"The app compared all four strategies using the current inputs. {best.reason}",
+        },
         {"Area": "Trend", "Read": trend, "Plain English": trend_detail},
         {"Area": "Setup", "Read": overall, "Plain English": setup_detail},
         {"Area": "Volatility", "Read": volatility, "Plain English": volatility_detail},

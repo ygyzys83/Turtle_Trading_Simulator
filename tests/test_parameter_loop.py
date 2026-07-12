@@ -220,7 +220,7 @@ def test_buy_and_hold_benchmark_uses_the_exact_requested_price_range():
     subset = buy_and_hold_benchmark(market_data, 10_000, start=1)
 
     assert result.return_percent == 20.0
-    assert result.max_drawdown_percent == 18.18
+    assert result.max_drawdown_percent == 20.0
     assert result.final_equity == 12_000.0
     assert subset.return_percent == 9.09
     assert subset.bars == 3
@@ -281,4 +281,29 @@ def test_interval_optimizer_returns_one_ranked_result_per_interval():
     assert result.best_interval in {"1d", "4h"}
     assert len(rows) == 2
     assert {row["Interval"] for row in rows} == {"1d", "4h"}
-    assert all("Equal-Capital Buy and Hold %" in row and "Excess Return %" in row for row in rows)
+    assert all(
+        "Comparable Buy and Hold %" in row
+        and "Comparable Excess %" in row
+        and "Long-History Excess %" in row
+        for row in rows
+    )
+
+
+def test_interval_optimizer_uses_one_shared_calendar_period_and_long_history_check():
+    daily = synthetic_ohlc_frame(n=1_500, seed=14)
+    hourly = synthetic_ohlc_frame(n=3_000, seed=15)
+    daily.index = pd.date_range("2020-01-01", periods=1_500, freq="D")
+    hourly.index = pd.date_range("2020-01-01", periods=3_000, freq="8h")
+
+    result = optimize_strategy_intervals(
+        market_data_by_interval={"1d": ("10y", daily), "4h": ("5y", hourly)},
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=1,
+        bootstrap_samples=20,
+        comparison_years=2,
+    )
+
+    assert len({row.comparison_history for row in result.interval_results}) == 1
+    assert all(row.durability_trades >= 0 for row in result.interval_results)
+    assert "same latest" in result.summary.lower()

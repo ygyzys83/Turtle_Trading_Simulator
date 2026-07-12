@@ -43,6 +43,15 @@ def test_equal_capital_buy_and_hold_keeps_unallocated_account_cash_idle():
     assert result.annualized_return_percent is not None
 
 
+def test_buy_and_hold_worst_drop_uses_the_original_ticker_allocation():
+    data = pd.DataFrame({"Close": [100.0, 160.0, 110.0, 170.0]})
+
+    result = buy_and_hold_benchmark(data, 100_000, allocated_capital=5_000)
+
+    # The sleeve falls $2,500 from its $8,000 peak; the common denominator is the $5,000 allocation.
+    assert result.max_drawdown_percent == 50.0
+
+
 def test_annualized_return_is_hidden_for_one_year_or_less_and_for_exhausted_capital():
     assert annualized_return_percent(10.0, 1.0) is None
     assert annualized_return_percent(-100.0, 2.0) is None

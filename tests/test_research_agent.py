@@ -63,3 +63,30 @@ def test_strategy_fit_records_mark_one_best_strategy():
 
     assert sum(1 for row in records if row["Best"] == "Yes") == 1
     assert next(row for row in records if row["Best"] == "Yes")["Strategy"] == "Trend pullback continuation"
+
+
+def test_research_read_distinguishes_selected_strategy_from_best_current_fit():
+    report = build_research_agent_report(
+        ticker="IBM",
+        selected_strategy="Trendline retest continuation",
+        strategy_results={
+            "Trendline breakout": {
+                "live": {"signal": "long", "buy_requirements": {"trend": True}},
+                "stats": {"return_pct": 4, "total_trades": 4, "win_rate": 50, "profit_factor": 1.5, "max_drawdown_pct": 2},
+            },
+            "Trendline retest continuation": {
+                "live": {"signal": "flat", "buy_requirements": {"trend": True, "retest": False}},
+                "stats": {"return_pct": 1, "total_trades": 2, "win_rate": 50, "profit_factor": 1.1, "max_drawdown_pct": 2},
+            },
+        },
+        setup_rows=[],
+        final_read="WAIT",
+        decision_detail="The selected strategy is waiting.",
+        next_action="Wait.",
+    )
+
+    records = research_agent_records(report)
+    selected = next(row for row in records if row["Area"] == "Selected strategy")
+    best = next(row for row in records if row["Area"] == "Best current fit across all strategies")
+    assert selected["Read"] == "Trendline retest continuation"
+    assert best["Read"] == "Trendline breakout"

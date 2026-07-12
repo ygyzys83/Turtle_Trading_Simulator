@@ -1,9 +1,10 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
+import json
 
 import pandas as pd
 import pytest
 
-from agentloop_trader.market_data import NewsItem, alpaca_timeframe, build_company_research_context, completed_price_bars, period_start_time, validate_price_bars
+from agentloop_trader.market_data import NewsItem, alpaca_timeframe, build_company_research_context, completed_price_bars, fetch_alpaca_bars, period_start_time, validate_price_bars
 
 
 def test_alpaca_timeframe_maps_intraday_intervals():
@@ -76,3 +77,36 @@ def test_completed_bars_exclude_forming_bar_but_keep_latest_price():
     assert completed.iloc[-1]["Close"] == 101
     assert completed.attrs["latest_price"] == 103
     assert completed.attrs["latest_high"] == 104
+
+
+def test_alpaca_history_fetch_continues_past_twenty_pages(monkeypatch):
+    calls = []
+
+    class FakeResponse:
+        def __init__(self, payload):
+            self.payload = payload
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps(self.payload).encode("utf-8")
+
+    def fake_urlopen(_request, timeout):
+        calls.append(timeout)
+        page = len(calls)
+        timestamp = datetime(2020, 1, 1, tzinfo=UTC) + timedelta(days=page)
+        return FakeResponse({
+            "bars": {"QQQ": [{"t": timestamp.isoformat(), "o": 100, "h": 102, "l": 99, "c": 101, "v": 1000}]},
+            "next_page_token": f"page-{page + 1}" if page < 21 else None,
+        })
+
+    monkeypatch.setattr("agentloop_trader.market_data.urlopen", fake_urlopen)
+
+    result = fetch_alpaca_bars("QQQ", "5y", "4h", "key", "secret")
+
+    assert len(calls) == 21
+    assert len(result) == 21
