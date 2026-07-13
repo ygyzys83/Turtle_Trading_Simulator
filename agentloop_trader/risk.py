@@ -2,9 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from agentloop_trader.assets import floor_quantity, format_quantity
 from agentloop_trader.fees import (
-    estimate_alpaca_equity_order_fees,
-    estimate_alpaca_equity_round_trip_fees,
+    estimate_alpaca_order_fees,
+    estimate_alpaca_round_trip_fees,
 )
 from agentloop_trader.models import (
     ExecutionDecision,
@@ -49,9 +50,10 @@ def constrain_trade_intent_to_limits(
     if intent.stop_loss is not None:
         risk_per_share = abs(entry_price - float(intent.stop_loss))
         max_risk_dollars = account_equity * limits.max_risk_per_trade_pct / 100
-        risk_limited_quantity = int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0
+        risk_limited_quantity = floor_quantity(max_risk_dollars / risk_per_share, intent.asset_class) if risk_per_share > 0 else 0
         while risk_limited_quantity > 0:
-            buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+            buy_fees, sell_fees = estimate_alpaca_round_trip_fees(
+                asset_class=intent.asset_class,
                 quantity=risk_limited_quantity,
                 entry_price=entry_price,
                 exit_price=float(intent.stop_loss),
@@ -59,27 +61,33 @@ def constrain_trade_intent_to_limits(
             estimated_stop_loss = risk_per_share * risk_limited_quantity + buy_fees.total + sell_fees.total
             if estimated_stop_loss <= max_risk_dollars:
                 break
-            risk_limited_quantity -= 1
+            risk_limited_quantity = floor_quantity(
+                risk_limited_quantity - (0.0001 if intent.asset_class == "crypto" else 1),
+                intent.asset_class,
+            )
         max_quantities.append(risk_limited_quantity)
 
     max_position_notional = account_equity * limits.max_position_notional_pct / 100
-    max_quantities.append(int(max_position_notional // entry_price))
+    max_quantities.append(floor_quantity(max_position_notional / entry_price, intent.asset_class))
 
     remaining_portfolio_notional = account_equity * limits.max_portfolio_exposure_pct / 100 - current_portfolio_notional
-    max_quantities.append(int(max(0.0, remaining_portfolio_notional) // entry_price))
+    max_quantities.append(floor_quantity(max(0.0, remaining_portfolio_notional) / entry_price, intent.asset_class))
 
     remaining_symbol_notional = account_equity * limits.max_symbol_concentration_pct / 100 - symbol_current_notional
-    max_quantities.append(int(max(0.0, remaining_symbol_notional) // entry_price))
+    max_quantities.append(floor_quantity(max(0.0, remaining_symbol_notional) / entry_price, intent.asset_class))
 
     if available_cash is not None and intent.side == "buy":
-        cash_limited_quantity = int(max(0.0, available_cash) // entry_price)
+        cash_limited_quantity = floor_quantity(max(0.0, available_cash) / entry_price, intent.asset_class)
         while cash_limited_quantity > 0:
-            buy_fee = estimate_alpaca_equity_order_fees(
-                side="buy", quantity=cash_limited_quantity, price=entry_price,
+            buy_fee = estimate_alpaca_order_fees(
+                asset_class=intent.asset_class, side="buy", quantity=cash_limited_quantity, price=entry_price,
             ).total
             if entry_price * cash_limited_quantity + buy_fee <= available_cash:
                 break
-            cash_limited_quantity -= 1
+            cash_limited_quantity = floor_quantity(
+                cash_limited_quantity - (0.0001 if intent.asset_class == "crypto" else 1),
+                intent.asset_class,
+            )
         max_quantities.append(cash_limited_quantity)
 
     adjusted_quantity = max(0, min(max_quantities))
@@ -88,7 +96,10 @@ def constrain_trade_intent_to_limits(
 
     rationale = intent.rationale
     if adjusted_quantity > 0:
-        rationale = f"{rationale} Quantity reduced from {intent.quantity:,} to {adjusted_quantity:,} by deterministic risk sizing."
+        rationale = (
+            f"{rationale} Quantity reduced from {format_quantity(intent.quantity, intent.asset_class)} "
+            f"to {format_quantity(adjusted_quantity, intent.asset_class)} by deterministic risk sizing."
+        )
     else:
         rationale = f"{rationale} Deterministic risk sizing found no allowable quantity under current limits."
 
@@ -126,11 +137,12 @@ def check_trade_intent(
     risk_dollars = intent.estimated_risk_dollars
     estimated_buy_fee = 0.0
     if intent.entry_price is not None and intent.quantity > 0 and intent.side == "buy":
-        estimated_buy_fee = estimate_alpaca_equity_order_fees(
-            side="buy", quantity=intent.quantity, price=float(intent.entry_price),
+        estimated_buy_fee = estimate_alpaca_order_fees(
+            asset_class=intent.asset_class, side="buy", quantity=intent.quantity, price=float(intent.entry_price),
         ).total
         if intent.stop_loss is not None:
-            _, estimated_sell_fees = estimate_alpaca_equity_round_trip_fees(
+            _, estimated_sell_fees = estimate_alpaca_round_trip_fees(
+                asset_class=intent.asset_class,
                 quantity=intent.quantity,
                 entry_price=float(intent.entry_price),
                 exit_price=float(intent.stop_loss),

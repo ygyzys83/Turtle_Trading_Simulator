@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
 
+from agentloop_trader.assets import normalize_asset_class, normalize_symbol
 from agentloop_trader.brokers import AlpacaConfig, AlpacaOrderPreview, build_alpaca_order_preview
 from agentloop_trader.models import ExecutionDecision, PACIFIC_TIME, RiskCheckResult, TradeIntent
 
@@ -368,7 +369,8 @@ def reconcile_alpaca_positions(position_records: list[dict], tracked_orders: lis
 
 
 def adopt_alpaca_position(position: dict, adopted_at: datetime | None = None) -> dict:
-    symbol = str(position.get("Symbol", "")).strip().upper()
+    asset_class = normalize_asset_class(position.get("Asset Type"), position.get("Symbol", ""))
+    symbol = normalize_symbol(position.get("Symbol", ""), asset_class)
     quantity = _as_float(position.get("Quantity"))
     average_entry = _as_float(position.get("Average Entry"))
     if not symbol:
@@ -387,6 +389,7 @@ def adopt_alpaca_position(position: dict, adopted_at: datetime | None = None) ->
         "broker_order_id": f"adopted-{symbol}-{compact_time}",
         "preview_hash": "",
         "symbol": symbol,
+        "asset_class": asset_class,
         "side": "buy",
         "quantity": _format_number(quantity),
         "status": "filled",
@@ -404,16 +407,18 @@ def adopt_alpaca_position(position: dict, adopted_at: datetime | None = None) ->
 
 
 def build_exit_intent_from_position(position: dict) -> TradeIntent | None:
-    symbol = str(position.get("Symbol", "")).strip().upper()
-    qty = int(abs(_as_float(position.get("Quantity"))))
+    asset_class = normalize_asset_class(position.get("Asset Type"), position.get("Symbol", ""))
+    symbol = normalize_symbol(position.get("Symbol", ""), asset_class)
+    qty = abs(_as_float(position.get("Quantity")))
     if not symbol or qty <= 0:
         return None
     return TradeIntent(
         symbol=symbol,
         side="sell",
         quantity=qty,
+        asset_class=asset_class,
         order_type="market",
-        time_in_force="day",
+        time_in_force="gtc" if asset_class == "crypto" else "day",
         rationale="Exit preview generated from existing Alpaca paper position.",
         source_signals=["alpaca_position_exit_preview"],
     )

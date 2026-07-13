@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import numpy as np
 
+from agentloop_trader.assets import floor_quantity, normalize_asset_class
 from agentloop_trader.data import generate_synthetic_prices
 from agentloop_trader.fees import (
-    estimate_alpaca_equity_order_fees,
-    estimate_alpaca_equity_round_trip_fees,
+    estimate_alpaca_order_fees,
+    estimate_alpaca_round_trip_fees,
 )
 from agentloop_trader.indicators import calc_atr, calc_rsi, calc_sma
 from agentloop_trader.market_data import validate_price_bars
@@ -115,13 +116,14 @@ def _build_stats(
 
 def _backtest_limited_quantity(
     *,
-    raw_quantity: int,
+    raw_quantity: float,
     account_equity: float,
     entry_price: float,
     stop_price: float,
     session_pnl: float,
     limits: RiskLimits | None,
-) -> int:
+    asset_class: str = "equity",
+) -> float:
     if raw_quantity <= 0:
         return 0
     if limits is None:
@@ -137,9 +139,10 @@ def _backtest_limited_quantity(
     max_quantities = [raw_quantity, limits.max_quantity]
     risk_per_share = abs(entry_price - stop_price)
     max_risk_dollars = account_equity * limits.max_risk_per_trade_pct / 100
-    risk_limited_quantity = int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0
+    risk_limited_quantity = floor_quantity(max_risk_dollars / risk_per_share, asset_class) if risk_per_share > 0 else 0
     while risk_limited_quantity > 0:
-        buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+        buy_fees, sell_fees = estimate_alpaca_round_trip_fees(
+            asset_class=asset_class,
             quantity=risk_limited_quantity,
             entry_price=entry_price,
             exit_price=stop_price,
@@ -147,17 +150,19 @@ def _backtest_limited_quantity(
         total_stop_risk = risk_per_share * risk_limited_quantity + buy_fees.total + sell_fees.total
         if total_stop_risk <= max_risk_dollars:
             break
-        risk_limited_quantity -= 1
+        risk_limited_quantity = floor_quantity(
+            risk_limited_quantity - (0.0001 if asset_class == "crypto" else 1), asset_class,
+        )
     max_quantities.append(risk_limited_quantity)
 
     max_position_notional = account_equity * limits.max_position_notional_pct / 100
     max_portfolio_notional = account_equity * limits.max_portfolio_exposure_pct / 100
     max_symbol_notional = account_equity * limits.max_symbol_concentration_pct / 100
     max_quantities.extend([
-        int(max_position_notional // entry_price),
-        int(max_portfolio_notional // entry_price),
-        int(max_symbol_notional // entry_price),
-        int(max(0.0, account_equity) // entry_price),
+        floor_quantity(max_position_notional / entry_price, asset_class),
+        floor_quantity(max_portfolio_notional / entry_price, asset_class),
+        floor_quantity(max_symbol_notional / entry_price, asset_class),
+        floor_quantity(max(0.0, account_equity) / entry_price, asset_class),
     ])
     return max(0, min(max_quantities))
 
@@ -171,17 +176,19 @@ def _trade_record(
     exit_bar: int,
     entry_price: float,
     exit_price: float,
-    shares: int,
+    shares: float,
     stop_price: float,
     account: float,
     exit_rule: str = "Exit rule",
     lowest_price_since_entry: float | None = None,
+    asset_class: str = "equity",
 ) -> dict:
     entry_price = round(float(entry_price), 2)
     exit_price = round(float(exit_price), 2)
     stop_price = round(float(stop_price), 2)
     gross_pnl = (exit_price - entry_price) * shares
-    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+    buy_fees, sell_fees = estimate_alpaca_round_trip_fees(
+        asset_class=asset_class,
         quantity=shares,
         entry_price=entry_price,
         exit_price=exit_price,
@@ -190,7 +197,8 @@ def _trade_record(
     pnl = gross_pnl - estimated_fees
     notional = entry_price * shares
     price_risk_dollars = abs(entry_price - stop_price) * shares
-    risk_buy_fees, risk_sell_fees = estimate_alpaca_equity_round_trip_fees(
+    risk_buy_fees, risk_sell_fees = estimate_alpaca_round_trip_fees(
+        asset_class=asset_class,
         quantity=shares,
         entry_price=entry_price,
         exit_price=stop_price,
@@ -208,6 +216,7 @@ def _trade_record(
         "entry": entry_price,
         "exit": exit_price,
         "shares": shares,
+        "asset_class": asset_class,
         "notional": round(notional, 2),
         "risk_dollars": round(risk_dollars, 2),
         "price_risk_dollars": round(price_risk_dollars, 2),
@@ -225,13 +234,16 @@ def _trade_record(
     }
 
 
-def _entry_fee(price: float, shares: int) -> float:
-    return estimate_alpaca_equity_order_fees(side="buy", quantity=shares, price=price).total
+def _entry_fee(price: float, shares: float, asset_class: str = "equity") -> float:
+    return estimate_alpaca_order_fees(
+        asset_class=asset_class, side="buy", quantity=shares, price=price,
+    ).total
 
 
-def _exit_balance_change(entry_price: float, exit_price: float, shares: int) -> float:
-    gross_pnl = (round(float(exit_price), 2) - round(float(entry_price), 2)) * int(shares)
-    sell_fee = estimate_alpaca_equity_order_fees(
+def _exit_balance_change(entry_price: float, exit_price: float, shares: float, asset_class: str = "equity") -> float:
+    gross_pnl = (round(float(exit_price), 2) - round(float(entry_price), 2)) * float(shares)
+    sell_fee = estimate_alpaca_order_fees(
+        asset_class=asset_class,
         side="sell",
         quantity=shares,
         price=round(float(exit_price), 2),
@@ -525,6 +537,7 @@ def simulate_turtle_strategy(
     )
 
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
     opens = _bar_open_prices(prices, market_data)
     entry_source = highs if highs is not None else prices
     exit_source = lows if lows is not None else prices
@@ -567,7 +580,7 @@ def simulate_turtle_strategy(
             if p > don_high and ma_up and _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled):
                 stop = round(float(p - atr_mult * atr), 2)
                 risk = p - stop
-                raw_size = int((balance * risk_pct_dec) / risk) if risk > 0 else 0
+                raw_size = floor_quantity((balance * risk_pct_dec) / risk, asset_class) if risk > 0 else 0
                 size = _backtest_limited_quantity(
                     raw_quantity=raw_size,
                     account_equity=balance,
@@ -575,11 +588,12 @@ def simulate_turtle_strategy(
                     stop_price=float(stop),
                     session_pnl=balance - account,
                     limits=risk_limits,
+                    asset_class=asset_class,
                 )
                 if size > 0:
                     in_trade = True
                     entry_price = round(float(p), 2)
-                    open_entry_fee = _entry_fee(entry_price, size)
+                    open_entry_fee = _entry_fee(entry_price, size, asset_class)
                     balance -= open_entry_fee
                     stop_price = stop
                     initial_stop_price = stop
@@ -594,12 +608,13 @@ def simulate_turtle_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += _exit_balance_change(entry_price, protective_fill, shares)
+                balance += _exit_balance_change(entry_price, protective_fill, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
-                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    exit_price=protective_fill, shares=shares, stop_price=float(initial_stop_price),
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -620,7 +635,7 @@ def simulate_turtle_strategy(
                 strategy_exit_price=float(don_low),
             )
             if p <= stop_price:
-                balance += _exit_balance_change(entry_price, p, shares)
+                balance += _exit_balance_change(entry_price, p, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -629,11 +644,12 @@ def simulate_turtle_strategy(
                     exit_bar=i,
                     entry_price=float(entry_price),
                     exit_price=float(p),
-                    shares=int(shares),
+                    shares=shares,
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
                     lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -653,7 +669,7 @@ def simulate_turtle_strategy(
     dl_last = float(np.min(exit_source[-1 - exit_w:-1]))
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
-    raw_pos_size = int((balance * risk_pct_dec) / (atr_mult * last_atr)) if last_atr else 0
+    raw_pos_size = floor_quantity((balance * risk_pct_dec) / (atr_mult * last_atr), asset_class) if last_atr else 0
     live_stop = last_p - atr_mult * last_atr if last_atr else last_p
     pos_size = _backtest_limited_quantity(
         raw_quantity=raw_pos_size,
@@ -662,6 +678,7 @@ def simulate_turtle_strategy(
         stop_price=live_stop,
         session_pnl=live_balance - account,
         limits=risk_limits,
+        asset_class=asset_class,
     )
 
     rsi_entry_ready = _rsi_entry_allowed(rsis, live_bar, rsi_entry_filter_enabled)
@@ -681,6 +698,8 @@ def simulate_turtle_strategy(
             symbol=symbol,
             side="buy",
             quantity=pos_size,
+            asset_class=asset_class,
+            time_in_force="gtc" if asset_class == "crypto" else "day",
             entry_price=last_p,
             stop_loss=round(last_p - atr_mult * last_atr, 2) if last_atr else None,
             max_holding_bars=exit_w,
@@ -775,6 +794,7 @@ def simulate_trend_pullback_strategy(
         moving_average_window=trend_w,
     )
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
     opens = _bar_open_prices(prices, market_data)
     min_bars = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window) + 3
     if n_bars < min_bars:
@@ -830,7 +850,7 @@ def simulate_trend_pullback_strategy(
             if setup_ready:
                 stop = round(min(float(np.min(prices[i - pullback_w:i + 1])), p - atr_mult * atr), 2)
                 risk = p - stop
-                raw_size = int((balance * risk_pct_dec) / risk) if risk > 0 else 0
+                raw_size = floor_quantity((balance * risk_pct_dec) / risk, asset_class) if risk > 0 else 0
                 size = _backtest_limited_quantity(
                     raw_quantity=raw_size,
                     account_equity=balance,
@@ -838,11 +858,12 @@ def simulate_trend_pullback_strategy(
                     stop_price=float(stop),
                     session_pnl=balance - account,
                     limits=risk_limits,
+                    asset_class=asset_class,
                 )
                 if size > 0:
                     in_trade = True
                     entry_price = round(float(p), 2)
-                    open_entry_fee = _entry_fee(entry_price, size)
+                    open_entry_fee = _entry_fee(entry_price, size, asset_class)
                     balance -= open_entry_fee
                     stop_price = stop
                     initial_stop_price = stop
@@ -857,12 +878,13 @@ def simulate_trend_pullback_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += _exit_balance_change(entry_price, protective_fill, shares)
+                balance += _exit_balance_change(entry_price, protective_fill, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
-                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    exit_price=protective_fill, shares=shares, stop_price=float(initial_stop_price),
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -884,7 +906,7 @@ def simulate_trend_pullback_strategy(
             )
             exit_hit = p <= stop_price
             if exit_hit:
-                balance += _exit_balance_change(entry_price, p, shares)
+                balance += _exit_balance_change(entry_price, p, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -893,11 +915,12 @@ def simulate_trend_pullback_strategy(
                     exit_bar=i,
                     entry_price=float(entry_price),
                     exit_price=float(p),
-                    shares=int(shares),
+                    shares=shares,
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
                     lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -918,7 +941,7 @@ def simulate_trend_pullback_strategy(
     recent_close_low = float(np.min(prices[-pullback_w:]))
     live_stop = min(recent_close_low, atr_stop)
     stop_distance = max(0.0, last_p - live_stop)
-    raw_pos_size = int((balance * risk_pct_dec) / stop_distance) if stop_distance else 0
+    raw_pos_size = floor_quantity((balance * risk_pct_dec) / stop_distance, asset_class) if stop_distance else 0
     pos_size = _backtest_limited_quantity(
         raw_quantity=raw_pos_size,
         account_equity=live_balance,
@@ -926,6 +949,7 @@ def simulate_trend_pullback_strategy(
         stop_price=live_stop,
         session_pnl=live_balance - account,
         limits=risk_limits,
+        asset_class=asset_class,
     )
 
     strategy_exit_ready = bool(last_p < exit_level)
@@ -943,6 +967,8 @@ def simulate_trend_pullback_strategy(
             symbol=symbol,
             side="buy",
             quantity=pos_size,
+            asset_class=asset_class,
+            time_in_force="gtc" if asset_class == "crypto" else "day",
             entry_price=last_p,
             stop_loss=round(live_stop, 2) if stop_distance else None,
             max_holding_bars=exit_w,
@@ -1037,6 +1063,7 @@ def simulate_trendline_breakout_strategy(
     rsi_entry_filter_enabled: bool = False,
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
     opens = _bar_open_prices(prices, market_data)
     min_bars = max(trendline_w, exit_w, ma_w, 14) + 4
     if n_bars < min_bars:
@@ -1079,7 +1106,7 @@ def simulate_trendline_breakout_strategy(
         if not in_trade:
             if trendline_level is not None and crossed_trendline and trend_ok and _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled):
                 stop = round(float(p - atr_mult * atr), 2)
-                raw_size = int((balance * risk_pct_dec) / (p - stop)) if p > stop else 0
+                raw_size = floor_quantity((balance * risk_pct_dec) / (p - stop), asset_class) if p > stop else 0
                 size = _backtest_limited_quantity(
                     raw_quantity=raw_size,
                     account_equity=balance,
@@ -1087,11 +1114,12 @@ def simulate_trendline_breakout_strategy(
                     stop_price=stop,
                     session_pnl=balance - account,
                     limits=risk_limits,
+                    asset_class=asset_class,
                 )
                 if size > 0:
                     in_trade = True
                     entry_price = round(float(p), 2)
-                    open_entry_fee = _entry_fee(entry_price, size)
+                    open_entry_fee = _entry_fee(entry_price, size, asset_class)
                     balance -= open_entry_fee
                     stop_price = stop
                     initial_stop_price = stop
@@ -1106,12 +1134,13 @@ def simulate_trendline_breakout_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += _exit_balance_change(entry_price, protective_fill, shares)
+                balance += _exit_balance_change(entry_price, protective_fill, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
-                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    exit_price=protective_fill, shares=shares, stop_price=float(initial_stop_price),
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -1132,7 +1161,7 @@ def simulate_trendline_breakout_strategy(
                 strategy_exit_price=float(exit_level),
             )
             if p <= stop_price:
-                balance += _exit_balance_change(entry_price, p, shares)
+                balance += _exit_balance_change(entry_price, p, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -1141,11 +1170,12 @@ def simulate_trendline_breakout_strategy(
                     exit_bar=i,
                     entry_price=float(entry_price),
                     exit_price=p,
-                    shares=int(shares),
+                    shares=shares,
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
                     lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -1204,6 +1234,7 @@ def simulate_trendline_retest_strategy(
     rsi_entry_filter_enabled: bool = False,
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
     opens = _bar_open_prices(prices, market_data)
     min_bars = max(trendline_w, exit_w, ma_w, momentum_w, 14) + 4
     if n_bars < min_bars:
@@ -1268,7 +1299,7 @@ def simulate_trendline_retest_strategy(
                 momentum_turn = bool(retest_seen and p > momentum_sma and p > float(prices[i - 1]) and trend_ok)
                 if momentum_turn and _rsi_entry_allowed(rsis, i, rsi_entry_filter_enabled):
                     stop = round(min(level - atr * 0.25, p - atr_mult * atr), 2)
-                    raw_size = int((balance * risk_pct_dec) / (p - stop)) if p > stop else 0
+                    raw_size = floor_quantity((balance * risk_pct_dec) / (p - stop), asset_class) if p > stop else 0
                     size = _backtest_limited_quantity(
                         raw_quantity=raw_size,
                         account_equity=balance,
@@ -1276,6 +1307,7 @@ def simulate_trendline_retest_strategy(
                         stop_price=stop,
                         session_pnl=balance - account,
                         limits=risk_limits,
+                        asset_class=asset_class,
                     )
                     if size > 0:
                         in_trade = True
@@ -1284,7 +1316,7 @@ def simulate_trendline_retest_strategy(
                         breakout_line = None
                         breakout_bar = None
                         entry_price = round(float(p), 2)
-                        open_entry_fee = _entry_fee(entry_price, size)
+                        open_entry_fee = _entry_fee(entry_price, size, asset_class)
                         balance -= open_entry_fee
                         stop_price = stop
                         initial_stop_price = stop
@@ -1299,12 +1331,13 @@ def simulate_trendline_retest_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += _exit_balance_change(entry_price, protective_fill, shares)
+                balance += _exit_balance_change(entry_price, protective_fill, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
-                    exit_price=protective_fill, shares=int(shares), stop_price=float(initial_stop_price),
+                    exit_price=protective_fill, shares=shares, stop_price=float(initial_stop_price),
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -1325,7 +1358,7 @@ def simulate_trendline_retest_strategy(
                 strategy_exit_price=float(exit_level),
             )
             if p <= stop_price:
-                balance += _exit_balance_change(entry_price, p, shares)
+                balance += _exit_balance_change(entry_price, p, shares, asset_class)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -1334,11 +1367,12 @@ def simulate_trendline_retest_strategy(
                     exit_bar=i,
                     entry_price=float(entry_price),
                     exit_price=p,
-                    shares=int(shares),
+                    shares=shares,
                     stop_price=float(initial_stop_price),
                     account=float(account),
                     exit_rule=exit_rule,
                     lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
                 ))
                 in_trade = False
                 open_entry_fee = 0.0
@@ -1411,6 +1445,7 @@ def _trendline_live_fields(
     momentum_smas=None,
     rsi_entry_filter_enabled: bool = False,
 ) -> dict:
+    asset_class = normalize_asset_class(symbol=symbol)
     last_p = float(prices[index])
     last_atr = atrs[index]
     last_sma = smas[index]
@@ -1445,7 +1480,7 @@ def _trendline_live_fields(
         else atr_stop
     )
     stop_distance = max(0.0, last_p - stop_loss)
-    raw_pos_size = int((balance * risk_pct_dec) / stop_distance) if stop_distance else 0
+    raw_pos_size = floor_quantity((balance * risk_pct_dec) / stop_distance, asset_class) if stop_distance else 0
     pos_size = _backtest_limited_quantity(
         raw_quantity=raw_pos_size,
         account_equity=balance,
@@ -1453,6 +1488,7 @@ def _trendline_live_fields(
         stop_price=stop_loss,
         session_pnl=balance - account,
         limits=risk_limits,
+        asset_class=asset_class,
     )
     signal = "long" if entry_ready else "flat"
     proposed_trade_intent = None
@@ -1461,6 +1497,8 @@ def _trendline_live_fields(
             symbol=symbol,
             side="buy",
             quantity=pos_size,
+            asset_class=asset_class,
+            time_in_force="gtc" if asset_class == "crypto" else "day",
             entry_price=last_p,
             stop_loss=round(stop_loss, 2) if stop_distance else None,
             max_holding_bars=exit_w,

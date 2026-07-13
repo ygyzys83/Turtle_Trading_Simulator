@@ -8,10 +8,12 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Protocol
 
+from agentloop_trader.assets import normalize_asset_class, normalize_symbol
 from agentloop_trader.execution import PaperBroker, PaperOrder
 from agentloop_trader.fees import (
+    ALPACA_CRYPTO_FEE_SCHEDULE_URL,
     ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
-    estimate_alpaca_equity_order_fees,
+    estimate_alpaca_order_fees,
 )
 from agentloop_trader.models import ExecutionDecision, TradeIntent
 
@@ -57,6 +59,7 @@ class AlpacaTrackedOrder:
     filled_at: str
     filled_quantity: str
     average_fill_price: str
+    asset_class: str = "equity"
 
 
 class BrokerAdapter(Protocol):
@@ -414,7 +417,14 @@ class AlpacaBrokerAdapterStub:
         self._read_errors.pop("positions", None)
         return [
             {
-                "Symbol": getattr(position, "symbol", ""),
+                "Symbol": normalize_symbol(
+                    getattr(position, "symbol", ""),
+                    _enum_value(getattr(position, "asset_class", "equity")),
+                ),
+                "Asset Type": normalize_asset_class(
+                    _enum_value(getattr(position, "asset_class", "equity")),
+                    getattr(position, "symbol", ""),
+                ),
                 "Quantity": getattr(position, "qty", ""),
                 "Market Value": getattr(position, "market_value", ""),
                 "Average Entry": getattr(position, "avg_entry_price", ""),
@@ -464,7 +474,13 @@ class AlpacaBrokerAdapterStub:
                 order["limit_price"] = intent.limit_price
             return order
         side = OrderSide.BUY if intent.side == "buy" else OrderSide.SELL
-        tif = TimeInForce.DAY if intent.time_in_force == "day" else TimeInForce.GTC
+        tif = (
+            TimeInForce.DAY
+            if intent.time_in_force == "day"
+            else TimeInForce.IOC
+            if intent.time_in_force == "ioc"
+            else TimeInForce.GTC
+        )
         if intent.order_type == "limit":
             return LimitOrderRequest(
                 symbol=intent.symbol_clean,
@@ -512,11 +528,13 @@ def build_alpaca_order_preview(
 ) -> AlpacaOrderPreview:
     blocked: list[str] = []
     symbol = intent.symbol_clean if intent else ""
+    asset_class = intent.asset_class if intent else "equity"
     reference_price = 0.0
     if intent is not None:
         reference_price = float(intent.limit_price or intent.entry_price or 0.0)
     fee_estimate = (
-        estimate_alpaca_equity_order_fees(
+        estimate_alpaca_order_fees(
+            asset_class=asset_class,
             side=intent.side,
             quantity=intent.quantity,
             price=reference_price,
@@ -532,10 +550,22 @@ def build_alpaca_order_preview(
         if fee_estimate is not None
         else 0.0
     )
+    maker_fee_estimate = (
+        estimate_alpaca_order_fees(
+            asset_class="crypto",
+            side=intent.side,
+            quantity=intent.quantity,
+            price=reference_price,
+            liquidity="maker",
+        )
+        if intent is not None and asset_class == "crypto" and intent.order_type == "limit" and reference_price > 0
+        else None
+    )
     order = {
         "broker": "alpaca",
         "mode": config.account_mode,
         "symbol": symbol,
+        "asset_class": asset_class,
         "side": intent.side if intent else "",
         "quantity": intent.quantity if intent else 0,
         "order_type": intent.order_type if intent else "",
@@ -543,6 +573,7 @@ def build_alpaca_order_preview(
         "time_in_force": intent.time_in_force if intent else "",
         "estimated_order_value": f"${estimated_order_value:,.2f}" if fee_estimate is not None else "Not available",
         "estimated_alpaca_fees": f"${fee_estimate.total:,.2f}" if fee_estimate is not None else "Not available",
+        "possible_maker_fee": f"${maker_fee_estimate.total:,.2f}" if maker_fee_estimate is not None else "Not applicable",
         "estimated_cash_needed": (
             f"${estimated_cash_change:,.2f}"
             if fee_estimate is not None and intent is not None and intent.side == "buy"
@@ -554,11 +585,13 @@ def build_alpaca_order_preview(
             else "Not applicable"
         ),
         "fee_estimate_note": (
-            "Live-equivalent estimate; Alpaca paper does not deduct regulatory fees."
+            "Conservative Tier 1 taker estimate. A resting crypto limit order may receive the lower maker fee."
+            if asset_class == "crypto"
+            else "Live-equivalent estimate; Alpaca paper does not deduct regulatory fees."
             if config.paper
             else "Estimate only; Alpaca aggregates fee types daily and posts actual charges at day-end."
         ),
-        "fee_schedule_effective": ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
+        "fee_schedule_effective": ALPACA_CRYPTO_FEE_SCHEDULE_URL if asset_class == "crypto" else ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
         "source": "adjusted_deterministic_trade_intent",
     }
     if intent is None:
@@ -577,6 +610,8 @@ def build_alpaca_order_preview(
         blocked.append("Quantity must be greater than zero.")
     if intent is not None and intent.order_type == "limit" and (intent.limit_price is None or intent.limit_price <= 0):
         blocked.append("Limit orders need a limit price.")
+    if intent is not None and intent.asset_class == "crypto" and intent.time_in_force not in {"gtc", "ioc"}:
+        blocked.append("Crypto orders require GTC or IOC time in force.")
 
     payload = json.dumps(order, sort_keys=True, separators=(",", ":"))
     preview_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]
@@ -655,10 +690,14 @@ def _canonical_quantity(value) -> str:
 
 
 def alpaca_tracked_order_from_broker_order(order, preview_hash: str) -> AlpacaTrackedOrder:
+    asset_class = normalize_asset_class(
+        _enum_value(getattr(order, "asset_class", "equity")),
+        str(getattr(order, "symbol", "")),
+    )
     return AlpacaTrackedOrder(
         broker_order_id=str(getattr(order, "id", "")),
         preview_hash=preview_hash,
-        symbol=str(getattr(order, "symbol", "")),
+        symbol=normalize_symbol(str(getattr(order, "symbol", "")), asset_class),
         side=str(getattr(order, "side", "")).upper(),
         quantity=str(getattr(order, "qty", "")),
         order_type=str(getattr(order, "type", "")),
@@ -668,6 +707,7 @@ def alpaca_tracked_order_from_broker_order(order, preview_hash: str) -> AlpacaTr
         filled_at=str(getattr(order, "filled_at", "")),
         filled_quantity=str(getattr(order, "filled_qty", "")),
         average_fill_price=str(getattr(order, "filled_avg_price", "")),
+        asset_class=asset_class,
     )
 
 
@@ -678,6 +718,7 @@ def alpaca_tracked_order_records(orders: list[AlpacaTrackedOrder]) -> list[dict]
             "Alpaca Order ID": order.broker_order_id,
             "Review ID": order.preview_hash,
             "Symbol": order.symbol,
+            "Asset Type": order.asset_class,
             "Side": order.side,
             "Quantity": order.quantity,
             "Order Type": order.order_type,
@@ -697,6 +738,7 @@ def _display_order_field(key: str) -> str:
         "broker": "Broker",
         "mode": "Account",
         "symbol": "Symbol",
+        "asset_class": "Asset Type",
         "side": "Side",
         "quantity": "Quantity",
         "order_type": "Order Type",
@@ -708,6 +750,7 @@ def _display_order_field(key: str) -> str:
         "status": "Alpaca Status",
         "estimated_order_value": "Estimated Order Value",
         "estimated_alpaca_fees": "Estimated Alpaca Fees",
+        "possible_maker_fee": "Possible Maker Fee",
         "estimated_cash_needed": "Estimated Cash Needed",
         "estimated_net_proceeds": "Estimated Net Proceeds",
         "fee_estimate_note": "Fee Estimate Note",

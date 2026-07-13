@@ -550,6 +550,21 @@ Fee behavior in the app:
 
 The full suite passed after this integration: 286 tests.
 
+## Alpaca Crypto Support (July 13, 2026)
+
+The app now treats crypto as an explicit asset type rather than pretending it is a stock:
+
+- The daily UI can select Stocks or Crypto. Crypto uses Alpaca and normalizes Bitcoin to `BTC/USD`.
+- Alpaca crypto history and latest trades use the official `/v1beta3/crypto/us` data endpoints.
+- Completed crypto bars use elapsed UTC time and run 24/7; stock bars keep stock-session completion rules.
+- The four deterministic strategies, backtests, optimizer, risk sizing, buy watchlist, broker previews, paper orders, and background exits support fractional crypto quantities.
+- Crypto order previews require GTC or IOC and show a conservative Tier 1 taker fee plus the possible maker fee for limit orders.
+- Crypto backtests and buy-and-hold comparisons use conservative Tier 1 taker fees on both sides. Actual crypto rates vary with maker/taker status and trailing 30-day volume.
+- The worker batches stock and crypto latest-price reads separately. Stock orders respect stock market hours; crypto orders and exits do not.
+- Live crypto orders use the existing Alpaca live-account wiring and remain subject to the same live environment gates. The background worker remains paper-only.
+
+The crypto integration checkpoint passed 296 tests. No broker order was submitted while building or testing it.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

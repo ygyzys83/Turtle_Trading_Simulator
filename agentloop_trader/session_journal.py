@@ -5,7 +5,8 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
-from agentloop_trader.fees import estimate_alpaca_equity_order_fees
+from agentloop_trader.assets import normalize_asset_class
+from agentloop_trader.fees import estimate_alpaca_order_fees
 from agentloop_trader.models import PACIFIC_TIME
 
 
@@ -144,7 +145,7 @@ def paper_trading_review_records(
         {
             "Area": "Estimated live fees",
             "Read": fee_read,
-            "Plain English": "What current Alpaca regulatory fees would approximately cost. Alpaca paper did not deduct this amount.",
+            "Plain English": "What current Alpaca trading fees would approximately cost. Alpaca paper may not deduct the same amount.",
         },
         {"Area": "Next step", "Read": next_step, "Plain English": "The useful action from here."},
     ]
@@ -161,7 +162,12 @@ def _filled_order_fee_summary(orders: list[dict]) -> tuple[float, int, int]:
         if side not in {"buy", "sell"} or quantity <= 0 or price <= 0:
             missing_count += 1
             continue
-        total += estimate_alpaca_equity_order_fees(side=side, quantity=quantity, price=price).total
+        total += estimate_alpaca_order_fees(
+            asset_class=normalize_asset_class(order.get("asset_class"), order.get("symbol", "")),
+            side=side,
+            quantity=quantity,
+            price=price,
+        ).total
         estimated_count += 1
     return round(total, 2), estimated_count, missing_count
 

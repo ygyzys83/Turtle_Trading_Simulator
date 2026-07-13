@@ -22,6 +22,7 @@ class BuyWatchPlan:
     history: str
     price_data_source: str
     strategy_label: str
+    asset_class: str = "equity"
     strategy_settings: dict[str, Any] = field(default_factory=dict)
     risk_limits: dict[str, Any] = field(default_factory=dict)
     order_style: str = "Limit at current price"
@@ -36,8 +37,8 @@ class BuyWatchPlan:
     order_sent_at: str = ""
 
 
-def buy_watch_plan_id(symbol: str, interval: str, strategy_label: str) -> str:
-    identity = f"{symbol.strip().upper()}|{interval.strip().lower()}|{strategy_label.strip()}"
+def buy_watch_plan_id(symbol: str, interval: str, strategy_label: str, asset_class: str = "equity") -> str:
+    identity = f"{asset_class.strip().lower()}|{symbol.strip().upper()}|{interval.strip().lower()}|{strategy_label.strip()}"
     return hashlib.sha256(identity.encode("utf-8")).hexdigest()[:12]
 
 
@@ -116,6 +117,7 @@ def buy_watchlist_records(plans: list[BuyWatchPlan]) -> list[dict[str, Any]]:
     return [
         {
             "Ticker": plan.symbol,
+            "Asset Type": plan.asset_class.title(),
             "Interval": plan.interval,
             "Strategy": plan.strategy_label,
             "Enabled": "Yes" if plan.enabled else "No",
@@ -145,6 +147,7 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
 
     rows = [
         {"Area": "Setup", "Input": "Ticker", "Saved Value": plan.symbol},
+        {"Area": "Setup", "Input": "Asset type", "Saved Value": plan.asset_class.title()},
         {"Area": "Setup", "Input": "Price source", "Saved Value": plan.price_data_source},
         {"Area": "Setup", "Input": "Price interval", "Saved Value": plan.interval},
         {"Area": "Setup", "Input": "History period", "Saved Value": plan.history},

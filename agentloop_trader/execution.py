@@ -12,7 +12,7 @@ class PaperOrder:
     order_id: str
     symbol: str
     side: str
-    quantity: int
+    quantity: float
     status: str
     submitted_at: datetime
     filled_price: float | None = None
@@ -26,7 +26,7 @@ class PaperOrder:
 @dataclass
 class PaperPosition:
     symbol: str
-    quantity: int = 0
+    quantity: float = 0
     average_price: float = 0.0
 
     @property
@@ -65,7 +65,7 @@ class PaperBroker:
             "Paper order filled at strategy reference price.",
         )
 
-    def _fill_buy(self, symbol: str, quantity: int, price: float) -> None:
+    def _fill_buy(self, symbol: str, quantity: float, price: float) -> None:
         position = self.positions.get(symbol, PaperPosition(symbol=symbol))
         existing_value = position.quantity * position.average_price
         new_value = quantity * price
@@ -75,7 +75,7 @@ class PaperBroker:
         self.positions[symbol] = position
         self.cash -= new_value
 
-    def _fill_sell(self, symbol: str, quantity: int, price: float) -> None:
+    def _fill_sell(self, symbol: str, quantity: float, price: float) -> None:
         position = self.positions[symbol]
         position.quantity -= quantity
         self.cash += quantity * price

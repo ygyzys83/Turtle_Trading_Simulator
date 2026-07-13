@@ -10,7 +10,8 @@ import numpy as np
 import pandas as pd
 
 from agentloop_trader.evaluation import WalkForwardResult, evaluate_walk_forward, synthetic_ohlc_frame
-from agentloop_trader.fees import estimate_alpaca_equity_round_trip_fees
+from agentloop_trader.assets import normalize_asset_class
+from agentloop_trader.fees import estimate_alpaca_round_trip_fees
 from agentloop_trader.models import RiskLimits, StrategyConfig
 from agentloop_trader.performance import (
     allocation_metrics,
@@ -518,7 +519,8 @@ def buy_and_hold_benchmark(
             allocated_capital=allocation, period_years=years,
         )
     quantity = allocation / start_price
-    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+    buy_fees, sell_fees = estimate_alpaca_round_trip_fees(
+        asset_class=normalize_asset_class(market_data.attrs.get("asset_class"), market_data.attrs.get("symbol", "")),
         quantity=quantity,
         entry_price=start_price,
         exit_price=end_price,

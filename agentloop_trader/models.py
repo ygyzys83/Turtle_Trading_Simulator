@@ -7,8 +7,9 @@ from zoneinfo import ZoneInfo
 
 
 Side = Literal["buy", "sell"]
+AssetClass = Literal["equity", "crypto"]
 OrderType = Literal["market", "limit", "stop"]
-TimeInForce = Literal["day", "gtc"]
+TimeInForce = Literal["day", "gtc", "ioc"]
 ExecutionMode = Literal[
     "backtest_only",
     "paper",
@@ -35,7 +36,8 @@ class StrategyConfig:
 class TradeIntent:
     symbol: str
     side: Side
-    quantity: int
+    quantity: float
+    asset_class: AssetClass = "equity"
     order_type: OrderType = "market"
     time_in_force: TimeInForce = "day"
     limit_price: float | None = None

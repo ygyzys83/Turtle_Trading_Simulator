@@ -13,6 +13,7 @@ import re
 from agentloop_trader.audit import build_audit_events, events_to_records
 from agentloop_trader.audit_store import JsonlAuditStore
 from agentloop_trader.agents import build_trade_proposal, proposal_records
+from agentloop_trader.assets import format_quantity, normalize_symbol
 from agentloop_trader.automation import (
     AutomationDryRunStore,
     AutomationRuntimeState,
@@ -100,13 +101,19 @@ from agentloop_trader.evidence import (
     write_evidence_package,
 )
 from agentloop_trader.fees import (
+    ALPACA_CRYPTO_FEE_SCHEDULE_URL,
     ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
-    estimate_alpaca_equity_order_fees,
-    estimate_alpaca_equity_round_trip_fees,
+    estimate_alpaca_order_fees,
+    estimate_alpaca_round_trip_fees,
 )
 from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
-from agentloop_trader.market_data import build_company_research_context, fetch_alpaca_bars, fetch_yfinance_bars
+from agentloop_trader.market_data import (
+    build_company_research_context,
+    fetch_alpaca_bars,
+    fetch_alpaca_crypto_bars,
+    fetch_yfinance_bars,
+)
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
 from agentloop_trader.strategy_runtime import adjust_initial_stop_settings, reprice_trade_intent
 from agentloop_trader.monitoring import (
@@ -231,7 +238,15 @@ def fetch_alpaca_stock_data(ticker: str, period: str, interval: str, api_key: st
     return fetch_alpaca_bars(ticker, period, interval, api_key, api_secret)
 
 
+@st.cache_data(ttl=60, show_spinner=False)
+def fetch_alpaca_crypto_data(ticker: str, period: str, interval: str, api_key: str | None, api_secret: str | None) -> pd.DataFrame:
+    return fetch_alpaca_crypto_bars(ticker, period, interval, api_key, api_secret)
+
+
 def fetch_price_data_for_source(symbol: str, history: str, interval_value: str, price_source: str) -> pd.DataFrame:
+    if price_source == "Crypto (Alpaca)":
+        market_data_config = AlpacaConfig.from_env()
+        return fetch_alpaca_crypto_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret)
     if price_source == "Ticker (Alpaca)":
         market_data_config = AlpacaConfig.from_env()
         return fetch_alpaca_stock_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret)
@@ -472,7 +487,7 @@ def waiting_limit_buy_order_records(
         rows.append(
             {
                 "Ticker": symbol,
-                "Shares": order.get("Quantity", ""),
+                "Quantity": order.get("Quantity", ""),
                 "Limit Price": money_or_missing(limit_price),
                 "Current Price": money_or_missing(loaded_price),
                 "Current vs Limit": pct_or_missing(price_distance) if price_distance is not None else "Load ticker to compare",
@@ -752,7 +767,7 @@ def daily_position_rows(positions: list[dict], settings_by_symbol: dict[str, dic
         rows.append(
             {
                 "Ticker": symbol,
-                "Shares": position.get("Quantity", ""),
+                "Quantity": position.get("Quantity", ""),
                 "Current Price": money_or_missing(current_price),
                 "Average Entry": money_or_missing(position.get("Average Entry")),
                 "Unrealized P&L": money_or_missing(position.get("Unrealized P&L")),
@@ -774,7 +789,7 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
     highest_profit_r = optional_float(exit_details.get("highest_profit_r"))
     return [
         {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
-        {"Area": "Position", "Item": "Shares", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current shares held at Alpaca."},
+        {"Area": "Position", "Item": "Quantity", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current position quantity held at Alpaca."},
         {"Area": "Position", "Item": "Current price", "Status / Value": money_or_missing(current_price), "Plain English": "Estimated from Alpaca market value."},
         {"Area": "Position", "Item": "Average entry", "Status / Value": money_or_missing(position.get("Average Entry")), "Plain English": "Average entry price reported by Alpaca."},
         {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "On" if settings.get("auto_exit_enabled", True) else "Off", "Plain English": "Whether the app may sell this position automatically."},
@@ -1000,12 +1015,12 @@ def paper_buy_price_records(
         else "Do not buy above the listed limit price."
     )
     fee_price = float(intent.limit_price or intent.entry_price or reference_price or 0.0)
-    buy_fee = estimate_alpaca_equity_order_fees(
-        side="buy", quantity=intent.quantity, price=fee_price,
+    buy_fee = estimate_alpaca_order_fees(
+        asset_class=intent.asset_class, side="buy", quantity=intent.quantity, price=fee_price,
     ) if fee_price > 0 else None
     return [
         {"Field": "Order sent to Alpaca", "Value": order_type},
-        {"Field": "Shares", "Value": f"{intent.quantity:,}"},
+        {"Field": "Quantity", "Value": format_quantity(intent.quantity, intent.asset_class)},
         {"Field": "Reference price", "Value": money_or_missing(reference_price)},
         {"Field": "Price instruction", "Value": order_style},
         {"Field": "Price adjustment", "Value": adjustment_label},
@@ -1113,7 +1128,8 @@ def decision_ticket_records() -> list[dict]:
     dollars_at_risk = estimated_intent_risk_with_fees(intent)
     risk_pct_account = (dollars_at_risk / paper_order_risk_equity * 100) if dollars_at_risk is not None and paper_order_risk_equity else None
     fee_exit_price = intent.stop_loss or intent.entry_price
-    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+    buy_fees, sell_fees = estimate_alpaca_round_trip_fees(
+        asset_class=intent.asset_class,
         quantity=intent.quantity,
         entry_price=intent.entry_price,
         exit_price=fee_exit_price,
@@ -1123,7 +1139,7 @@ def decision_ticket_records() -> list[dict]:
         {"Item": "Reason", "Value": final_detail},
         {"Item": "Ticker", "Value": intent.symbol_clean},
         {"Item": "Strategy", "Value": strategy_label},
-        {"Item": "Shares", "Value": f"{intent.quantity:,}"},
+        {"Item": "Quantity", "Value": format_quantity(intent.quantity, intent.asset_class)},
         {"Item": "Reference price", "Value": money_or_missing(live.get("last_p"))},
         {"Item": "Highest buy price", "Value": "Market order" if intent.order_type == "market" else money_or_missing(intent.limit_price)},
         {"Item": "Stop loss", "Value": money_or_missing(intent.stop_loss)},
@@ -1141,7 +1157,8 @@ def estimated_intent_risk_with_fees(trade_intent: TradeIntent | None) -> float |
     if trade_intent is None or trade_intent.entry_price is None or trade_intent.stop_loss is None:
         return None
     price_risk = abs(float(trade_intent.entry_price) - float(trade_intent.stop_loss)) * trade_intent.quantity
-    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+    buy_fees, sell_fees = estimate_alpaca_round_trip_fees(
+        asset_class=trade_intent.asset_class,
         quantity=trade_intent.quantity,
         entry_price=trade_intent.entry_price,
         exit_price=trade_intent.stop_loss,
@@ -1174,7 +1191,7 @@ def trade_read_records() -> list[dict]:
         risk_pct_account = (dollars_at_risk / paper_order_risk_equity * 100) if dollars_at_risk is not None and paper_order_risk_equity else None
         rows.extend(
             [
-                {"Section": "Decision", "Item": "Shares", "Status / Value": f"{intent.quantity:,}", "Plain English": "Order size after risk sizing."},
+                {"Section": "Decision", "Item": "Quantity", "Status / Value": format_quantity(intent.quantity, intent.asset_class), "Plain English": "Order size after risk sizing."},
                 {
                     "Section": "Decision",
                     "Item": "Highest buy price",
@@ -1658,7 +1675,7 @@ mode_options = {
 mode_label = st.sidebar.selectbox(
     "Order mode",
     list(mode_options.keys()),
-    index=0,
+    index=1,
     help=(
         "Backtest only uses the chart and simulator. Paper trading can send orders to Alpaca paper. "
         "Practice mode records decisions without sending broker orders. Live with approval can send real orders only after live credentials and confirmation are configured. Automated live is visible for setup but does not auto-submit yet."
@@ -1790,31 +1807,51 @@ elif paper_buy_order_style == "Custom limit price":
 reset_paper_broker = False
 
 st.sidebar.markdown("### :material/candlestick_chart: Ticker and price data")
-data_source = st.sidebar.radio(
-    "Prices to use",
-    ["Synthetic", "Ticker (Alpaca)", "Ticker (yfinance)"],
+asset_type = st.sidebar.radio(
+    "Asset type",
+    ["Stocks", "Crypto"],
     horizontal=True,
+    help="Stocks use whole-share sizing and stock market hours. Crypto uses Alpaca pairs such as BTC/USD, fractional sizing, and trades 24/7.",
 )
+asset_class = "crypto" if asset_type == "Crypto" else "equity"
+if asset_class == "crypto":
+    data_source = "Crypto (Alpaca)"
+    st.sidebar.caption("Crypto prices and orders use Alpaca. Bitcoin is BTC/USD and trades 24/7.")
+else:
+    data_source = st.sidebar.radio(
+        "Prices to use",
+        ["Synthetic", "Ticker (Alpaca)", "Ticker (yfinance)"],
+        horizontal=True,
+    )
 market_data = None
 source_caption = "synthetic price data"
 ticker = "SYNTH"
 interval = "1d"
 period = "synthetic"
 
-if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
-    ticker = st.sidebar.text_input("Ticker", value="AAPL").strip().upper()
+if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
+    ticker = normalize_symbol(
+        st.sidebar.text_input(
+            "Ticker or pair",
+            value="",
+            placeholder="BTC/USD" if asset_class == "crypto" else "Enter ticker",
+        ),
+        asset_class,
+    )
     interval_options = ["1d", "4h", "1h", "30m", "15m", "5m", "1m"]
     optimizer_interval_to_apply = st.session_state.pop("optimizer_apply_interval", None)
     if optimizer_interval_to_apply in interval_options:
         st.session_state["price_interval_input"] = optimizer_interval_to_apply
-    interval = st.sidebar.selectbox("Interval", interval_options, index=2, key="price_interval_input")
+    interval = st.sidebar.selectbox("Interval", interval_options, index=1, key="price_interval_input")
     if interval == "1d":
         period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y", "10y", "ytd", "max"], 5
-    elif interval == "4h" and data_source == "Ticker (Alpaca)":
-        period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y"], 3
-    elif interval == "1h" and data_source == "Ticker (Alpaca)":
+    elif interval == "4h" and data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}:
+        period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y", "5y"], 4
+    elif interval == "1h" and data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}:
         period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y"], 3
-    elif interval in ("4h", "1h"):
+    elif interval == "4h":
+        period_options, period_index = ["1mo", "3mo", "6mo", "1y", "2y"], 4
+    elif interval == "1h":
         period_options, period_index = ["1mo", "3mo", "6mo", "1y"], 3
     elif interval in ("30m", "15m"):
         period_options, period_index = ["1mo", "3mo", "6mo"], 2
@@ -1826,32 +1863,41 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)"):
     elif st.session_state.get("history_period_input") not in period_options:
         st.session_state["history_period_input"] = period_options[period_index]
     period = st.sidebar.selectbox("History period", period_options, index=period_index, key="history_period_input")
-    if st.sidebar.button("Refresh stock data", type="primary"):
+    if st.sidebar.button("Refresh price data", type="primary"):
         fetch_alpaca_stock_data.clear()
+        fetch_alpaca_crypto_data.clear()
         fetch_stock_data.clear()
-    try:
-        with st.spinner(f"Fetching {ticker}..."):
-            if data_source == "Ticker (Alpaca)":
-                market_data_config = AlpacaConfig.from_env()
-                market_data = fetch_alpaca_stock_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
-                source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest completed bar {market_data.index[-1]}"
-                st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca bars. Free IEX data can be delayed.")
-            else:
-                market_data = fetch_stock_data(ticker, period, interval)
-                source_caption = f"{ticker} via yfinance ({period}, {interval}); latest completed bar {market_data.index[-1]}"
-                st.sidebar.caption(f"Loaded {len(market_data):,} completed yfinance bars. Yahoo intraday data may be delayed or limited.")
-    except Exception as exc:
-        st.error(f"Could not load {data_source} price data: {exc}")
-        st.stop()
+    if not ticker:
+        st.sidebar.caption("Enter a ticker or crypto pair to load price data.")
+    else:
+        try:
+            with st.spinner(f"Fetching {ticker}..."):
+                if data_source == "Crypto (Alpaca)":
+                    market_data_config = AlpacaConfig.from_env()
+                    market_data = fetch_alpaca_crypto_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
+                    source_caption = f"{ticker} via Alpaca crypto ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                    st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca crypto bars.")
+                elif data_source == "Ticker (Alpaca)":
+                    market_data_config = AlpacaConfig.from_env()
+                    market_data = fetch_alpaca_stock_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
+                    source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                    st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca bars. Free IEX data can be delayed.")
+                else:
+                    market_data = fetch_stock_data(ticker, period, interval)
+                    source_caption = f"{ticker} via yfinance ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                    st.sidebar.caption(f"Loaded {len(market_data):,} completed yfinance bars. Yahoo intraday data may be delayed or limited.")
+        except Exception as exc:
+            st.error(f"Could not load {data_source} price data: {exc}")
+            st.stop()
 st.session_state["last_loaded_symbol"] = ticker
 
 optimizer_apply_settings = st.session_state.pop("optimizer_apply_settings", None)
 if optimizer_apply_settings:
-    st.session_state["strategy_label_input"] = optimizer_apply_settings.get("strategy_label", "Trendline retest continuation")
+    st.session_state["strategy_label_input"] = optimizer_apply_settings.get("strategy_label", "Trend pullback continuation")
     st.session_state["entry_window_input"] = int(optimizer_apply_settings.get("entry_window", 20))
     st.session_state["exit_window_input"] = int(optimizer_apply_settings.get("exit_window", 10))
-    st.session_state["atr_stop_multiplier_input"] = float(optimizer_apply_settings.get("atr_stop_multiplier", 2.0))
-    optimizer_risk_pct = float(optimizer_apply_settings.get("risk_per_trade_pct", 1.0))
+    st.session_state["atr_stop_multiplier_input"] = float(optimizer_apply_settings.get("atr_stop_multiplier", 1.5))
+    optimizer_risk_pct = float(optimizer_apply_settings.get("risk_per_trade_pct", 0.5))
     st.session_state["risk_pct_input"] = max(0.5, min(3.0, round(optimizer_risk_pct * 2) / 2))
     st.session_state["moving_average_window_input"] = int(optimizer_apply_settings.get("moving_average_window", 50))
     st.session_state["pullback_average_length_input"] = int(optimizer_apply_settings.get("pullback_average_length", 20))
@@ -1876,7 +1922,7 @@ strategy_options = {
 strategy_label = st.sidebar.selectbox(
     "Strategy type",
     list(strategy_options.keys()),
-    index=3,
+    index=1,
     key="strategy_label_input",
     help=(
         "Choose the rule set that creates trade ideas. Breakout continuation uses prior highs. "
@@ -1885,6 +1931,7 @@ strategy_label = st.sidebar.selectbox(
     ),
 )
 strategy_type = strategy_options[strategy_label]
+st.sidebar.caption("Only inputs used by the selected strategy are enabled.")
 entry_w = st.sidebar.slider(
     "Buy breakout / trendline lookback (bars)",
     10,
@@ -1892,6 +1939,7 @@ entry_w = st.sidebar.slider(
     20,
     step=5,
     key="entry_window_input",
+    disabled=strategy_type == "pullback",
     help=(
         "Breakout continuation uses this many bars to find the prior high. "
         "Trendline breakout and Trendline retest continuation use this many bars to find descending swing-high resistance."
@@ -1914,7 +1962,7 @@ atr_mult = st.sidebar.number_input(
     "Stop distance (ATR multiplier)",
     min_value=0.50,
     max_value=5.00,
-    value=2.00,
+    value=1.50,
     step=0.01,
     format="%.2f",
     key="atr_stop_multiplier_input",
@@ -1927,7 +1975,7 @@ risk_pct = st.sidebar.slider(
     "Strategy risk per trade (%)",
     0.5,
     3.0,
-    1.0,
+    0.5,
     step=0.5,
     key="risk_pct_input",
     help="How much of the simulator account the strategy is allowed to risk on one trade before separate risk limits are applied.",
@@ -1948,6 +1996,7 @@ pullback_w = st.sidebar.slider(
     20,
     step=5,
     key="pullback_average_length_input",
+    disabled=strategy_type != "pullback",
     help=(
         "Used by Trend pullback continuation. This calculates the moving average used as the pullback zone. "
         "The strategy looks for the recent low to touch or come near this average before buying. "
@@ -1961,6 +2010,7 @@ momentum_w = st.sidebar.slider(
     10,
     step=1,
     key="momentum_turn_length_input",
+    disabled=strategy_type not in {"pullback", "trendline_retest"},
     help=(
         "Used by Trend pullback continuation and Trendline retest continuation. This calculates the short average used to confirm "
         "price has turned back up before buying. Shorter values react faster; longer values wait for more confirmation."
@@ -1982,7 +2032,7 @@ max_risk_limit = st.sidebar.slider(
     "Max risk per trade (%)",
     0.25,
     5.0,
-    1.0,
+    0.5,
     step=0.25,
     help="Hard cap on dollars at risk for one trade. If the stop loss would risk more than this, the app reduces size or blocks the trade.",
 )
@@ -2126,6 +2176,10 @@ with st.sidebar.expander("Files, records, and simulator reset", expanded=False):
 if data_source == "Synthetic" and st.sidebar.button("Simulate new run", type="primary"):
     st.session_state["seed"] = np.random.randint(0, 100_000)
     st.session_state["selected_trade_idx"] = None
+
+if data_source != "Synthetic" and not ticker:
+    st.info("Enter a ticker or crypto pair in the sidebar to load price data.")
+    st.stop()
 
 seed = st.session_state.get("seed", 42)
 risk_dec = risk_pct / 100
@@ -2433,6 +2487,7 @@ current_strategy_config = StrategyConfig(
 )
 current_strategy_settings = {
     "symbol": ticker,
+    "asset_class": asset_class,
     "interval": interval,
     "history": period,
     "price_data_source": data_source,
@@ -2494,6 +2549,7 @@ automation_control = AutomationControl(
     stale_limit_order_minutes=int(stale_limit_order_minutes),
     refresh_seconds=int(automation_refresh_seconds),
     symbol=ticker,
+    asset_class=asset_class,
     price_data_source=data_source,
     history=period,
     interval=interval,
@@ -4135,7 +4191,7 @@ elif command_center_view == "New Trade":
     )
     watchlist_plans = buy_watchlist_store.read()
     watchlist_cols = st.columns([1, 1, 2])
-    add_watch_disabled = data_source != "Ticker (Alpaca)" or ticker.strip().upper() == "SYNTH"
+    add_watch_disabled = data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"} or ticker.strip().upper() == "SYNTH"
     if watchlist_cols[0].button(
         "Add or Update Current Setup",
         disabled=add_watch_disabled,
@@ -4143,12 +4199,13 @@ elif command_center_view == "New Trade":
         key="add_current_buy_watch_plan",
     ):
         plan = BuyWatchPlan(
-            plan_id=buy_watch_plan_id(ticker, interval, strategy_label),
+            plan_id=buy_watch_plan_id(ticker, interval, strategy_label, asset_class),
             symbol=ticker,
             interval=interval,
             history=period,
             price_data_source=data_source,
             strategy_label=strategy_label,
+            asset_class=asset_class,
             strategy_settings=dict(current_strategy_settings),
             risk_limits=asdict(risk_limits),
             order_style=paper_buy_order_style,
@@ -4168,7 +4225,7 @@ elif command_center_view == "New Trade":
         "Signals use cached completed bars. Order pricing uses a lightweight latest Alpaca trade every worker check."
     )
     if add_watch_disabled:
-        st.caption("Select Ticker (Alpaca) before adding an automatic BUY setup.")
+        st.caption("Select Alpaca stock or crypto price data before adding an automatic BUY setup.")
     if watchlist_plans:
         st.dataframe(pd.DataFrame(buy_watchlist_records(watchlist_plans)), width="stretch", hide_index=True)
         watch_labels = {
@@ -4227,7 +4284,7 @@ elif command_center_view == "New Trade":
     else:
         proposal_cols = st.columns(4)
         metric_card(proposal_cols[0], "Symbol", intent.symbol_clean, intent.side.upper())
-        metric_card(proposal_cols[1], "Quantity", f"{intent.quantity:,}", intent.order_type)
+        metric_card(proposal_cols[1], "Quantity", format_quantity(intent.quantity, intent.asset_class), intent.order_type)
         metric_card(proposal_cols[2], "Buy near", f"${intent.entry_price:,.2f}", "Strategy price")
         metric_card(proposal_cols[3], "Stop loss", f"${intent.stop_loss:,.2f}", "Risk rule")
         st.caption(
@@ -4425,7 +4482,7 @@ if command_center_view == "New Trade":
             "Exit Date": t["exit_date"],
             "Entry $": t["entry"],
             "Exit $": t["exit"],
-            "Shares": t["shares"],
+            "Quantity": t["shares"],
             "Position $": t.get("notional", round(t["entry"] * t["shares"], 2)),
             "Risk $": t.get("risk_dollars", ""),
             "Risk %": t.get("risk_pct", ""),
@@ -4496,14 +4553,18 @@ if command_center_view == "New Trade":
     metric_card(c7, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
     metric_card(c8, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
     with st.expander("Backtest assumptions and exit model", expanded=False):
+        fee_assumption = (
+            "Crypto results use Alpaca's conservative Tier 1 taker fee of 0.25% on buys and sells. "
+            f"Actual maker/taker rates depend on 30-day crypto volume; see {ALPACA_CRYPTO_FEE_SCHEDULE_URL}. "
+            if asset_class == "crypto"
+            else f"Results include estimated Alpaca U.S. equity regulatory fees using the fee schedule effective "
+            f"{ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE} and a 0% direct-account commission assumption. "
+        )
         st.markdown(
             "Historical signals use completed bars. Entries use the signal-bar close. "
             "Protective stops fill at the stop price, or at the bar open after a gap below the stop. "
-            f"Results include estimated Alpaca U.S. equity regulatory fees using the fee schedule effective "
-            f"{ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE} and a 0% direct-account commission assumption. "
-            "Paper trading does not deduct these fees, so they are included here as live-equivalent costs. "
-            "The estimate conservatively rounds each order's applicable fee components upward; Alpaca live "
-            "aggregates each fee type by account and day, so actual day-end charges may differ by a few cents. "
+            + fee_assumption
+            + "Paper trading may not deduct the same fees, so they are included as live-equivalent costs. "
             "Spread, slippage, market impact, taxes, and idle-cash interest are not included."
         )
         st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
@@ -4521,7 +4582,7 @@ if command_center_view == "New Trade":
         st.caption(
             "This compares all four strategies and buy-and-hold using the same ticker allocation set by Max symbol concentration. "
             "Account return remains visible separately. Buy and hold uses adjusted closing prices; taxes, idle-cash interest, "
-            "spread, slippage, and market impact are not included. Strategy results are net of estimated Alpaca regulatory fees; "
+            "spread, slippage, and market impact are not included. Strategy results are net of estimated Alpaca trading fees; "
             "buy and hold includes one estimated buy and one estimated sell."
         )
         

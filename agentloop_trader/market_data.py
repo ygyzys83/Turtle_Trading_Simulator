@@ -10,6 +10,8 @@ from zoneinfo import ZoneInfo
 
 import pandas as pd
 
+from agentloop_trader.assets import normalize_asset_class, normalize_symbol
+
 
 ALPACA_DATA_BASE_URL = "https://data.alpaca.markets"
 NEW_YORK_TIME = ZoneInfo("America/New_York")
@@ -67,6 +69,22 @@ def completed_price_bars(
     if current.tzinfo is None:
         current = current.tz_localize("UTC")
     current_et = current.tz_convert(NEW_YORK_TIME)
+
+    if normalize_asset_class(attrs.get("asset_class"), attrs.get("symbol", "")) == "crypto":
+        duration = pd.Timedelta(days=1) if interval == "1d" else pd.Timedelta(
+            minutes=INTERVAL_MINUTES.get(interval, 60)
+        )
+        completed_mask = []
+        for raw_timestamp in clean.index:
+            timestamp = pd.Timestamp(raw_timestamp)
+            if timestamp.tzinfo is None:
+                timestamp = timestamp.tz_localize("UTC")
+            completed_mask.append(bool(current >= timestamp.tz_convert("UTC") + duration))
+        completed = clean.loc[completed_mask].copy()
+        if completed.empty:
+            raise ValueError("No completed price bars are available for the selected interval.")
+        completed.attrs.update(attrs)
+        return completed
 
     completed_mask: list[bool] = []
     for raw_timestamp in clean.index:
@@ -187,10 +205,72 @@ def fetch_alpaca_bars(
     )
     data["Date"] = pd.to_datetime(data["Date"], utc=True)
     data = data.set_index("Date").sort_index()
-    return completed_price_bars(
-        validate_price_bars(data[["Open", "Close", "High", "Low", "Volume"]], clean),
-        interval,
-    )
+    validated = validate_price_bars(data[["Open", "Close", "High", "Low", "Volume"]], clean)
+    validated.attrs["asset_class"] = "equity"
+    return completed_price_bars(validated, interval)
+
+
+def fetch_alpaca_crypto_bars(
+    symbol: str,
+    period: str,
+    interval: str,
+    api_key: str | None,
+    api_secret: str | None,
+    *,
+    location: str = "us",
+    timeout: int = 20,
+) -> pd.DataFrame:
+    clean = normalize_symbol(symbol, "crypto")
+    if not clean:
+        raise ValueError("Enter a crypto pair, such as BTC/USD.")
+    if not api_key or not api_secret:
+        raise RuntimeError("Alpaca API key and secret are required for crypto price data.")
+
+    all_bars: list[dict[str, Any]] = []
+    page_token = ""
+    start_time = period_start_time(period).isoformat().replace("+00:00", "Z")
+    max_pages = 200
+    for _ in range(max_pages):
+        params: dict[str, Any] = {
+            "symbols": clean,
+            "timeframe": alpaca_timeframe(interval),
+            "start": start_time,
+            "limit": 10000,
+        }
+        if page_token:
+            params["page_token"] = page_token
+        request = Request(
+            f"{ALPACA_DATA_BASE_URL}/v1beta3/crypto/{location}/bars?{urlencode(params)}",
+            headers={
+                "APCA-API-KEY-ID": api_key,
+                "APCA-API-SECRET-KEY": api_secret,
+                "Accept": "application/json",
+            },
+        )
+        with urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        all_bars.extend(payload.get("bars", {}).get(clean, []))
+        page_token = str(payload.get("next_page_token") or "")
+        if not page_token:
+            break
+    if page_token:
+        raise RuntimeError(f"Alpaca crypto history for {clean} exceeded {max_pages} pages; no partial dataset was used.")
+    if not all_bars:
+        raise ValueError(f"No Alpaca crypto price data returned for {clean}.")
+
+    data = pd.DataFrame({
+        "Date": [bar.get("t") for bar in all_bars],
+        "Open": [bar.get("o") for bar in all_bars],
+        "Close": [bar.get("c") for bar in all_bars],
+        "High": [bar.get("h") for bar in all_bars],
+        "Low": [bar.get("l") for bar in all_bars],
+        "Volume": [bar.get("v") for bar in all_bars],
+    })
+    data["Date"] = pd.to_datetime(data["Date"], utc=True)
+    data = data.set_index("Date").sort_index()
+    validated = validate_price_bars(data[["Open", "Close", "High", "Low", "Volume"]], clean)
+    validated.attrs["asset_class"] = "crypto"
+    return completed_price_bars(validated, interval)
 
 
 def fetch_alpaca_latest_trades(
@@ -210,6 +290,45 @@ def fetch_alpaca_latest_trades(
     params = {"symbols": ",".join(clean_symbols), "feed": feed}
     request = Request(
         f"{ALPACA_DATA_BASE_URL}/v2/stocks/trades/latest?{urlencode(params)}",
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    trades = payload.get("trades", {}) if isinstance(payload, dict) else {}
+    prices: dict[str, float] = {}
+    for symbol in clean_symbols:
+        trade = trades.get(symbol, {}) if isinstance(trades, dict) else {}
+        try:
+            price = float(trade.get("p"))
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            prices[symbol] = price
+    return prices
+
+
+def fetch_alpaca_latest_crypto_trades(
+    symbols: list[str] | tuple[str, ...],
+    api_key: str | None,
+    api_secret: str | None,
+    *,
+    location: str = "us",
+    timeout: int = 10,
+) -> dict[str, float]:
+    clean_symbols = tuple(dict.fromkeys(
+        normalize_symbol(symbol, "crypto") for symbol in symbols if str(symbol).strip()
+    ))
+    if not clean_symbols:
+        return {}
+    if not api_key or not api_secret:
+        raise RuntimeError("Alpaca API key and secret are required for latest crypto prices.")
+    params = {"symbols": ",".join(clean_symbols)}
+    request = Request(
+        f"{ALPACA_DATA_BASE_URL}/v1beta3/crypto/{location}/latest/trades?{urlencode(params)}",
         headers={
             "APCA-API-KEY-ID": api_key,
             "APCA-API-SECRET-KEY": api_secret,
@@ -277,8 +396,12 @@ def fetch_price_bars(
     source: str,
     api_key: str | None = None,
     api_secret: str | None = None,
+    asset_class: str | None = None,
 ) -> pd.DataFrame:
+    kind = normalize_asset_class(asset_class, symbol)
     if "alpaca" in str(source).lower():
+        if kind == "crypto" or "crypto" in str(source).lower():
+            return fetch_alpaca_crypto_bars(symbol, period, interval, api_key, api_secret)
         return fetch_alpaca_bars(symbol, period, interval, api_key, api_secret)
     if "yfinance" in str(source).lower() or "yahoo" in str(source).lower():
         return fetch_yfinance_bars(symbol, period, interval)

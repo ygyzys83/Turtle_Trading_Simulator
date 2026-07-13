@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Callable
 
+from agentloop_trader.assets import normalize_asset_class, normalize_symbol
 from agentloop_trader.audit_store import JsonlAuditStore
 from agentloop_trader.automation_runtime import (
     AutomationControl,
@@ -34,7 +35,11 @@ from agentloop_trader.brokers import (
     build_alpaca_order_preview,
 )
 from agentloop_trader.buy_watchlist import BuyWatchPlan, BuyWatchlistStore
-from agentloop_trader.market_data import fetch_alpaca_latest_trades, fetch_price_bars
+from agentloop_trader.market_data import (
+    fetch_alpaca_latest_crypto_trades,
+    fetch_alpaca_latest_trades,
+    fetch_price_bars,
+)
 from agentloop_trader.models import AuditEvent, ExecutionDecision, PACIFIC_TIME, RiskCheckResult, RiskLimits
 from agentloop_trader.risk import check_trade_intent, constrain_trade_intent_to_limits
 from agentloop_trader.strategy_runtime import (
@@ -155,13 +160,17 @@ def _track_broker_order(order: Any, preview_hash: str, strategy_settings: dict[s
 
 def _fetcher(control: AutomationControl, config: AlpacaConfig) -> Callable[[str, str, str, str], Any]:
     def fetch(symbol: str, history: str, interval: str, source: str):
-        key = (symbol.strip().upper(), history, interval, source)
+        asset_class = normalize_asset_class("crypto" if "crypto" in source.lower() else None, symbol)
+        clean_symbol = normalize_symbol(symbol, asset_class)
+        key = (clean_symbol, history, interval, source)
         cached = _BAR_CACHE.get(key)
         now = time.monotonic()
         if cached and now - cached[0] < _BAR_CACHE_SECONDS.get(interval, 300):
             data = cached[1]
             return data.copy() if hasattr(data, "copy") else data
-        data = fetch_price_bars(symbol, history, interval, source, config.api_key, config.api_secret)
+        data = fetch_price_bars(
+            clean_symbol, history, interval, source, config.api_key, config.api_secret, asset_class,
+        )
         _BAR_CACHE[key] = (now, data)
         return data.copy() if hasattr(data, "copy") else data
 
@@ -227,14 +236,14 @@ def _send_exits(
         return 0, tracked_orders, "Auto exits are blocked by account switch or Kill Switch."
     if not adapter.config.paper:
         return 0, tracked_orders, "Auto exits are paper-only in this worker."
-    if not _market_is_open(adapter):
-        return 0, tracked_orders, "Market is closed; auto exits wait for regular hours."
-
     sent = 0
     updated = list(tracked_orders)
     for position in positions:
         symbol = str(position.get("Symbol", "")).strip().upper()
+        asset_class = normalize_asset_class(position.get("Asset Type"), symbol)
         if not symbol or _number(position.get("Quantity")) <= 0:
+            continue
+        if asset_class != "crypto" and not _market_is_open(adapter):
             continue
         settings = saved_exit_settings_for_symbol(symbol, updated)
         details = evaluate_exit_settings(settings, position, fetch_bars)
@@ -305,7 +314,7 @@ def _send_entry(
         return 0, tracked_orders, "Auto entries are blocked by account switch or Kill Switch."
     if not adapter.config.paper:
         return 0, tracked_orders, "Auto entries are paper-only in this worker."
-    market_open = _market_is_open(adapter)
+    market_open = True if control.asset_class == "crypto" else _market_is_open(adapter)
     if not market_open and not control.allow_limit_buys_outside_market_hours:
         return 0, tracked_orders, "Market is closed; auto buys wait for regular hours."
 
@@ -364,6 +373,7 @@ def _send_entry(
     settings = dict(control.strategy_settings)
     settings.update({
         "symbol": intent.symbol_clean,
+        "asset_class": intent.asset_class,
         "history": control.history,
         "interval": control.interval,
         "price_data_source": control.price_data_source,
@@ -393,6 +403,7 @@ def _control_for_watch_plan(control: AutomationControl, plan: BuyWatchPlan) -> A
     return replace(
         control,
         symbol=plan.symbol,
+        asset_class=plan.asset_class,
         price_data_source=plan.price_data_source,
         history=plan.history,
         interval=plan.interval,
@@ -441,9 +452,9 @@ def _send_watchlist_entries(
     for plan in enabled:
         if sent >= max(0, max_to_send):
             break
-        if plan.price_data_source != "Ticker (Alpaca)":
+        if plan.price_data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"}:
             checked_at = datetime.now(PACIFIC_TIME).isoformat()
-            message = "Queued automatic buys require Ticker (Alpaca) for a current order price."
+            message = "Queued automatic buys require Alpaca price data for a current order price."
             store.update(
                 plan.plan_id,
                 status="Blocked",
@@ -551,11 +562,24 @@ def run_once(
             latest_price_error = ""
             if control.mode == "Auto entries and exits" and control.full_automation_enabled:
                 try:
+                    stock_symbols = [
+                        plan.symbol for plan in watchlist_plans
+                        if plan.enabled and plan.asset_class != "crypto" and plan.price_data_source == "Ticker (Alpaca)"
+                    ]
+                    crypto_symbols = [
+                        plan.symbol for plan in watchlist_plans
+                        if plan.enabled and plan.asset_class == "crypto"
+                    ]
                     latest_prices = fetch_alpaca_latest_trades(
-                        [plan.symbol for plan in watchlist_plans if plan.enabled and plan.price_data_source == "Ticker (Alpaca)"],
+                        stock_symbols,
                         adapter.config.api_key,
                         adapter.config.api_secret,
                     )
+                    latest_prices.update(fetch_alpaca_latest_crypto_trades(
+                        crypto_symbols,
+                        adapter.config.api_key,
+                        adapter.config.api_secret,
+                    ))
                 except Exception as exc:
                     latest_price_error = str(exc)
             buy_count, tracked, buy_action = _send_watchlist_entries(
@@ -573,14 +597,17 @@ def run_once(
             )
         else:
             latest_price = None
-            require_latest_price = control.price_data_source == "Ticker (Alpaca)"
+            require_latest_price = control.price_data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}
             if require_latest_price and control.mode == "Auto entries and exits" and control.full_automation_enabled:
                 try:
-                    latest_price = fetch_alpaca_latest_trades(
-                        [control.symbol],
-                        adapter.config.api_key,
-                        adapter.config.api_secret,
-                    ).get(control.symbol.strip().upper())
+                    latest_lookup = (
+                        fetch_alpaca_latest_crypto_trades
+                        if control.asset_class == "crypto"
+                        else fetch_alpaca_latest_trades
+                    )
+                    latest_price = latest_lookup(
+                        [control.symbol], adapter.config.api_key, adapter.config.api_secret,
+                    ).get(normalize_symbol(control.symbol, control.asset_class))
                 except Exception:
                     latest_price = None
             buy_count, tracked, buy_action = _send_entry(

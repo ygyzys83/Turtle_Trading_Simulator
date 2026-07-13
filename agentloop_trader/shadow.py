@@ -13,7 +13,7 @@ class ShadowDecision:
     created_at: datetime
     symbol: str
     intended_action: str
-    quantity: int
+    quantity: float
     reference_price: float | None
     risk_approved: bool
     preflight_ready: bool

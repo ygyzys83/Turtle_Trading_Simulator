@@ -33,6 +33,7 @@ class AutomationControl:
     stale_limit_order_minutes: int = 60
     refresh_seconds: int = 15
     symbol: str = "AAPL"
+    asset_class: str = "equity"
     price_data_source: str = "Ticker (Alpaca)"
     history: str = "1y"
     interval: str = "1h"
