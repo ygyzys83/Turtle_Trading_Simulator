@@ -148,6 +148,11 @@ class IntervalOptimizationResult:
     selection_score: float
     evidence_status: str
     comparison_history: str = "Latest 2 years"
+    comparison_return_percent: float = 0.0
+    comparison_benchmark_return_percent: float = 0.0
+    comparison_excess_return_percent: float = 0.0
+    comparison_max_drawdown_percent: float = 0.0
+    comparison_trades: int = 0
     durability_return_percent: float = 0.0
     durability_benchmark_return_percent: float = 0.0
     durability_excess_return_percent: float = 0.0
@@ -569,7 +574,34 @@ def optimize_strategy_intervals(
         durability_benchmark = 0.0
         durability_drawdown = 0.0
         durability_trades = 0
+        comparison_return = 0.0
+        comparison_benchmark = 0.0
+        comparison_drawdown = 0.0
+        comparison_trades = 0
         if candidate is not None:
+            comparison_result = _run_one(
+                candidate.strategy_type,
+                comparison_data,
+                candidate.settings,
+                account_equity,
+                risk_limits,
+            )
+            comparison_stats = _closed_trade_stats(
+                account_equity,
+                list(comparison_result["trade_log"]),
+                len(comparison_data),
+                risk_limits,
+                elapsed_years(comparison_data.index),
+            )
+            comparison_hold = buy_and_hold_benchmark(
+                comparison_data,
+                account_equity,
+                allocated_capital=ticker_allocated_capital(account_equity, risk_limits),
+            )
+            comparison_return = float(comparison_stats["allocated_return_pct"])
+            comparison_benchmark = comparison_hold.return_percent
+            comparison_drawdown = float(comparison_stats["allocated_max_drawdown_pct"])
+            comparison_trades = int(comparison_stats["total_trades"])
             durability_result = _run_one(
                 candidate.strategy_type,
                 market_data,
@@ -600,6 +632,11 @@ def optimize_strategy_intervals(
             selection_score=round(selection_score, 2),
             evidence_status=recommendation_evidence_status(result),
             comparison_history=shared_label,
+            comparison_return_percent=round(comparison_return, 2),
+            comparison_benchmark_return_percent=round(comparison_benchmark, 2),
+            comparison_excess_return_percent=round(comparison_return - comparison_benchmark, 2),
+            comparison_max_drawdown_percent=round(comparison_drawdown, 2),
+            comparison_trades=comparison_trades,
             durability_return_percent=round(durability_return, 2),
             durability_benchmark_return_percent=round(durability_benchmark, 2),
             durability_excess_return_percent=round(durability_return - durability_benchmark, 2),
@@ -614,11 +651,20 @@ def optimize_strategy_intervals(
     )
     best_row = interval_rows[0]
     best = best_row.recommendation.best
+    locked = best_row.recommendation.robustness.locked_test if best_row.recommendation.robustness else None
+    qualification_text = (
+        "Qualified paper-test candidate."
+        if best_row.evidence_status == "Ready for paper test"
+        else "No interval qualified for paper testing; this is only the strongest research candidate."
+    )
     summary = (
-        f"Best comparable interval: {best_row.interval}, based on the same latest "
-        f"{shared_label.lower()} used for every interval. "
-        f"Its unchanged settings were also checked on {best_row.history} of available history. "
-        f"{best_row.recommendation.summary}"
+        f"{qualification_text} Candidate: {best_row.interval} / {best.strategy_label}. "
+        f"Across the complete {shared_label.lower()} comparison, its unchanged settings returned "
+        f"{best_row.comparison_return_percent:.2f}% versus {best_row.comparison_benchmark_return_percent:.2f}% "
+        f"for buy-and-hold ({best_row.comparison_excess_return_percent:+.2f}% excess). "
+        f"The middle validation period was {best.excess_return_percent:+.2f}% versus buy-and-hold; "
+        f"the untouched final period was {locked.excess_return_percent:+.2f}% versus buy-and-hold. "
+        f"Status: {best_row.evidence_status}."
         if best is not None
         else "No interval produced enough evidence to recommend settings."
     )
@@ -734,7 +780,7 @@ def optimizer_summary(candidate: OptimizerCandidate | None) -> str:
     return (
         f"Best current fit: {candidate.strategy_label}. "
         f"Suggested settings: {_settings_text(candidate.settings)}. "
-        f"Newer-data allocated return was {candidate.test_return_percent:.2f}% with a "
+        f"Middle validation-period allocated return was {candidate.test_return_percent:.2f}% with a "
         f"{candidate.test_max_drawdown_percent:.2f}% allocated-capital worst drop and "
         f"{candidate.excess_return_percent:+.2f}% versus buy-and-hold. Confidence: {candidate.confidence}."
     )
@@ -771,11 +817,11 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
         {"Item": "Best strategy", "Value": candidate.strategy_label, "Plain English": candidate.reason},
         {"Item": "Suggested settings", "Value": _settings_text(settings), "Plain English": "The single setting combination to paper test first."},
         {"Item": "Ticker allocation", "Value": f"${candidate.allocated_capital:,.2f}", "Plain English": "Stable capital budget set by Max symbol concentration."},
-        {"Item": "Newer-data allocated return", "Value": f"{candidate.test_return_percent:.2f}%", "Plain English": f"Account impact was {candidate.test_account_return_percent:.2f}%."},
+        {"Item": "Middle validation-period return", "Value": f"{candidate.test_return_percent:.2f}%", "Plain English": f"This is only the middle validation slice, not the complete backtest. Account impact was {candidate.test_account_return_percent:.2f}%."},
         {
             "Item": "Annualized allocated return",
             "Value": _annualized_text(candidate.test_annualized_return_percent),
-            "Plain English": "Shown only when this test period is longer than one year.",
+            "Plain English": "Shown only when the middle validation period is longer than one year.",
         },
         {
             "Item": "RSI entry rule",
@@ -783,11 +829,11 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
             "Plain English": "The search tested the same strategy settings with this rule both off and on.",
         },
         {"Item": "Strong nearby range", "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}), "Plain English": "Nearby profitable settings. A useful result should not depend on one exact number."},
-        {"Item": "Buy-and-hold comparison", "Value": benchmark_read, "Plain English": f"Newer-data advantage {candidate.excess_return_percent:+.2f}%; locked-period advantage {locked.excess_return_percent:+.2f}%" if locked else "Locked-period comparison is unavailable."},
+        {"Item": "Validation and final-period comparison", "Value": benchmark_read, "Plain English": f"Middle validation advantage {candidate.excess_return_percent:+.2f}%; untouched final-period advantage {locked.excess_return_percent:+.2f}%" if locked else "Untouched final-period comparison is unavailable."},
         {
             "Item": "Annualized buy-and-hold return",
             "Value": _annualized_text(candidate.benchmark_annualized_return_percent),
-            "Plain English": "Equal-capital buy-and-hold over the newer-data period.",
+            "Plain English": "Equal-capital buy-and-hold over the middle validation period.",
         },
         {
             "Item": "Annualized excess return",
@@ -849,13 +895,13 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Pullback Average": candidate.settings["pullback_average_length"],
             "Momentum Turn": candidate.settings["momentum_turn_length"],
             "RSI Entry Rule": "On" if candidate.settings.get("rsi_entry_filter_enabled", False) else "Off",
-            "Newer Allocated Return %": candidate.test_return_percent,
-            "Newer Account Return %": candidate.test_account_return_percent,
+            "Middle Validation Return %": candidate.test_return_percent,
+            "Middle Validation Account Return %": candidate.test_account_return_percent,
             "Annualized Allocated Return %": candidate.test_annualized_return_percent,
             "Equal-Capital Buy and Hold %": candidate.benchmark_return_percent,
             "Annualized Buy and Hold %": candidate.benchmark_annualized_return_percent,
             "Excess Return %": candidate.excess_return_percent,
-            "Newer Trades": candidate.test_trades,
+            "Middle Validation Trades": candidate.test_trades,
             "Profit Factor": candidate.test_profit_factor,
             "Allocated Worst Drop %": candidate.test_max_drawdown_percent,
             "Profitable Periods": f"{candidate.profitable_test_periods}/{candidate.tested_periods}",
@@ -884,6 +930,9 @@ def optimizer_interval_records(result: MultiIntervalRecommendation) -> list[dict
             "Locked Excess %": locked.excess_return_percent if locked else 0.0,
             "Comparable Worst Drop %": candidate.test_max_drawdown_percent if candidate else 0.0,
             "Confidence": candidate.confidence if candidate else "Low",
+            "Complete Shared-Period Return %": interval_result.comparison_return_percent,
+            "Complete Shared-Period Buy and Hold %": interval_result.comparison_benchmark_return_percent,
+            "Complete Shared-Period Excess %": interval_result.comparison_excess_return_percent,
             "Long-History Check": interval_result.history,
             "Long-History Return %": interval_result.durability_return_percent,
             "Long-History Buy and Hold %": interval_result.durability_benchmark_return_percent,
@@ -1081,7 +1130,7 @@ def _evaluate_optimizer_candidate(
     confidence = _optimizer_confidence(score, test_trades, drawdown, return_pct, profitable_periods, tested_periods)
     concern = _optimizer_concern(test_trades, drawdown, return_pct, train_return, min_test_trades)
     reason = (
-        f"Newer-data allocated return {return_pct:.2f}%, {test_trades} trades, "
+        f"Middle validation-period allocated return {return_pct:.2f}%, {test_trades} trades, "
         f"profit factor {profit_factor:.2f}, allocated worst drop {drawdown:.2f}%, "
         f"profitable in {profitable_periods}/{tested_periods} newer periods, "
         f"{excess_return:+.2f}% versus buy-and-hold."

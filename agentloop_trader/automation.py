@@ -99,8 +99,10 @@ def strategy_settings_match_reason(current: dict | None, entry: dict | None) -> 
 
 
 def active_automation_level(selected_level: str, full_automation_enabled: bool, kill_switch_enabled: bool) -> str:
-    if selected_level == "Auto entries and exits" and (not full_automation_enabled or kill_switch_enabled):
+    if selected_level == "Auto entries and exits" and kill_switch_enabled:
         return "Manual review only"
+    if selected_level == "Auto entries and exits" and not full_automation_enabled:
+        return "Auto exits only"
     return selected_level
 
 

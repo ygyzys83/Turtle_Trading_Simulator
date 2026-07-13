@@ -33,7 +33,8 @@ from agentloop_trader.brokers import (
     build_alpaca_cancel_preview,
     build_alpaca_order_preview,
 )
-from agentloop_trader.market_data import fetch_price_bars
+from agentloop_trader.buy_watchlist import BuyWatchPlan, BuyWatchlistStore
+from agentloop_trader.market_data import fetch_alpaca_latest_trades, fetch_price_bars
 from agentloop_trader.models import AuditEvent, ExecutionDecision, PACIFIC_TIME, RiskCheckResult, RiskLimits
 from agentloop_trader.risk import check_trade_intent, constrain_trade_intent_to_limits
 from agentloop_trader.strategy_runtime import (
@@ -44,6 +45,10 @@ from agentloop_trader.strategy_runtime import (
     saved_exit_settings_for_symbol,
     update_exit_settings_for_symbol,
 )
+
+
+_BAR_CACHE: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
+_BAR_CACHE_SECONDS = {"1m": 30, "5m": 60, "15m": 120, "30m": 180, "1h": 300, "4h": 900, "1d": 1800}
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -150,7 +155,15 @@ def _track_broker_order(order: Any, preview_hash: str, strategy_settings: dict[s
 
 def _fetcher(control: AutomationControl, config: AlpacaConfig) -> Callable[[str, str, str, str], Any]:
     def fetch(symbol: str, history: str, interval: str, source: str):
-        return fetch_price_bars(symbol, history, interval, source, config.api_key, config.api_secret)
+        key = (symbol.strip().upper(), history, interval, source)
+        cached = _BAR_CACHE.get(key)
+        now = time.monotonic()
+        if cached and now - cached[0] < _BAR_CACHE_SECONDS.get(interval, 300):
+            data = cached[1]
+            return data.copy() if hasattr(data, "copy") else data
+        data = fetch_price_bars(symbol, history, interval, source, config.api_key, config.api_secret)
+        _BAR_CACHE[key] = (now, data)
+        return data.copy() if hasattr(data, "copy") else data
 
     return fetch
 
@@ -282,6 +295,9 @@ def _send_entry(
     tracked_orders: list[dict],
     fetch_bars: Callable[[str, str, str, str], Any],
     audit_store: JsonlAuditStore,
+    *,
+    latest_price: float | None = None,
+    require_latest_price: bool = False,
 ) -> tuple[int, list[dict], str]:
     if control.mode != "Auto entries and exits" or not control.full_automation_enabled:
         return 0, tracked_orders, "Auto entries are off."
@@ -308,7 +324,12 @@ def _send_entry(
     if intent is None:
         return 0, tracked_orders, "No BUY setup right now."
     data_attrs = getattr(data, "attrs", {})
-    intent = reprice_trade_intent(intent, _number(data_attrs.get("latest_price"), _number(intent.entry_price if intent else 0)))
+    pricing_price = _number(latest_price, 0.0)
+    if require_latest_price and pricing_price <= 0:
+        return 0, tracked_orders, "Latest Alpaca trade price is unavailable; queued BUY was not submitted."
+    if pricing_price <= 0:
+        pricing_price = _number(data_attrs.get("latest_price"), _number(intent.entry_price if intent else 0))
+    intent = reprice_trade_intent(intent, pricing_price)
     intent = apply_buy_order_style(intent, control.order_style, control.limit_adjustment_pct, control.custom_limit_price)
     if not market_open and intent is not None and intent.order_type != "limit":
         return 0, tracked_orders, "Outside-hours auto buys must be limit orders."
@@ -366,6 +387,127 @@ def _send_entry(
     return 1, tracked_orders, f"Sent paper buy for {intent.quantity} {intent.symbol_clean}."
 
 
+def _control_for_watch_plan(control: AutomationControl, plan: BuyWatchPlan) -> AutomationControl:
+    saved_risk_limits = dict(plan.risk_limits)
+    saved_risk_limits["kill_switch_enabled"] = bool(control.kill_switch_enabled)
+    return replace(
+        control,
+        symbol=plan.symbol,
+        price_data_source=plan.price_data_source,
+        history=plan.history,
+        interval=plan.interval,
+        strategy_settings=dict(plan.strategy_settings),
+        risk_limits=saved_risk_limits,
+        order_style=plan.order_style,
+        limit_adjustment_pct=float(plan.limit_adjustment_pct),
+        custom_limit_price=float(plan.custom_limit_price),
+    )
+
+
+def _send_watchlist_entries(
+    control: AutomationControl,
+    adapter: AlpacaBrokerAdapterStub,
+    positions: list[dict],
+    orders: list[dict],
+    tracked_orders: list[dict],
+    fetch_bars: Callable[[str, str, str, str], Any],
+    audit_store: JsonlAuditStore,
+    store: BuyWatchlistStore,
+    latest_prices: dict[str, float] | None = None,
+    latest_price_error: str = "",
+    *,
+    max_to_send: int,
+) -> tuple[int, list[dict], str]:
+    plans = store.read()
+    enabled = [plan for plan in plans if plan.enabled]
+    if not enabled:
+        return 0, tracked_orders, "Buy watchlist has no enabled setups."
+    if control.mode != "Auto entries and exits" or not control.full_automation_enabled:
+        now = datetime.now(PACIFIC_TIME).isoformat()
+        for plan in enabled:
+            store.update(
+                plan.plan_id,
+                status="Paused",
+                detail="Select Auto entries and exits and check Enable Automation to monitor this setup.",
+                last_checked_at=now,
+            )
+        return 0, tracked_orders, "Buy watchlist is paused because automatic entries are off."
+
+    sent = 0
+    messages = []
+    current_positions = list(positions)
+    current_orders = list(orders)
+    tracked = list(tracked_orders)
+    for plan in enabled:
+        if sent >= max(0, max_to_send):
+            break
+        if plan.price_data_source != "Ticker (Alpaca)":
+            checked_at = datetime.now(PACIFIC_TIME).isoformat()
+            message = "Queued automatic buys require Ticker (Alpaca) for a current order price."
+            store.update(
+                plan.plan_id,
+                status="Blocked",
+                detail=message,
+                last_checked_at=checked_at,
+            )
+            messages.append(f"{plan.symbol} {plan.strategy_label}: {message}")
+            continue
+        if plan.symbol not in (latest_prices or {}):
+            checked_at = datetime.now(PACIFIC_TIME).isoformat()
+            message = (
+                f"Latest Alpaca trade request failed: {latest_price_error}"
+                if latest_price_error
+                else "Latest Alpaca trade price is unavailable; queued BUY was not submitted."
+            )
+            store.update(
+                plan.plan_id,
+                status="Blocked",
+                detail=message,
+                last_checked_at=checked_at,
+            )
+            messages.append(f"{plan.symbol} {plan.strategy_label}: {message}")
+            continue
+        plan_control = _control_for_watch_plan(control, plan)
+        count, tracked, message = _send_entry(
+            plan_control,
+            adapter,
+            current_positions,
+            current_orders,
+            tracked,
+            fetch_bars,
+            audit_store,
+            latest_price=(latest_prices or {}).get(plan.symbol),
+            require_latest_price=True,
+        )
+        checked_at = datetime.now(PACIFIC_TIME).isoformat()
+        if count:
+            sent += count
+            store.update(
+                plan.plan_id,
+                enabled=False,
+                status="Order sent",
+                detail=message,
+                last_checked_at=checked_at,
+                order_sent_at=checked_at,
+            )
+            current_positions = _strict_broker_records(adapter, "position_records")
+            current_orders = _strict_broker_records(adapter, "order_records")
+        else:
+            waiting = message == "No BUY setup right now."
+            store.update(
+                plan.plan_id,
+                status="Waiting for BUY" if waiting else "Blocked",
+                detail=(
+                    "The saved strategy's required BUY rules have not passed yet."
+                    if waiting
+                    else message
+                ),
+                last_checked_at=checked_at,
+            )
+        messages.append(f"{plan.symbol} {plan.strategy_label}: {message}")
+    return sent, tracked, " | ".join(messages)[:800]
+
+
 def run_once(
     control: AutomationControl,
     status: WorkerStatus | None = None,
@@ -398,7 +540,60 @@ def run_once(
         positions = _strict_broker_records(adapter, "position_records")
         orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
-        buy_count, tracked, buy_action = _send_entry(control, adapter, positions, orders, tracked, fetch_bars, audit_store)
+        watchlist_store = BuyWatchlistStore(control.buy_watchlist_path)
+        watchlist_plans = watchlist_store.read()
+        max_session_buys = max(1, int(_number(control.strategy_settings.get("max_auto_buys_per_session"), 3)))
+        remaining_buys = max(0, max_session_buys - previous.orders_sent)
+        if remaining_buys <= 0:
+            buy_count, buy_action = 0, f"Automatic buys reached the session limit of {max_session_buys}."
+        elif watchlist_plans:
+            latest_prices: dict[str, float] = {}
+            latest_price_error = ""
+            if control.mode == "Auto entries and exits" and control.full_automation_enabled:
+                try:
+                    latest_prices = fetch_alpaca_latest_trades(
+                        [plan.symbol for plan in watchlist_plans if plan.enabled and plan.price_data_source == "Ticker (Alpaca)"],
+                        adapter.config.api_key,
+                        adapter.config.api_secret,
+                    )
+                except Exception as exc:
+                    latest_price_error = str(exc)
+            buy_count, tracked, buy_action = _send_watchlist_entries(
+                control,
+                adapter,
+                positions,
+                orders,
+                tracked,
+                fetch_bars,
+                audit_store,
+                watchlist_store,
+                latest_prices=latest_prices,
+                latest_price_error=latest_price_error,
+                max_to_send=remaining_buys,
+            )
+        else:
+            latest_price = None
+            require_latest_price = control.price_data_source == "Ticker (Alpaca)"
+            if require_latest_price and control.mode == "Auto entries and exits" and control.full_automation_enabled:
+                try:
+                    latest_price = fetch_alpaca_latest_trades(
+                        [control.symbol],
+                        adapter.config.api_key,
+                        adapter.config.api_secret,
+                    ).get(control.symbol.strip().upper())
+                except Exception:
+                    latest_price = None
+            buy_count, tracked, buy_action = _send_entry(
+                control,
+                adapter,
+                positions,
+                orders,
+                tracked,
+                fetch_bars,
+                audit_store,
+                latest_price=latest_price,
+                require_latest_price=require_latest_price,
+            )
         broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
 
         actions = [text for text in (cancel_action, exit_action, buy_action) if text]

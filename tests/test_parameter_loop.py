@@ -246,7 +246,7 @@ def test_optimizer_reports_newer_and_locked_results_against_buy_and_hold():
         2,
     )
     record_names = {row["Item"] for row in optimizer_recommendation_records(result)}
-    assert {"Recommendation status", "Buy-and-hold comparison", "RSI entry rule", "Next step"} <= record_names
+    assert {"Recommendation status", "Validation and final-period comparison", "RSI entry rule", "Next step"} <= record_names
     assert recommendation_evidence_status(result) in {"Research only", "Ready for paper test"}
 
 
@@ -306,4 +306,11 @@ def test_interval_optimizer_uses_one_shared_calendar_period_and_long_history_che
 
     assert len({row.comparison_history for row in result.interval_results}) == 1
     assert all(row.durability_trades >= 0 for row in result.interval_results)
-    assert "same latest" in result.summary.lower()
+    assert all(
+        row.comparison_excess_return_percent
+        == round(row.comparison_return_percent - row.comparison_benchmark_return_percent, 2)
+        for row in result.interval_results
+    )
+    assert "complete latest" in result.summary.lower()
+    assert "middle validation period" in result.summary.lower()
+    assert "untouched final period" in result.summary.lower()

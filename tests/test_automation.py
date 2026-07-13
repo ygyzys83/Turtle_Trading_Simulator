@@ -238,8 +238,8 @@ def test_auto_entry_decision_waits_without_buy_setup():
     assert "No buy setup right now." in decision.reasons
 
 
-def test_active_automation_level_requires_enable_checkbox_for_full_auto():
-    assert active_automation_level("Auto entries and exits", False, False) == "Manual review only"
+def test_active_automation_level_buy_permission_does_not_disable_auto_exits():
+    assert active_automation_level("Auto entries and exits", False, False) == "Auto exits only"
     assert active_automation_level("Auto entries and exits", True, False) == "Auto entries and exits"
     assert active_automation_level("Auto entries and exits", True, True) == "Manual review only"
     assert active_automation_level("Auto exits only", False, True) == "Auto exits only"

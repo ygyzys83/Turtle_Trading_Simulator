@@ -113,3 +113,22 @@ def test_strategy_decision_sections_have_plain_language_helpers():
     assert "It answers which of those four exact strategies fits the ticker now; it does not search for better settings." in text
     assert "This table does not search for better settings" in text
     assert "Use this as the strongest candidate for paper testing" in text
+
+
+def test_buy_watchlist_readiness_distinguishes_worker_state_from_market_hours():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert "The Streamlit page timer does not monitor queued setups." in text
+    assert "Only the background worker monitors the durable Buy watchlist." in text
+    assert 'allow_limit_buys_outside_market_hours\n    and paper_buy_order_style != "Market"' in text
+
+
+def test_sidebar_automation_controls_state_their_exact_scope():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert '"Allow automatic paper buys"' in text
+    assert '"Use Alpaca paper account"' not in text
+    assert 'enable_alpaca_paper_orders = bool(execution_mode == "paper" and alpaca_config.paper)' in text
+    assert "It does not control automatic exits." in text
+    assert "Only the open Streamlit page can check the loaded ticker and exits; the Buy watchlist is paused." in text
+    assert "Monitoring continues if Streamlit closes; the Buy watchlist is active." in text

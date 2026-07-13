@@ -24,6 +24,8 @@ A governed trading simulator, paper-trading console, and research lab for testin
 - Adds a ticker Ideas page that scans a watchlist, ranks current setup quality, and creates a concise research read.
 - Adds optional deterministic, Ollama, or Gemini research summaries. The LLM cannot send orders or override deterministic risk rules.
 - Adds an optional paper-only background worker for automation checks outside the Streamlit page refresh.
+- Adds a durable Buy watchlist capped at 10 independent setups. Each row saves its ticker, interval, strategy, inputs, risk limits, and order instructions; the worker records whether it is waiting, blocked, paused, or sent and disables it after submission.
+- Queued BUY signals use cached completed bars, while one lightweight batched Alpaca latest-trades request supplies current IEX prices for order repricing and sizing on each worker cycle. A missing latest price blocks submission rather than falling back to stale history.
 - Includes a selectable trade log that highlights entries and exits on the chart.
 
 ## Product Direction
@@ -142,9 +144,9 @@ streamlit run turtle_trading.py
 
 The app will open in your browser. Use the sidebar controls to switch between synthetic data and stock data, adjust the strategy windows, risk settings, and ATR stop multiplier.
 
-Optional paper automation worker:
+Paper automation:
 
-Use the `Start Worker` and `Stop Worker` buttons at the top of the Streamlit sidebar, directly under the Kill Switch. The worker is paper-only. It uses the same saved control file, risk limits, Alpaca paper account, and broker-state file as the Streamlit app.
+Selecting `Paper trading - send orders to Alpaca paper` automatically uses the configured Alpaca paper account; there is no second account checkbox. With Streamlit open, the page can check the loaded ticker and saved exits on its refresh timer. Use `Start Worker` when monitoring must continue after Streamlit closes or when the durable Buy watchlist should be active. `Allow automatic paper buys` appears only for `Auto entries and exits`; it does not control automatic exits. The worker is paper-only and uses the same saved controls, risk limits, Alpaca paper account, and broker-state file as Streamlit.
 
 You can still start it manually for debugging:
 

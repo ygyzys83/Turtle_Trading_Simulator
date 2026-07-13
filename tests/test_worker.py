@@ -1,9 +1,10 @@
 from types import SimpleNamespace
 
 from agentloop_trader.automation_runtime import AutomationControl, WorkerStatus
+from agentloop_trader.buy_watchlist import BuyWatchPlan, BuyWatchlistStore, buy_watch_plan_id
 from agentloop_trader.brokers import AlpacaConfig
 from agentloop_trader.models import TradeIntent
-from agentloop_trader.worker import _open_buy_order_notional, _send_entry, _send_exits, _stop_requested_during_wait, run_once
+from agentloop_trader.worker import _BAR_CACHE, _fetcher, _open_buy_order_notional, _send_entry, _send_exits, _send_watchlist_entries, _stop_requested_during_wait, run_once
 
 
 def test_worker_disabled_only_records_heartbeat():
@@ -74,7 +75,7 @@ def test_worker_sizes_strategy_from_alpaca_equity_not_saved_simulator_value(monk
         paper_orders_enabled=True, account_size=50_000, symbol="AAPL",
     )
     adapter = SimpleNamespace(
-        config=SimpleNamespace(paper=True),
+        config=AlpacaConfig(api_key="key", api_secret="secret", paper=True),
         account_records=lambda: [
             {"Field": "Portfolio Value", "Value": "100000"},
             {"Field": "Cash", "Value": "90000"},
@@ -137,3 +138,135 @@ def test_worker_counts_only_unfilled_open_buy_order_notional():
 
     assert _open_buy_order_notional(orders) == 1600
     assert _open_buy_order_notional(orders, "AAPL") == 600
+
+
+def test_worker_updates_watchlist_status_when_buy_rules_are_waiting(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("TSLA", "4h", "Breakout continuation"),
+        symbol="TSLA",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Breakout continuation",
+    )
+    store.upsert(plan)
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (0, args[4], "No BUY setup right now."),
+    )
+
+    sent, _, _ = _send_watchlist_entries(
+        AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
+        SimpleNamespace(),
+        [],
+        [],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+        latest_prices={"TSLA": 250.0},
+        max_to_send=1,
+    )
+
+    updated = store.read()[0]
+    assert sent == 0
+    assert updated.enabled is True
+    assert updated.status == "Waiting for BUY"
+
+
+def test_worker_disables_watchlist_setup_after_order_is_sent(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("TSLA", "4h", "Trend pullback continuation"),
+        symbol="TSLA",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+    )
+    store.upsert(plan)
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (1, args[4], "Sent paper buy for 5 TSLA."),
+    )
+    adapter = SimpleNamespace(position_records=lambda **kwargs: [], order_records=lambda **kwargs: [])
+
+    sent, _, _ = _send_watchlist_entries(
+        AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
+        adapter,
+        [],
+        [],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+        latest_prices={"TSLA": 250.0},
+        max_to_send=1,
+    )
+
+    updated = store.read()[0]
+    assert sent == 1
+    assert updated.enabled is False
+    assert updated.status == "Order sent"
+
+
+def test_worker_reuses_recent_price_history_for_queued_setups(monkeypatch):
+    calls = []
+    data = SimpleNamespace(copy=lambda: "copied-bars")
+    monkeypatch.setattr(
+        "agentloop_trader.worker.fetch_price_bars",
+        lambda *args: calls.append(args) or data,
+    )
+    _BAR_CACHE.clear()
+    fetch = _fetcher(AutomationControl(), AlpacaConfig(api_key="key", api_secret="secret", paper=True))
+
+    first = fetch("TSLA", "2y", "1h", "Ticker (Alpaca)")
+    second = fetch("TSLA", "2y", "1h", "Ticker (Alpaca)")
+
+    assert first == "copied-bars"
+    assert second == "copied-bars"
+    assert len(calls) == 1
+
+
+def test_worker_reprices_queued_buy_with_latest_trade(monkeypatch):
+    captured = {}
+    control = AutomationControl(
+        mode="Auto entries and exits",
+        full_automation_enabled=True,
+        paper_orders_enabled=True,
+        symbol="TSLA",
+    )
+    adapter = SimpleNamespace(
+        config=AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        account_records=lambda: [
+            {"Field": "Portfolio Value", "Value": "100000"},
+            {"Field": "Cash", "Value": "100000"},
+            {"Field": "Last Equity", "Value": "100000"},
+        ],
+    )
+    intent = TradeIntent(symbol="TSLA", side="buy", quantity=1, entry_price=200, stop_loss=190)
+    monkeypatch.setattr("agentloop_trader.worker.market_session_advisory", lambda: {"Open": True})
+    monkeypatch.setattr(
+        "agentloop_trader.worker.selected_strategy_result",
+        lambda *args, **kwargs: {"live": {"trade_intent": intent}},
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker.reprice_trade_intent",
+        lambda trade_intent, price: captured.update(price=price) or trade_intent,
+    )
+    monkeypatch.setattr("agentloop_trader.worker.constrain_trade_intent_to_limits", lambda *args, **kwargs: None)
+
+    _send_entry(
+        control,
+        adapter,
+        [],
+        [],
+        [],
+        lambda *_: SimpleNamespace(attrs={"latest_price": 201}),
+        SimpleNamespace(append=lambda event: None),
+        latest_price=225.50,
+        require_latest_price=True,
+    )
+
+    assert captured["price"] == 225.50

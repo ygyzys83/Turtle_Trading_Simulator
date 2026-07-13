@@ -193,6 +193,44 @@ def fetch_alpaca_bars(
     )
 
 
+def fetch_alpaca_latest_trades(
+    symbols: list[str] | tuple[str, ...],
+    api_key: str | None,
+    api_secret: str | None,
+    *,
+    feed: str = "iex",
+    timeout: int = 10,
+) -> dict[str, float]:
+    """Return the latest eligible Alpaca trade price for each requested stock."""
+    clean_symbols = tuple(dict.fromkeys(str(symbol).strip().upper() for symbol in symbols if str(symbol).strip()))
+    if not clean_symbols:
+        return {}
+    if not api_key or not api_secret:
+        raise RuntimeError("Alpaca API key and secret are required for latest stock prices.")
+    params = {"symbols": ",".join(clean_symbols), "feed": feed}
+    request = Request(
+        f"{ALPACA_DATA_BASE_URL}/v2/stocks/trades/latest?{urlencode(params)}",
+        headers={
+            "APCA-API-KEY-ID": api_key,
+            "APCA-API-SECRET-KEY": api_secret,
+            "Accept": "application/json",
+        },
+    )
+    with urlopen(request, timeout=timeout) as response:
+        payload = json.loads(response.read().decode("utf-8"))
+    trades = payload.get("trades", {}) if isinstance(payload, dict) else {}
+    prices: dict[str, float] = {}
+    for symbol in clean_symbols:
+        trade = trades.get(symbol, {}) if isinstance(trades, dict) else {}
+        try:
+            price = float(trade.get("p"))
+        except (TypeError, ValueError):
+            continue
+        if price > 0:
+            prices[symbol] = price
+    return prices
+
+
 def fetch_yfinance_bars(symbol: str, period: str, interval: str) -> pd.DataFrame:
     try:
         import yfinance as yf

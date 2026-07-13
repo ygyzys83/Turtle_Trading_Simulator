@@ -4,7 +4,7 @@ import json
 import pandas as pd
 import pytest
 
-from agentloop_trader.market_data import NewsItem, alpaca_timeframe, build_company_research_context, completed_price_bars, fetch_alpaca_bars, period_start_time, validate_price_bars
+from agentloop_trader.market_data import NewsItem, alpaca_timeframe, build_company_research_context, completed_price_bars, fetch_alpaca_bars, fetch_alpaca_latest_trades, period_start_time, validate_price_bars
 
 
 def test_alpaca_timeframe_maps_intraday_intervals():
@@ -110,3 +110,30 @@ def test_alpaca_history_fetch_continues_past_twenty_pages(monkeypatch):
 
     assert len(calls) == 21
     assert len(result) == 21
+
+
+def test_alpaca_latest_trades_batches_symbols_and_ignores_invalid_prices(monkeypatch):
+    captured = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self):
+            return json.dumps({"trades": {"AAPL": {"p": 215.25}, "TSLA": {"p": None}}}).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        return FakeResponse()
+
+    monkeypatch.setattr("agentloop_trader.market_data.urlopen", fake_urlopen)
+
+    prices = fetch_alpaca_latest_trades(["aapl", "TSLA", "AAPL"], "key", "secret")
+
+    assert prices == {"AAPL": 215.25}
+    assert "symbols=AAPL%2CTSLA" in captured["url"]
+    assert "feed=iex" in captured["url"]

@@ -13,7 +13,14 @@ from agentloop_trader.automation_runtime import (
 def test_control_store_roundtrips_settings(tmp_path):
     path = tmp_path / "control.json"
     store = AutomationControlStore(path)
-    control = AutomationControl(enabled=True, stop_requested=True, mode="Auto exits only", symbol="AAPL", refresh_seconds=30)
+    control = AutomationControl(
+        enabled=True,
+        stop_requested=True,
+        mode="Auto exits only",
+        symbol="AAPL",
+        refresh_seconds=30,
+        buy_watchlist_path="custom-watchlist.json",
+    )
 
     store.write(control)
     loaded = store.read()
@@ -23,6 +30,7 @@ def test_control_store_roundtrips_settings(tmp_path):
     assert loaded.stop_requested is True
     assert loaded.symbol == "AAPL"
     assert loaded.refresh_seconds == 30
+    assert loaded.buy_watchlist_path == "custom-watchlist.json"
 
 
 def test_status_store_roundtrips_heartbeat(tmp_path):

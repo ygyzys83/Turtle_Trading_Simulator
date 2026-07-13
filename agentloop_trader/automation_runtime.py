@@ -42,6 +42,7 @@ class AutomationControl:
     account_size: float = 100000.0
     broker_state_path: str = "broker_state/alpaca_paper_orders.json"
     audit_log_path: str = "audit_logs/session_audit.jsonl"
+    buy_watchlist_path: str = "automation_logs/buy_watchlist.json"
     created_at: str = ""
 
 

@@ -57,6 +57,14 @@ from agentloop_trader.brokers import (
     build_alpaca_order_preview,
     broker_status_records,
 )
+from agentloop_trader.buy_watchlist import (
+    MAX_BUY_WATCHLIST_ITEMS,
+    BuyWatchPlan,
+    BuyWatchlistStore,
+    buy_watch_plan_id,
+    buy_watch_plan_detail_records,
+    buy_watchlist_records,
+)
 from agentloop_trader.display import dataframe_for_streamlit
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
@@ -491,7 +499,7 @@ def stale_limit_cancel_blockers(orders: list[dict], max_age_minutes: int) -> lis
     if execution_mode != "paper":
         blockers.append("Order mode is not Paper trading.")
     if not enable_alpaca_paper_orders:
-        blockers.append("Use Alpaca paper account is off.")
+        blockers.append("Alpaca is not configured for paper trading.")
     if not alpaca_status.connected:
         blockers.append("Alpaca is not connected.")
     if not alpaca_status.can_submit_orders:
@@ -805,6 +813,41 @@ def automation_status_text() -> tuple[str, str, str]:
 
 
 def daily_automation_readiness_records(context: str) -> list[dict]:
+    queued_plans = buy_watchlist_store.read() if context == "New trade" and "buy_watchlist_store" in globals() else []
+    if queued_plans:
+        enabled_plans = [plan for plan in queued_plans if plan.enabled]
+        status_counts: dict[str, int] = {}
+        for plan in enabled_plans:
+            status_counts[plan.status] = status_counts.get(plan.status, 0) + 1
+        if effective_kill_switch:
+            read = "Blocked"
+            detail = "Kill Switch is on. No queued paper orders can be sent."
+        elif active_automation_level != "Auto entries and exits" or not full_automation_enabled:
+            read = "Paused"
+            detail = "Select Auto entries and exits and check Allow automatic paper buys."
+        elif execution_mode != "paper" or not enable_alpaca_paper_orders:
+            read = "Paused"
+            detail = "Select Paper trading. That order mode automatically uses Alpaca paper."
+        elif not sidebar_worker_active:
+            read = "Worker stopped"
+            detail = "Click Start Worker. The Streamlit page timer does not monitor queued setups."
+        elif not enabled_plans:
+            read = "No enabled setups"
+            detail = "Resume a saved setup or add a new one."
+        elif status_counts.get("Blocked"):
+            read = "Blocked"
+            detail = f"{status_counts['Blocked']} queued setup(s) are blocked. Review the Buy watchlist status and saved details."
+        else:
+            read = "Watching queue"
+            detail = f"The worker is monitoring {len(enabled_plans)} enabled setup(s) for completed BUY rules."
+        status_summary = ", ".join(f"{count} {status.lower()}" for status, count in status_counts.items()) or "No enabled setups"
+        return [
+            {"Area": "Buy watchlist", "Read": read, "Plain English": detail},
+            {"Area": "Queued setups", "Read": f"{len(enabled_plans)} enabled / {len(queued_plans)} saved", "Plain English": status_summary},
+            {"Area": "Automation mode", "Read": automation_level_label, "Plain English": "Queued entries require Auto entries and exits with Allow automatic paper buys checked."},
+            {"Area": "Background worker", "Read": "Running" if sidebar_worker_active else "Stopped", "Plain English": "Only the background worker monitors the durable Buy watchlist."},
+            {"Area": "Last worker check", "Read": automation_worker_status.last_checked_at or "Not checked yet", "Plain English": automation_worker_status.last_action or "No worker action yet."},
+        ]
     if effective_kill_switch:
         read = "Blocked"
         detail = "Kill Switch is on. No paper orders can be sent."
@@ -1453,6 +1496,46 @@ kill_switch = st.sidebar.checkbox(
     value=False,
     help="Immediate hard stop. When this is on, the app blocks new paper orders and automation actions.",
 )
+automation_level_options = {
+    "Manual - I click paper orders": "Manual review only",
+    "Auto exits - app sells paper positions": "Auto exits only",
+    "Auto entries and exits - app trades paper": "Auto entries and exits",
+}
+st.sidebar.markdown("### :material/smart_toy: Background Automation")
+automation_level_label = st.sidebar.selectbox(
+    "Automation",
+    list(automation_level_options.keys()),
+    index=0,
+    help=(
+        "Manual means the app never sends an automatic order. Auto exits lets the open Streamlit page or the Background Worker sell paper positions from their saved exit plans. "
+        "Auto entries and exits also permits automatic paper buys for the loaded ticker; the Buy watchlist is monitored only by the Background Worker."
+    ),
+)
+automation_level = automation_level_options[automation_level_label]
+if kill_switch:
+    st.session_state["enable_full_paper_automation"] = False
+full_automation_enabled = False
+if automation_level == "Auto entries and exits":
+    full_automation_enabled = st.sidebar.checkbox(
+        "Allow automatic paper buys",
+        value=bool(st.session_state.get("enable_full_paper_automation", False)),
+        key="enable_full_paper_automation",
+        disabled=kill_switch,
+        help=(
+            "Required before the app may send an automatic BUY to Alpaca paper. It does not control automatic exits. "
+            "The Kill Switch turns this permission off."
+        ),
+    )
+    full_automation_enabled = bool(full_automation_enabled and not kill_switch)
+    if not full_automation_enabled:
+        st.sidebar.caption("Automatic paper buys are not allowed.")
+
+active_automation_level = resolve_active_automation_level(
+    automation_level,
+    full_automation_enabled=full_automation_enabled,
+    kill_switch_enabled=kill_switch,
+)
+
 sidebar_worker_status_store = WorkerStatusStore()
 sidebar_worker_status = sidebar_worker_status_store.read()
 sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
@@ -1465,16 +1548,28 @@ if not sidebar_worker_active:
     st.session_state["worker_stop_pending"] = False
 if kill_switch:
     st.session_state["background_worker_enabled"] = False
-st.sidebar.markdown("### :material/smart_toy: Background Automation")
 worker_status_text = "Running" if sidebar_worker_active else "Stopped"
-st.sidebar.caption(f"Worker: {worker_status_text}. {sidebar_worker_status.last_action or 'No recent action.'}")
+worker_behavior_text = (
+    "Monitoring continues if Streamlit closes; the Buy watchlist is active."
+    if sidebar_worker_active
+    else "Only the open Streamlit page can check the loaded ticker and exits; the Buy watchlist is paused."
+)
+st.sidebar.caption(f"Worker: {worker_status_text}. {worker_behavior_text}")
 worker_control_cols = st.sidebar.columns(2)
-if worker_control_cols[0].button("Start Worker", disabled=kill_switch or sidebar_worker_active):
+if worker_control_cols[0].button(
+    "Start Worker",
+    disabled=kill_switch or sidebar_worker_active,
+    help="Start background monitoring so saved exits and the Buy watchlist continue when Streamlit is closed.",
+):
     st.session_state["background_worker_enabled"] = True
     st.session_state["worker_stop_pending"] = False
     st.session_state["start_background_worker_requested"] = True
     st.session_state["stop_background_worker_requested"] = False
-if worker_control_cols[1].button("Stop Worker", disabled=not sidebar_worker_active):
+if worker_control_cols[1].button(
+    "Stop Worker",
+    disabled=not sidebar_worker_active,
+    help="Stop background monitoring. The open Streamlit page can still check the loaded ticker and saved exits.",
+):
     st.session_state["background_worker_enabled"] = False
     st.session_state["worker_stop_pending"] = True
     st.session_state["stop_background_worker_requested"] = True
@@ -1500,39 +1595,6 @@ workspace_mode = st.sidebar.radio(
 )
 show_portfolio_evidence = workspace_mode == "Full Records and Evidence *"
 
-automation_level_options = {
-    "Manual - I click paper orders": "Manual review only",
-    "Auto exits - app sells paper positions": "Auto exits only",
-    "Auto entries and exits - app trades paper": "Auto entries and exits",
-}
-automation_level_label = st.sidebar.selectbox(
-    "Automation",
-    list(automation_level_options.keys()),
-    index=0,
-    help="Manual means you click paper order buttons. Auto exits lets the app sell open paper positions using their saved exit settings. Auto entries and exits lets the app buy and sell the currently loaded ticker in paper mode.",
-)
-automation_level = automation_level_options[automation_level_label]
-if kill_switch:
-    st.session_state["enable_full_paper_automation"] = False
-full_automation_enabled = False
-if automation_level == "Auto entries and exits":
-    full_automation_enabled = st.sidebar.checkbox(
-        "Enable Automation",
-        value=bool(st.session_state.get("enable_full_paper_automation", False)),
-        key="enable_full_paper_automation",
-        disabled=kill_switch,
-        help="Required before the app can automatically buy in Alpaca paper. The Kill Switch turns this off.",
-    )
-    full_automation_enabled = bool(full_automation_enabled and not kill_switch)
-    if not full_automation_enabled:
-        st.sidebar.caption("Full automation is selected but not enabled.")
-
-active_automation_level = resolve_active_automation_level(
-    automation_level,
-    full_automation_enabled=full_automation_enabled,
-    kill_switch_enabled=kill_switch,
-)
-
 st.sidebar.markdown("### :material/account_balance_wallet: Paper trading")
 mode_options = {
     "Backtest only - no orders are sent": "backtest_only",
@@ -1551,7 +1613,9 @@ mode_label = st.sidebar.selectbox(
     ),
 )
 execution_mode = mode_options[mode_label]
-enable_alpaca_paper_orders = st.sidebar.checkbox("Use Alpaca paper account", value=False)
+enable_alpaca_paper_orders = bool(execution_mode == "paper" and alpaca_config.paper)
+if execution_mode == "paper":
+    st.sidebar.caption("Orders use the connected Alpaca paper account.")
 enable_alpaca_live_orders = False
 if execution_mode in {"live_with_approval", "automated_live"}:
     enable_alpaca_live_orders = st.sidebar.checkbox(
@@ -1612,8 +1676,8 @@ with st.sidebar.expander("Advanced safety", expanded=False):
         "Allowed symbols",
         value="",
         help=(
-            "Optional whitelist for paper orders. Leave blank to allow the ticker you typed. "
-            "Use commas to allow only specific tickers, such as AAPL, MSFT, NVDA."
+            "Optional whitelist for paper orders. Leave blank to allow the ticker you typed and every queued setup. "
+            "Use commas to restrict both manual and queued paper orders to specific tickers, such as AAPL, MSFT, NVDA."
         ),
     )
     allow_add_to_existing_position = st.checkbox(
@@ -2352,6 +2416,7 @@ current_exit_settings["auto_exit_enabled"] = True
 
 automation_control_store = AutomationControlStore()
 automation_worker_status_store = WorkerStatusStore()
+buy_watchlist_store = BuyWatchlistStore()
 previous_automation_control = automation_control_store.read()
 start_worker_requested = bool(st.session_state.pop("start_background_worker_requested", False))
 stop_worker_requested = bool(st.session_state.pop("stop_background_worker_requested", False))
@@ -2388,6 +2453,7 @@ automation_control = AutomationControl(
     account_size=float(paper_order_risk_equity),
     broker_state_path=broker_state_path,
     audit_log_path=audit_log_path,
+    buy_watchlist_path=str(buy_watchlist_store.path),
 )
 automation_control_store.write(automation_control)
 if start_worker_requested:
@@ -3008,9 +3074,7 @@ current_market_advisory = market_session_advisory()
 regular_market_open = bool(current_market_advisory.get("Open", False))
 limit_buy_allowed_outside_market = (
     allow_limit_buys_outside_market_hours
-    and intent is not None
-    and intent.side == "buy"
-    and intent.order_type == "limit"
+    and paper_buy_order_style != "Market"
 )
 auto_buy_session_allows_order = regular_market_open or limit_buy_allowed_outside_market
 first_exit_preview = next((preview for preview in exit_previews if preview.valid), None)
@@ -3550,7 +3614,7 @@ def render_automation_status() -> None:
         if full_automation_enabled:
             st.caption("Automatic buys are enabled for paper trading. Risk checks, account sizing, and duplicate-order checks still apply.")
         else:
-            st.caption("Full paper automation is selected but not enabled. Check Enable Automation in the sidebar to allow automatic buys.")
+            st.caption("Automatic paper buys are not allowed. Check Allow automatic paper buys in Background Automation to permit them.")
     elif automation_level == "Auto exits only":
         st.caption("Auto exits can sell Alpaca paper positions. You still approve new buys manually.")
     runtime_state = AutomationRuntimeState(
@@ -3997,6 +4061,87 @@ elif command_center_view == "New Trade":
         ),
     )
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
+    st.markdown(
+        "#### Buy watchlist",
+        help=(
+            "Saves the current ticker, interval, strategy, strategy inputs, risk limits, and paper-order instructions. "
+            f"The background worker checks each enabled setup independently. The queue is capped at {MAX_BUY_WATCHLIST_ITEMS} setups. "
+            "Allowed symbols is only a whitelist; it does not add rows here."
+        ),
+    )
+    watchlist_plans = buy_watchlist_store.read()
+    watchlist_cols = st.columns([1, 1, 2])
+    add_watch_disabled = data_source != "Ticker (Alpaca)" or ticker.strip().upper() == "SYNTH"
+    if watchlist_cols[0].button(
+        "Add or Update Current Setup",
+        disabled=add_watch_disabled,
+        help="Adds this exact ticker, interval, and strategy as one monitored setup. Adding it again updates its saved inputs.",
+        key="add_current_buy_watch_plan",
+    ):
+        plan = BuyWatchPlan(
+            plan_id=buy_watch_plan_id(ticker, interval, strategy_label),
+            symbol=ticker,
+            interval=interval,
+            history=period,
+            price_data_source=data_source,
+            strategy_label=strategy_label,
+            strategy_settings=dict(current_strategy_settings),
+            risk_limits=asdict(risk_limits),
+            order_style=paper_buy_order_style,
+            limit_adjustment_pct=float(paper_buy_limit_adjustment_pct),
+            custom_limit_price=float(paper_buy_custom_limit_price),
+            enabled=True,
+            status="Waiting for BUY",
+            detail="Waiting for the saved strategy's required BUY rules.",
+        )
+        try:
+            buy_watchlist_store.upsert(plan)
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+    watchlist_cols[1].markdown(f"**Queued setups:** {len(watchlist_plans)}/{MAX_BUY_WATCHLIST_ITEMS}")
+    watchlist_cols[2].caption(
+        "Signals use cached completed bars. Order pricing uses a lightweight latest Alpaca trade every worker check."
+    )
+    if add_watch_disabled:
+        st.caption("Select Ticker (Alpaca) before adding an automatic BUY setup.")
+    if watchlist_plans:
+        st.dataframe(pd.DataFrame(buy_watchlist_records(watchlist_plans)), width="stretch", hide_index=True)
+        watch_labels = {
+            f"{plan.symbol} | {plan.interval} | {plan.strategy_label}": plan
+            for plan in watchlist_plans
+        }
+        selected_watch_label = st.selectbox(
+            "Manage queued setup",
+            list(watch_labels),
+            key="selected_buy_watch_plan",
+        )
+        selected_watch_plan = watch_labels[selected_watch_label]
+        with st.expander("Saved setup details", expanded=True):
+            st.dataframe(
+                pd.DataFrame(buy_watch_plan_detail_records(selected_watch_plan)),
+                width="stretch",
+                hide_index=True,
+            )
+        manage_cols = st.columns(2)
+        toggle_label = "Pause Selected Setup" if selected_watch_plan.enabled else "Resume Selected Setup"
+        if manage_cols[0].button(toggle_label, key="toggle_selected_buy_watch_plan"):
+            buy_watchlist_store.update(
+                selected_watch_plan.plan_id,
+                enabled=not selected_watch_plan.enabled,
+                status="Paused" if selected_watch_plan.enabled else "Waiting for BUY",
+                detail=(
+                    "Paused manually."
+                    if selected_watch_plan.enabled
+                    else "Waiting for the saved strategy's required BUY rules."
+                ),
+            )
+            st.rerun()
+        if manage_cols[1].button("Remove Selected Setup", key="remove_selected_buy_watch_plan"):
+            buy_watchlist_store.remove(selected_watch_plan.plan_id)
+            st.rerun()
+    else:
+        st.caption("No queued setups. Configure a real ticker and strategy, then add the current setup.")
     st.markdown("#### Automation readiness")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("New trade")), width="stretch", hide_index=True)
     with st.expander("Compare all four current strategy fits", expanded=False):
@@ -4335,7 +4480,7 @@ if command_center_view == "New Trade":
                     st.markdown(f"- {reason}")
         
         st.markdown(
-            "#### Recommended strategy inputs",
+            "#### Strategy input search result",
             help=(
                 "Searches nearby input combinations for all four strategies, then favors settings that also hold up on newer data, "
                 "nearby settings, separate time periods, an untouched final period, and simulated trading friction. "
@@ -4360,6 +4505,10 @@ if command_center_view == "New Trade":
             st.info(recommendation_summary_text)
             recommendation_rows = optimizer_recommendation_records(strategy_optimizer_result)
             if strategy_optimizer_interval_result is not None:
+                best_interval_evidence = next(
+                    row for row in strategy_optimizer_interval_result.interval_results
+                    if row.interval == strategy_optimizer_interval_result.best_interval
+                )
                 recommendation_rows.insert(0, {
                     "Item": "Recommended interval",
                     "Value": strategy_optimizer_interval_result.best_interval,
@@ -4368,6 +4517,16 @@ if command_center_view == "New Trade":
                         f"{strategy_optimizer_interval_result.interval_results[0].comparison_history.lower()}. "
                         f"The winning settings were then checked without changes on "
                         f"{strategy_optimizer_interval_result.best_history} of available history."
+                    ),
+                })
+                recommendation_rows.insert(1, {
+                    "Item": "Complete-period comparison",
+                    "Value": f"{best_interval_evidence.comparison_excess_return_percent:+.2f}% vs buy-and-hold",
+                    "Plain English": (
+                        f"Across the complete {best_interval_evidence.comparison_history.lower()}, the strategy returned "
+                        f"{best_interval_evidence.comparison_return_percent:.2f}% and equal-capital buy-and-hold returned "
+                        f"{best_interval_evidence.comparison_benchmark_return_percent:.2f}%. This is the comparison that "
+                        "matches the full Backtest results after these inputs are applied."
                     ),
                 })
             st.dataframe(
