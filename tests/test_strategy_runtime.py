@@ -2,6 +2,7 @@ import pandas as pd
 
 from agentloop_trader.models import TradeIntent
 from agentloop_trader.strategy_runtime import (
+    adjust_initial_stop_settings,
     apply_buy_order_style,
     evaluate_exit_settings,
     reprice_trade_intent,
@@ -22,6 +23,27 @@ def test_apply_buy_order_style_supports_custom_limit_price():
     assert intent.order_type == "limit"
     assert intent.limit_price == 99.25
     assert intent.entry_price == 99.25
+
+
+def test_adjust_initial_stop_settings_rebuilds_planned_and_fill_adjusted_risk_distance():
+    settings = {
+        "entry_atr": 5.561451503208706,
+        "planned_entry_price": 313.260009765625,
+        "entry_stop_loss": 307.70,
+        "entry_stop_distance": 5.56,
+        "entry_stop_atr_multiplier": 1.0,
+        "last_exit_trigger_price": 308.49,
+        "last_exit_trigger_source": "fill-adjusted initial stop",
+    }
+
+    adjusted = adjust_initial_stop_settings(settings, 1.5)
+
+    assert adjusted["entry_stop_atr_multiplier"] == 1.5
+    assert adjusted["atr_stop_multiplier"] == 1.5
+    assert adjusted["entry_stop_distance"] == 5.561451503208706 * 1.5
+    assert adjusted["entry_stop_loss"] == 313.260009765625 - (5.561451503208706 * 1.5)
+    assert "last_exit_trigger_price" not in adjusted
+    assert "last_exit_trigger_source" not in adjusted
 
 
 def test_apply_buy_order_style_supports_limit_below_current_price():

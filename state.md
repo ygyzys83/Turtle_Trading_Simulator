@@ -461,6 +461,8 @@ The New Trade `Automation readiness` table now treats the Buy watchlist as a bac
 
 Sidebar automation controls were simplified. Selecting `Paper trading - send orders to Alpaca paper` now automatically enables the configured Alpaca paper account, so the redundant `Use Alpaca paper account` checkbox was removed. `Enable Automation` was renamed `Allow automatic paper buys` and moved into `Background Automation`; it controls BUY permission only, not exits. The sidebar now explains that an open Streamlit page can check the loaded ticker and saved exits, while the Background Worker is required for monitoring after Streamlit closes and for the durable Buy watchlist.
 
+Open-position stop labels distinguish the order-time plan from the operational stop: `Planned stop before fill` is calculated from the strategy reference price, while `Fill-adjusted initial stop` applies the saved entry ATR distance to Alpaca's actual average fill. The position editor's `Initial stop ATR multiplier` now genuinely recalculates the saved initial-risk distance, planned stop, fill-adjusted stop, and R thresholds. It shows the projected fill-adjusted stop before saving. Explicitly saving a wider multiplier may loosen the active stop; tightening and loosening quick actions use the same calculation.
+
 Alpaca's 4-hour bars may arrive in small pages even when a large page limit is requested. The market-data fetcher now follows up to 200 pages and refuses to use a silently truncated dataset. This fixed an optimizer failure where five-year 4-hour history stopped in 2023, causing the shared interval-comparison period to display as 0.0 years and produce no candidates.
 
 ## Visual Design System (2026-07-11)

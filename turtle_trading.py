@@ -101,7 +101,7 @@ from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
 from agentloop_trader.market_data import build_company_research_context, fetch_alpaca_bars, fetch_yfinance_bars
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
-from agentloop_trader.strategy_runtime import reprice_trade_intent
+from agentloop_trader.strategy_runtime import adjust_initial_stop_settings, reprice_trade_intent
 from agentloop_trader.monitoring import (
     broker_heartbeat_records,
     daily_risk_records,
@@ -664,7 +664,7 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "ATR percent at entry", "Value": pct_or_missing(settings.get("entry_atr_pct"))},
         {"Field": "Stop distance ATR multiplier", "Value": str(settings.get("entry_stop_atr_multiplier", settings.get("atr_stop_multiplier", "Not recorded")))},
         {"Field": "Stop distance at entry", "Value": money_or_missing(settings.get("entry_stop_distance"))},
-        {"Field": "Stop loss at entry", "Value": money_or_missing(settings.get("entry_stop_loss"))},
+        {"Field": "Planned stop before fill", "Value": money_or_missing(settings.get("entry_stop_loss"))},
         {"Field": "Entry rule level", "Value": money_or_missing(settings.get("entry_rule_level"))},
         {"Field": "Exit rule level at entry", "Value": money_or_missing(settings.get("exit_rule_level_at_entry"))},
         {"Field": "Profit protection", "Value": "On" if settings.get("profit_protection_enabled", True) else "Off"},
@@ -775,8 +775,8 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
         {"Area": "Exit plan", "Item": "Pullback average length", "Status / Value": bars_or_missing(settings.get("pullback_average_length")), "Plain English": "Saved pullback-zone average used by Trend pullback continuation."},
         {"Area": "Exit plan", "Item": "Momentum turn length", "Status / Value": bars_or_missing(settings.get("momentum_turn_length")), "Plain English": "Saved short average used by Trend pullback continuation and Trendline retest continuation to confirm price turned back up."},
         {"Area": "Exit plan", "Item": "Strategy exit", "Status / Value": money_or_missing(exit_details.get("strategy_exit_price")), "Plain English": "Exit line from the saved strategy settings."},
-        {"Area": "Exit plan", "Item": "Original stop", "Status / Value": money_or_missing(exit_details.get("original_stop_price")), "Plain English": "Initial protective stop from the saved entry."},
-        {"Area": "Exit plan", "Item": "Stop distance ATR multiplier", "Status / Value": str(settings.get("entry_stop_atr_multiplier", settings.get("atr_stop_multiplier", "Not recorded"))), "Plain English": "ATR multiplier used to set the original stop."},
+        {"Area": "Exit plan", "Item": "Fill-adjusted initial stop", "Status / Value": money_or_missing(exit_details.get("original_stop_price")), "Plain English": "Actual Alpaca average fill minus the saved initial ATR stop distance."},
+        {"Area": "Exit plan", "Item": "Initial stop ATR multiplier", "Status / Value": str(settings.get("entry_stop_atr_multiplier", settings.get("atr_stop_multiplier", "Not recorded"))), "Plain English": "Saved entry ATR multiplier used to calculate the fill-adjusted initial stop."},
         {"Area": "Profit protection", "Item": "Current profit in R", "Status / Value": f"{profit_r:.2f}R" if profit_r is not None else "Not available", "Plain English": "Current profit compared with original trade risk."},
         {"Area": "Profit protection", "Item": "Highest profit reached in R", "Status / Value": f"{highest_profit_r:.2f}R" if highest_profit_r is not None else "Not available", "Plain English": "Highest price reached since entry compared with original trade risk. This turns profit protection on permanently."},
         {"Area": "Profit protection", "Item": "ATR trail", "Status / Value": money_or_missing(exit_details.get("trailing_stop_price")), "Plain English": "Highest high since entry minus the trailing ATR distance."},
@@ -2662,7 +2662,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         saved_trigger_price = optional_float(settings.get("last_exit_trigger_price"))
         trigger_candidates = [
             ("strategy exit", strategy_exit_price),
-            ("original stop", original_stop_price),
+            ("fill-adjusted initial stop", original_stop_price),
             ("break-even stop", breakeven_stop_price),
             ("ATR trail", trailing_stop_price),
             ("saved trigger", saved_trigger_price),
@@ -2941,7 +2941,7 @@ if intent is not None:
             "planned_entry_price": intent.entry_price,
             "highest_high_since_entry": entry_reference_price,
             "last_exit_trigger_price": intent.stop_loss,
-            "last_exit_trigger_source": "original stop",
+            "last_exit_trigger_source": "fill-adjusted initial stop",
             "sizing_account_source": paper_order_account_source,
             "sizing_account_equity": paper_order_risk_equity,
             "sizing_available_cash": paper_order_available_cash,
@@ -3750,18 +3750,22 @@ def render_open_positions_panel() -> None:
     with st.expander("Quick exit changes", expanded=False):
         quick_cols = st.columns(3)
         if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
-            quick_settings = dict(selected_exit_settings)
+            quick_settings = adjust_initial_stop_settings(
+                selected_exit_settings,
+                max(0.5, float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))) - 0.25),
+            )
             quick_settings["symbol"] = selected_position_symbol
-            quick_settings["atr_stop_multiplier"] = max(0.5, float(quick_settings.get("atr_stop_multiplier", atr_mult)) - 0.25)
             updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
             broker_state_store.replace_all(updated_orders)
             st.session_state["tracked_alpaca_orders"] = updated_orders
             st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_tightened", message="ATR stop tightened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
             st.rerun()
         if quick_cols[1].button("Loosen ATR Stop", key=f"loosen_exit_{selected_position_symbol}"):
-            quick_settings = dict(selected_exit_settings)
+            quick_settings = adjust_initial_stop_settings(
+                selected_exit_settings,
+                min(5.0, float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))) + 0.25),
+            )
             quick_settings["symbol"] = selected_position_symbol
-            quick_settings["atr_stop_multiplier"] = min(5.0, float(quick_settings.get("atr_stop_multiplier", atr_mult)) + 0.25)
             updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
             broker_state_store.replace_all(updated_orders)
             st.session_state["tracked_alpaca_orders"] = updated_orders
@@ -3834,13 +3838,16 @@ def render_open_positions_panel() -> None:
             key=f"exit_window_{selected_position_symbol}",
         )
         edited_atr_mult = edit_cols[1].slider(
-            "ATR stop distance",
+            "Initial stop ATR multiplier",
             0.5,
             5.0,
-            float(selected_exit_settings.get("atr_stop_multiplier", atr_mult)),
+            float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))),
             step=0.1,
             key=f"exit_atr_mult_{selected_position_symbol}",
-            help="Sets the ATR-based stop. Higher numbers give the position more room; lower numbers make the stop tighter.",
+            help=(
+                "Recalculates this position's initial stop from its saved ATR at entry and actual Alpaca average fill. "
+                "Higher numbers give the position more room and increase its R distance; lower numbers tighten the stop."
+            ),
         )
         edited_trend_filter = edit_cols[2].slider(
             "Trend filter length",
@@ -3850,6 +3857,16 @@ def render_open_positions_panel() -> None:
             step=50,
             key=f"exit_trend_filter_{selected_position_symbol}",
             help="Calculates the trend filter for this position's saved exit plan.",
+        )
+        saved_entry_atr = optional_float(selected_exit_settings.get("entry_atr"))
+        projected_fill_adjusted_stop = (
+            selected_avg_entry - saved_entry_atr * edited_atr_mult
+            if selected_avg_entry and saved_entry_atr is not None
+            else None
+        )
+        st.caption(
+            f"Projected fill-adjusted initial stop: {money_or_missing(projected_fill_adjusted_stop)}. "
+            "Changing this multiplier also changes the position's 1R distance and can loosen or tighten its active stop."
         )
         st.markdown("#### Profit protection")
         profit_protection_enabled = st.checkbox(
@@ -3908,7 +3925,7 @@ def render_open_positions_panel() -> None:
         save_exit_settings = st.form_submit_button("Save Exit Settings For This Position")
 
     if save_exit_settings:
-        edited_exit_settings = {
+        edited_exit_settings = adjust_initial_stop_settings({
             **selected_exit_settings,
             "symbol": selected_position_symbol,
             "strategy_type": edited_exit_strategy_type,
@@ -3923,9 +3940,7 @@ def render_open_positions_panel() -> None:
             "breakeven_after_r": edited_breakeven_after_r,
             "trail_after_r": edited_trail_after_r,
             "trailing_atr_multiplier": edited_trailing_atr_multiplier,
-        }
-        edited_exit_settings.pop("last_exit_trigger_price", None)
-        edited_exit_settings.pop("last_exit_trigger_source", None)
+        }, edited_atr_mult)
         updated_orders = update_exit_settings_for_symbol(
             selected_position_symbol,
             st.session_state["tracked_alpaca_orders"],

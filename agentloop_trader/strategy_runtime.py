@@ -197,6 +197,33 @@ def _parse_time(value: Any) -> pd.Timestamp | None:
         return None
 
 
+def adjust_initial_stop_settings(settings: dict[str, Any], atr_multiplier: float) -> dict[str, Any]:
+    """Return exit settings with initial risk rebuilt from the saved entry ATR."""
+    updated = dict(settings)
+    multiplier = float(atr_multiplier)
+    if multiplier <= 0:
+        raise ValueError("Initial stop ATR multiplier must be positive.")
+    entry_atr = _number(updated.get("entry_atr"))
+    previous_distance = _number(updated.get("entry_stop_distance"))
+    previous_multiplier = _number(
+        updated.get("entry_stop_atr_multiplier"),
+        _number(updated.get("atr_stop_multiplier")),
+    )
+    if entry_atr is None and previous_distance is not None and previous_multiplier:
+        entry_atr = previous_distance / previous_multiplier
+    updated["atr_stop_multiplier"] = multiplier
+    updated["entry_stop_atr_multiplier"] = multiplier
+    if entry_atr is not None:
+        distance = entry_atr * multiplier
+        updated["entry_stop_distance"] = distance
+        planned_entry = _number(updated.get("planned_entry_price"), _number(updated.get("entry_reference_price")))
+        if planned_entry is not None:
+            updated["entry_stop_loss"] = planned_entry - distance
+    updated.pop("last_exit_trigger_price", None)
+    updated.pop("last_exit_trigger_source", None)
+    return updated
+
+
 def evaluate_exit_settings(
     settings: dict[str, Any] | None,
     position: dict[str, Any],
@@ -254,7 +281,7 @@ def evaluate_exit_settings(
         breakeven = entry if protect and highest_profit_r is not None and highest_profit_r >= breakeven_after else None
         atr_trail = high - trail_mult * current_atr if protect and highest_profit_r is not None and highest_profit_r >= trail_after and high is not None and current_atr is not None else None
         saved_trigger = _number(settings.get("last_exit_trigger_price"))
-        candidates = [("strategy exit", strategy_exit), ("original stop", original_stop), ("break-even stop", breakeven), ("ATR trail", atr_trail), ("saved trigger", saved_trigger)]
+        candidates = [("strategy exit", strategy_exit), ("fill-adjusted initial stop", original_stop), ("break-even stop", breakeven), ("ATR trail", atr_trail), ("saved trigger", saved_trigger)]
         usable = [(name, value) for name, value in candidates if value is not None]
         source_name, trigger = max(usable, key=lambda item: item[1]) if usable else ("exit rule", None)
         ready = bool(current_price is not None and trigger is not None and current_price <= trigger)

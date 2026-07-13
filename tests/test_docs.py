@@ -132,3 +132,14 @@ def test_sidebar_automation_controls_state_their_exact_scope():
     assert "It does not control automatic exits." in text
     assert "Only the open Streamlit page can check the loaded ticker and exits; the Buy watchlist is paused." in text
     assert "Monitoring continues if Streamlit closes; the Buy watchlist is active." in text
+
+
+def test_position_stop_labels_distinguish_planned_price_from_fill_adjusted_stop():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert '"Planned stop before fill"' in text
+    assert '"Fill-adjusted initial stop"' in text
+    assert '"Initial stop ATR multiplier"' in text
+    assert "Projected fill-adjusted initial stop:" in text
+    assert '"Stop loss at entry"' not in text
+    assert '"Original stop"' not in text
