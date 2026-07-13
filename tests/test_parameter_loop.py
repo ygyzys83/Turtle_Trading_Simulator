@@ -1,3 +1,5 @@
+from dataclasses import replace
+
 import pandas as pd
 
 from agentloop_trader.models import RiskLimits, StrategyConfig
@@ -7,7 +9,10 @@ from agentloop_trader.parameter_loop import (
     BOUNDED_ENTRY_WINDOWS,
     BOUNDED_EXIT_WINDOWS,
     BOUNDED_MA_WINDOWS,
+    CandidateDiagnostics,
     buy_and_hold_benchmark,
+    candidate_verdict,
+    candidate_verdict_records,
     candidate_records,
     evaluate_parameter_candidates,
     generate_bounded_candidates,
@@ -314,3 +319,90 @@ def test_interval_optimizer_uses_one_shared_calendar_period_and_long_history_che
     assert "complete latest" in result.summary.lower()
     assert "middle validation period" in result.summary.lower()
     assert "untouched final period" in result.summary.lower()
+
+
+def _verdict_result(**overrides):
+    result = optimize_strategy_inputs(
+        market_data=synthetic_ohlc_frame(n=700, seed=23),
+        current_settings=CURRENT_SETTINGS,
+        account_equity=100_000,
+        risk_limits=RiskLimits(max_symbol_concentration_pct=5.0),
+        max_candidates_per_strategy=1,
+        bootstrap_samples=20,
+    )
+    candidate = replace(
+        result.best,
+        excess_return_percent=overrides.get("validation_excess", 5.0),
+        plateau_profitable_percent=overrides.get("nearby_percent", 80.0),
+        plateau_neighbors=5,
+        test_trades=overrides.get("validation_trades", 30),
+        rolling_profitable_windows=overrides.get("rolling_profitable", 3),
+        rolling_windows=4,
+    )
+    locked = replace(
+        result.robustness.locked_test,
+        excess_return_percent=overrides.get("locked_excess", 3.0),
+        return_percent=5.0,
+        trades=overrides.get("locked_trades", 20),
+        passed=True,
+    )
+    bootstrap = replace(
+        result.robustness.bootstrap,
+        loss_probability_percent=overrides.get("loss_probability", 20.0),
+    )
+    diagnostics = CandidateDiagnostics(
+        after_cost_expectancy_percent=overrides.get("expectancy", 0.2),
+        best_trade_removed_return_percent=overrides.get("without_best", 5.0),
+        best_trade_share_percent=overrides.get("best_share", 30.0),
+        account_drawdown_percent=overrides.get("account_drawdown", 0.5),
+        slippage_survival_bps=overrides.get("slippage_bps", 20),
+        profitable_regime_percent=80.0,
+        return_to_drawdown=2.0,
+    )
+    evidence = replace(result.robustness, locked_test=locked, bootstrap=bootstrap, diagnostics=diagnostics)
+    return replace(result, best=candidate, robustness=evidence)
+
+
+def test_candidate_verdict_marks_broad_evidence_as_strong_and_is_deterministic():
+    result = _verdict_result()
+
+    first = candidate_verdict(result, "4h")
+    second = candidate_verdict(result, "4h")
+
+    assert first == second
+    assert first.tier == "Strong Candidate"
+    assert candidate_verdict_records(first)
+
+
+def test_candidate_verdict_allows_modest_locked_underperformance_as_promising():
+    result = _verdict_result(
+        validation_excess=2.0,
+        locked_excess=-2.0,
+        loss_probability=35.0,
+        nearby_percent=60.0,
+        slippage_bps=10,
+        without_best=-0.5,
+        best_share=50.0,
+        account_drawdown=1.2,
+        validation_trades=8,
+        locked_trades=5,
+        rolling_profitable=2,
+    )
+
+    assert candidate_verdict(result, "4h").tier == "Promising Candidate"
+
+
+def test_candidate_verdict_rejects_negative_after_cost_expectancy():
+    result = _verdict_result(expectancy=-0.01)
+
+    verdict = candidate_verdict(result, "4h")
+
+    assert verdict.tier == "Reject"
+    assert any("After-cost expectancy" in item for item in verdict.failed)
+
+
+def test_candidate_verdict_keeps_thin_trade_evidence_in_research_only():
+    result = _verdict_result(validation_trades=2, locked_trades=2)
+
+    assert candidate_verdict(result, "1h").tier == "Research Only"
+    assert candidate_verdict(result, "1d").tier == "Research Only"

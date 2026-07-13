@@ -513,6 +513,19 @@ After the paper period:
 7. If proceeding, begin with very small capital, manual BUY approval, and automated exits.
 8. Do not enable automatic live entries until manual-live and auto-exit behavior have been observed reliably.
 
+## Strategy Candidate Verdicts (July 12, 2026)
+
+The strategy input search now assigns one deterministic verdict to its recommended strategy and settings:
+
+- Strong Candidate: broad support across unseen buy-and-hold comparisons, after-cost expectancy, nearby settings, trading-cost stress, best-trade dependence, account drawdown, interval-adjusted trade count, rolling periods, return per drawdown, and market conditions.
+- Promising Candidate: enough support for paper testing, with modest or incomplete evidence but no serious contradiction.
+- Research Only: too few trades or evidence that remains incomplete or inconsistent.
+- Reject: a core test clearly failed, such as negative after-cost expectancy, material buy-and-hold underperformance in both unseen periods, fragile nearby settings, or dependence on one exceptional trade.
+
+The trade-count thresholds adapt to bar interval: 1-hour requires 20 trades for Promising and 40 for Strong; 4-hour requires 12 and 25; daily requires 8 and 15. Missing evidence is treated as uncertain rather than failed. The LLM may explain this result later, but it does not choose or override the verdict.
+
+The main UI shows only the verdict and next step. Detailed supporting, uncertain, and contradictory evidence stays inside `Why this recommendation`.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

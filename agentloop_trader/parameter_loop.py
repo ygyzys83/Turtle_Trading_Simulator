@@ -105,6 +105,17 @@ class TrialAdjustment:
 
 
 @dataclass(frozen=True)
+class CandidateDiagnostics:
+    after_cost_expectancy_percent: float
+    best_trade_removed_return_percent: float
+    best_trade_share_percent: float
+    account_drawdown_percent: float
+    slippage_survival_bps: int
+    profitable_regime_percent: float | None
+    return_to_drawdown: float
+
+
+@dataclass(frozen=True)
 class RobustnessEvidence:
     parameter_range: dict[str, tuple[float, float]]
     locked_test: LockedTestResult | None
@@ -112,6 +123,7 @@ class RobustnessEvidence:
     regime_rows: list[dict[str, Any]] = field(default_factory=list)
     bootstrap: BootstrapResult | None = None
     trial_adjustment: TrialAdjustment | None = None
+    diagnostics: CandidateDiagnostics | None = None
 
 
 @dataclass(frozen=True)
@@ -176,6 +188,15 @@ class CrossTickerResult:
     median_return_percent: float
     worst_drawdown_percent: float
     rows: list[dict[str, Any]] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class CandidateVerdict:
+    tier: str
+    summary: str
+    passed: tuple[str, ...] = ()
+    uncertain: tuple[str, ...] = ()
+    failed: tuple[str, ...] = ()
 
 
 BOUNDED_ENTRY_WINDOWS = (15, 20, 25, 30)
@@ -432,6 +453,13 @@ def optimize_strategy_inputs(
         )
         trial_adjustment = _trial_adjustment(best, ranked)
         parameter_range = _parameter_plateau_range(best, ranked)
+        diagnostics = _candidate_diagnostics(
+            best,
+            full_trades,
+            stress_rows,
+            regime_rows,
+            account_equity,
+        )
         final_confidence, final_stability = _final_confidence(
             best,
             locked_test,
@@ -448,6 +476,7 @@ def optimize_strategy_inputs(
             regime_rows=regime_rows,
             bootstrap=bootstrap,
             trial_adjustment=trial_adjustment,
+            diagnostics=diagnostics,
         )
     summary = optimizer_summary(best)
     return StrategyInputRecommendation(
@@ -527,6 +556,191 @@ def recommendation_evidence_status(result: StrategyInputRecommendation) -> str:
         and stress_10.get("Passed")
     )
     return "Ready for paper test" if credible else "Research only"
+
+
+def candidate_verdict(
+    result: StrategyInputRecommendation,
+    interval: str = "1d",
+) -> CandidateVerdict:
+    """Classify a recommendation from unseen, cost, stability, and risk evidence."""
+    candidate = result.best
+    evidence = result.robustness
+    if candidate is None or evidence is None or evidence.locked_test is None:
+        return CandidateVerdict(
+            tier="Research Only",
+            summary="No complete candidate is available yet.",
+            uncertain=("Run the strategy input search with enough price history.",),
+        )
+
+    locked = evidence.locked_test
+    diagnostics = evidence.diagnostics
+    bootstrap = evidence.bootstrap
+    strong_trades, promising_trades = _trade_evidence_thresholds(interval)
+    checks: list[tuple[str, str, str]] = []
+
+    def add(name: str, status: str, detail: str) -> None:
+        checks.append((name, status, detail))
+
+    validation_excess = candidate.excess_return_percent
+    locked_excess = locked.excess_return_percent
+    if validation_excess > 0 and locked_excess > 0:
+        add("Unseen buy-and-hold comparison", "strong", f"Validation {validation_excess:+.2f}%; final {locked_excess:+.2f}%.")
+    elif max(validation_excess, locked_excess) > 0 and min(validation_excess, locked_excess) >= -5:
+        add("Unseen buy-and-hold comparison", "promising", f"One unseen period led; the other was no worse than -5% ({validation_excess:+.2f}%, {locked_excess:+.2f}%).")
+    elif validation_excess <= -5 and locked_excess <= -5:
+        add("Unseen buy-and-hold comparison", "failed", f"Both unseen periods materially trailed buy-and-hold ({validation_excess:+.2f}%, {locked_excess:+.2f}%).")
+    else:
+        add("Unseen buy-and-hold comparison", "uncertain", f"Results disagreed across unseen periods ({validation_excess:+.2f}%, {locked_excess:+.2f}%).")
+
+    positive_probability = None if bootstrap is None else 100.0 - bootstrap.loss_probability_percent
+    expectancy = None if diagnostics is None else diagnostics.after_cost_expectancy_percent
+    if expectancy is None or positive_probability is None:
+        add("After-cost expectancy", "uncertain", "Not enough completed trades for a reliable after-cost estimate.")
+    elif expectancy <= 0 or positive_probability < 50:
+        add("After-cost expectancy", "failed", f"Average trade after 10 bps per side was {expectancy:+.3f}%; resampled profit probability {positive_probability:.1f}%.")
+    elif positive_probability >= 75:
+        add("After-cost expectancy", "strong", f"Average trade after 10 bps per side was {expectancy:+.3f}%; resampled profit probability {positive_probability:.1f}%.")
+    elif positive_probability >= 60:
+        add("After-cost expectancy", "promising", f"Average trade after 10 bps per side was {expectancy:+.3f}%; resampled profit probability {positive_probability:.1f}%.")
+    else:
+        add("After-cost expectancy", "uncertain", f"Positive after costs, but resampled profit probability was only {positive_probability:.1f}%.")
+
+    nearby = candidate.plateau_profitable_percent
+    if nearby >= 70:
+        add("Nearby settings", "strong", f"{nearby:.0f}% of nearby settings were profitable.")
+    elif nearby >= 50:
+        add("Nearby settings", "promising", f"{nearby:.0f}% of nearby settings were profitable.")
+    elif nearby < 25 and candidate.plateau_neighbors >= 3:
+        add("Nearby settings", "failed", f"Only {nearby:.0f}% of nearby settings were profitable.")
+    else:
+        add("Nearby settings", "uncertain", f"{nearby:.0f}% of nearby settings were profitable.")
+
+    slippage_bps = 0 if diagnostics is None else diagnostics.slippage_survival_bps
+    if slippage_bps >= 20:
+        add("Trading-cost test", "strong", "Stayed profitable with 20 bps of slippage per side.")
+    elif slippage_bps >= 10:
+        add("Trading-cost test", "promising", "Stayed profitable with 10 bps of slippage per side.")
+    elif slippage_bps >= 5:
+        add("Trading-cost test", "uncertain", "Stayed profitable with only 5 bps of slippage per side.")
+    else:
+        add("Trading-cost test", "failed", "Did not remain profitable under the 5 bps slippage test.")
+
+    if diagnostics is None:
+        add("Best-trade dependence", "uncertain", "Not enough trade detail to remove the best trade.")
+    elif diagnostics.best_trade_removed_return_percent > 0 and diagnostics.best_trade_share_percent < 50:
+        add("Best-trade dependence", "strong", f"Return without the best trade was {diagnostics.best_trade_removed_return_percent:+.2f}%; best trade supplied {diagnostics.best_trade_share_percent:.0f}% of profit.")
+    elif diagnostics.best_trade_removed_return_percent >= -1 and diagnostics.best_trade_share_percent < 70:
+        add("Best-trade dependence", "promising", f"Return without the best trade was {diagnostics.best_trade_removed_return_percent:+.2f}%; best trade supplied {diagnostics.best_trade_share_percent:.0f}% of profit.")
+    elif diagnostics.best_trade_removed_return_percent < 0 and diagnostics.best_trade_share_percent >= 70:
+        add("Best-trade dependence", "failed", f"The best trade supplied {diagnostics.best_trade_share_percent:.0f}% of profit and removing it produced {diagnostics.best_trade_removed_return_percent:+.2f}%.")
+    else:
+        add("Best-trade dependence", "uncertain", f"Return without the best trade was {diagnostics.best_trade_removed_return_percent:+.2f}%.")
+
+    account_drawdown = None if diagnostics is None else diagnostics.account_drawdown_percent
+    if account_drawdown is None:
+        add("Account drawdown", "uncertain", "Account-level drawdown could not be calculated.")
+    elif account_drawdown <= 1.0:
+        add("Account drawdown", "strong", f"Worst validation decline was {account_drawdown:.2f}% of the account.")
+    elif account_drawdown <= 1.5:
+        add("Account drawdown", "promising", f"Worst validation decline was {account_drawdown:.2f}% of the account.")
+    elif account_drawdown > 2.5:
+        add("Account drawdown", "failed", f"Worst validation decline was {account_drawdown:.2f}% of the account.")
+    else:
+        add("Account drawdown", "uncertain", f"Worst validation decline was {account_drawdown:.2f}% of the account.")
+
+    return_to_drawdown = None if diagnostics is None else diagnostics.return_to_drawdown
+    if return_to_drawdown is None:
+        add("Return per unit of drawdown", "uncertain", "Return-to-drawdown could not be calculated.")
+    elif return_to_drawdown >= 1.5:
+        add("Return per unit of drawdown", "strong", f"Validation return was {return_to_drawdown:.2f}x its worst allocated decline.")
+    elif return_to_drawdown >= 0.75:
+        add("Return per unit of drawdown", "promising", f"Validation return was {return_to_drawdown:.2f}x its worst allocated decline.")
+    elif return_to_drawdown <= 0:
+        add("Return per unit of drawdown", "failed", f"Validation return-to-drawdown was {return_to_drawdown:.2f}x.")
+    else:
+        add("Return per unit of drawdown", "uncertain", f"Validation return was only {return_to_drawdown:.2f}x its worst allocated decline.")
+
+    profitable_regimes = None if diagnostics is None else diagnostics.profitable_regime_percent
+    if profitable_regimes is None:
+        add("Market conditions", "uncertain", "No populated market-condition groups were available.")
+    elif profitable_regimes >= 60:
+        add("Market conditions", "strong", f"Profitable in {profitable_regimes:.0f}% of populated market-condition groups.")
+    elif profitable_regimes >= 40:
+        add("Market conditions", "promising", f"Profitable in {profitable_regimes:.0f}% of populated market-condition groups.")
+    else:
+        add("Market conditions", "uncertain", f"Profitable in only {profitable_regimes:.0f}% of populated market-condition groups.")
+
+    trades = candidate.test_trades + locked.trades
+    if trades >= strong_trades:
+        add("Completed trades", "strong", f"{trades} unseen trades; strong threshold for {interval} is {strong_trades}.")
+    elif trades >= promising_trades:
+        add("Completed trades", "promising", f"{trades} unseen trades; promising threshold for {interval} is {promising_trades}.")
+    else:
+        add("Completed trades", "uncertain", f"Only {trades} unseen trades; {promising_trades} are preferred for a Promising Candidate on {interval}.")
+
+    rolling_ratio = candidate.rolling_profitable_windows / max(1, candidate.rolling_windows)
+    if rolling_ratio >= 0.70:
+        add("Separate time periods", "strong", f"Profitable in {candidate.rolling_profitable_windows}/{candidate.rolling_windows} rolling periods.")
+    elif rolling_ratio >= 0.50:
+        add("Separate time periods", "promising", f"Profitable in {candidate.rolling_profitable_windows}/{candidate.rolling_windows} rolling periods.")
+    elif candidate.rolling_windows and rolling_ratio < 0.25:
+        add("Separate time periods", "failed", f"Profitable in only {candidate.rolling_profitable_windows}/{candidate.rolling_windows} rolling periods.")
+    else:
+        add("Separate time periods", "uncertain", f"Profitable in {candidate.rolling_profitable_windows}/{candidate.rolling_windows} rolling periods.")
+
+    passed = tuple(f"{name}: {detail}" for name, status, detail in checks if status in {"strong", "promising"})
+    uncertain = tuple(f"{name}: {detail}" for name, status, detail in checks if status == "uncertain")
+    failed = tuple(f"{name}: {detail}" for name, status, detail in checks if status == "failed")
+    status_by_name = {name: status for name, status, _ in checks}
+    critical_failures = {
+        "Unseen buy-and-hold comparison",
+        "After-cost expectancy",
+        "Best-trade dependence",
+        "Nearby settings",
+    }
+    if any(status_by_name.get(name) == "failed" for name in critical_failures):
+        tier = "Reject"
+    else:
+        strong_count = sum(status == "strong" for _, status, _ in checks)
+        supportive_count = sum(status in {"strong", "promising"} for _, status, _ in checks)
+        core_strong = all(status_by_name.get(name) == "strong" for name in (
+            "Unseen buy-and-hold comparison", "After-cost expectancy", "Completed trades"
+        ))
+        if not failed and core_strong and strong_count >= 6:
+            tier = "Strong Candidate"
+        elif not failed and trades >= promising_trades and supportive_count >= 6:
+            tier = "Promising Candidate"
+        else:
+            tier = "Research Only"
+
+    next_step = {
+        "Strong Candidate": "A high-priority paper-test candidate; still review the setup before buying.",
+        "Promising Candidate": "Worth paper testing, with the uncertain evidence kept visible.",
+        "Research Only": "Keep researching; the evidence is incomplete or inconsistent.",
+        "Reject": "Do not use these settings without a materially better result.",
+    }[tier]
+    return CandidateVerdict(tier=tier, summary=next_step, passed=passed, uncertain=uncertain, failed=failed)
+
+
+def candidate_verdict_records(verdict: CandidateVerdict) -> list[dict[str, str]]:
+    return [
+        {"Evidence": item.split(":", 1)[0], "Status": status, "Plain English": item.split(":", 1)[1].strip()}
+        for status, items in (
+            ("Supports candidate", verdict.passed),
+            ("Needs more evidence", verdict.uncertain),
+            ("Contradicts candidate", verdict.failed),
+        )
+        for item in items
+    ]
+
+
+def _trade_evidence_thresholds(interval: str) -> tuple[int, int]:
+    normalized = str(interval).strip().lower()
+    if normalized == "1h":
+        return 40, 20
+    if normalized == "4h":
+        return 25, 12
+    return 15, 8
 
 
 def optimize_strategy_intervals(
@@ -786,7 +1000,10 @@ def optimizer_summary(candidate: OptimizerCandidate | None) -> str:
     )
 
 
-def optimizer_recommendation_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+def optimizer_recommendation_records(
+    result: StrategyInputRecommendation,
+    interval: str = "1d",
+) -> list[dict[str, Any]]:
     candidate = result.best
     if candidate is None:
         return [{"Item": "Recommendation", "Value": "No recommendation", "Plain English": result.summary}]
@@ -798,7 +1015,7 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
         (row for row in evidence.stress_rows if row["Round-trip slippage"] == "10 bps per side"),
         None,
     ) if evidence else None
-    evidence_status = recommendation_evidence_status(result)
+    verdict = candidate_verdict(result, interval)
     benchmark_read = (
         "Beat buy-and-hold"
         if candidate.excess_return_percent > 0 and locked and locked.excess_return_percent > 0
@@ -807,13 +1024,9 @@ def optimizer_recommendation_records(result: StrategyInputRecommendation) -> lis
         else "Did not beat buy-and-hold"
     )
     best_condition = _best_market_condition(evidence.regime_rows if evidence else [])
-    next_step = (
-        "Paper-test these settings before considering live use."
-        if evidence_status == "Ready for paper test"
-        else "Keep this as a research candidate and collect more evidence."
-    )
+    next_step = verdict.summary
     return [
-        {"Item": "Recommendation status", "Value": evidence_status, "Plain English": next_step},
+        {"Item": "Recommendation status", "Value": verdict.tier, "Plain English": next_step},
         {"Item": "Best strategy", "Value": candidate.strategy_label, "Plain English": candidate.reason},
         {"Item": "Suggested settings", "Value": _settings_text(settings), "Plain English": "The single setting combination to paper test first."},
         {"Item": "Ticker allocation", "Value": f"${candidate.allocated_capital:,.2f}", "Plain English": "Stable capital budget set by Max symbol concentration."},
@@ -1361,6 +1574,67 @@ def _execution_stress_rows(
             "Passed": bool(stats["total_trades"] > 0 and stats["allocated_return_pct"] > 0),
         })
     return rows
+
+
+def _candidate_diagnostics(
+    candidate: OptimizerCandidate,
+    trades: list[dict],
+    stress_rows: list[dict[str, Any]],
+    regime_rows: list[dict[str, Any]],
+    account_equity: float,
+) -> CandidateDiagnostics:
+    adjusted_trade_returns = []
+    pnl_values = []
+    for trade in trades:
+        entry = float(trade.get("entry", 0))
+        exit_price = float(trade.get("exit", 0))
+        shares = float(trade.get("shares", 0))
+        notional = float(trade.get("notional", 0)) or entry * shares
+        execution_cost = (entry + exit_price) * shares * 10 / 10_000
+        adjusted_pnl = float(trade.get("pnl", 0)) - execution_cost
+        pnl_values.append(adjusted_pnl)
+        if notional > 0:
+            adjusted_trade_returns.append(adjusted_pnl / notional * 100)
+
+    allocation = max(0.0, float(candidate.allocated_capital))
+    total_pnl = sum(pnl_values)
+    best_pnl = max(pnl_values, default=0.0)
+    positive_pnl = sum(value for value in pnl_values if value > 0)
+    best_removed_return = (total_pnl - best_pnl) / allocation * 100 if allocation > 0 else 0.0
+    best_share = best_pnl / positive_pnl * 100 if best_pnl > 0 and positive_pnl > 0 else 0.0
+    slippage_survival = max(
+        (
+            int(str(row.get("Round-trip slippage", "0")).split()[0])
+            for row in stress_rows
+            if bool(row.get("Passed"))
+        ),
+        default=0,
+    )
+    populated_regimes = [row for row in regime_rows if int(row.get("Trades", 0)) > 0]
+    profitable_regime_percent = (
+        sum(float(row.get("Return Percent", 0)) > 0 for row in populated_regimes) / len(populated_regimes) * 100
+        if populated_regimes
+        else None
+    )
+    account_drawdown = (
+        candidate.test_max_drawdown_percent * allocation / account_equity
+        if account_equity > 0
+        else 0.0
+    )
+    return_to_drawdown = (
+        candidate.test_return_percent / candidate.test_max_drawdown_percent
+        if candidate.test_max_drawdown_percent > 0
+        else 0.0
+    )
+    return CandidateDiagnostics(
+        after_cost_expectancy_percent=round(float(np.mean(adjusted_trade_returns)), 3) if adjusted_trade_returns else 0.0,
+        best_trade_removed_return_percent=round(best_removed_return, 2),
+        best_trade_share_percent=round(best_share, 1),
+        account_drawdown_percent=round(account_drawdown, 2),
+        slippage_survival_bps=slippage_survival,
+        profitable_regime_percent=round(profitable_regime_percent, 1) if profitable_regime_percent is not None else None,
+        return_to_drawdown=round(return_to_drawdown, 2),
+    )
 
 
 def _regime_rows(

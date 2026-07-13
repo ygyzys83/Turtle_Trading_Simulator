@@ -119,6 +119,8 @@ from agentloop_trader.ops_readiness import (
 )
 from agentloop_trader.parameter_loop import (
     buy_and_hold_benchmark,
+    candidate_verdict,
+    candidate_verdict_records,
     optimize_strategy_intervals,
     optimize_strategy_inputs,
     optimizer_candidate_records,
@@ -4518,7 +4520,34 @@ if command_center_view == "New Trade":
                 else strategy_optimizer_result.summary
             )
             st.info(recommendation_summary_text)
-            recommendation_rows = optimizer_recommendation_records(strategy_optimizer_result)
+            verdict_interval = (
+                strategy_optimizer_interval_result.best_interval
+                if strategy_optimizer_interval_result is not None
+                else interval
+            )
+            setup_verdict = candidate_verdict(strategy_optimizer_result, verdict_interval)
+            st.markdown(
+                "#### Recommended setup verdict",
+                help=(
+                    "A deterministic classification of the recommended strategy and inputs. Strong Candidate has broad "
+                    "support across unseen periods, costs, nearby settings, trade count, and drawdown. Promising Candidate "
+                    "allows modest or incomplete evidence but no major contradiction. Research Only needs more evidence. "
+                    "Reject means a core test clearly failed."
+                ),
+            )
+            verdict_message = (
+                f"**{setup_verdict.tier}** - {strategy_optimizer_result.best.strategy_label if strategy_optimizer_result.best else 'No strategy'} "
+                f"on {verdict_interval}. {setup_verdict.summary}"
+            )
+            if setup_verdict.tier == "Strong Candidate":
+                st.success(verdict_message)
+            elif setup_verdict.tier == "Promising Candidate":
+                st.info(verdict_message)
+            elif setup_verdict.tier == "Reject":
+                st.error(verdict_message)
+            else:
+                st.warning(verdict_message)
+            recommendation_rows = optimizer_recommendation_records(strategy_optimizer_result, verdict_interval)
             if strategy_optimizer_interval_result is not None:
                 best_interval_evidence = next(
                     row for row in strategy_optimizer_interval_result.interval_results
@@ -4555,7 +4584,7 @@ if command_center_view == "New Trade":
             )
             apply_button_label = (
                 "Use Recommended Inputs"
-                if recommendation_status == "Ready for paper test"
+                if recommendation_status in {"Strong Candidate", "Promising Candidate"}
                 else "Use Research Candidate Inputs"
             )
             if strategy_optimizer_result.best is not None and st.button(
@@ -4584,6 +4613,14 @@ if command_center_view == "New Trade":
                     if strategy_optimizer_interval_errors:
                         st.warning("Some intervals could not be tested: " + "; ".join(strategy_optimizer_interval_errors))
             with st.expander("Why this recommendation", expanded=False):
+                verdict_rows = candidate_verdict_records(setup_verdict)
+                if verdict_rows:
+                    st.markdown("##### Candidate verdict evidence")
+                    st.dataframe(
+                        pd.DataFrame(verdict_rows),
+                        width="stretch",
+                        hide_index=True,
+                    )
                 st.dataframe(
                     pd.DataFrame(optimizer_robustness_records(strategy_optimizer_result)),
                     width="stretch",
