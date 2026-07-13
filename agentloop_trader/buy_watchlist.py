@@ -28,9 +28,12 @@ class BuyWatchPlan:
     order_style: str = "Limit at current price"
     limit_adjustment_pct: float = 0.0
     custom_limit_price: float = 0.0
+    repeat_after_exit: bool = False
     enabled: bool = True
     status: str = "Waiting for BUY"
     detail: str = "Waiting for the saved strategy's required BUY rules."
+    cycle_state: str = "waiting_for_buy"
+    last_cycle_completed_at: str = ""
     created_at: str = ""
     updated_at: str = ""
     last_checked_at: str = ""
@@ -120,6 +123,7 @@ def buy_watchlist_records(plans: list[BuyWatchPlan]) -> list[dict[str, Any]]:
             "Asset Type": plan.asset_class.title(),
             "Interval": plan.interval,
             "Strategy": plan.strategy_label,
+            "Repeat After Exit": "On" if plan.repeat_after_exit else "Off",
             "Enabled": "Yes" if plan.enabled else "No",
             "Status": plan.status,
             "Last checked": plan.last_checked_at or "Not checked yet",
@@ -183,6 +187,7 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
         {"Area": "Order", "Input": "Cancel unfilled limit buy after", "Saved Value": number("stale_limit_order_minutes", " minutes")},
         {"Area": "Order", "Input": "Allow limit buys outside market hours", "Saved Value": yes_no(settings.get("allow_limit_buys_outside_market_hours", False))},
         {"Area": "Automation", "Input": "Check automation every", "Saved Value": number("automation_refresh_seconds", " seconds")},
+        {"Area": "Automation", "Input": "Repeat after exit", "Saved Value": yes_no(plan.repeat_after_exit)},
         {"Area": "Automation", "Input": "Max automatic buys this session", "Saved Value": number("max_auto_buys_per_session")},
         {"Area": "Automation", "Input": "Wait after an exit before re-buying", "Saved Value": number("reentry_cooldown_minutes", " minutes")},
         {"Area": "Automation", "Input": "Order sizing account", "Saved Value": "Current Alpaca paper account at execution"},

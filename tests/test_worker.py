@@ -211,6 +211,85 @@ def test_worker_disables_watchlist_setup_after_order_is_sent(monkeypatch, tmp_pa
     assert updated.status == "Order sent"
 
 
+def test_worker_keeps_repeating_setup_enabled_after_order_is_sent(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("TSLA", "4h", "Trend pullback continuation"),
+        symbol="TSLA",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+        repeat_after_exit=True,
+    )
+    store.upsert(plan)
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (1, args[4], "Sent paper buy for 5 TSLA."),
+    )
+    adapter = SimpleNamespace(position_records=lambda **kwargs: [], order_records=lambda **kwargs: [])
+
+    sent, _, _ = _send_watchlist_entries(
+        AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
+        adapter,
+        [],
+        [],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+        latest_prices={"TSLA": 250.0},
+        max_to_send=1,
+    )
+
+    updated = store.read()[0]
+    assert sent == 1
+    assert updated.enabled is True
+    assert updated.repeat_after_exit is True
+    assert updated.cycle_state == "order_pending"
+    assert updated.status == "Buy order sent"
+
+
+def test_repeating_setup_waits_for_prior_buy_signal_to_clear(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("TSLA", "4h", "Trend pullback continuation"),
+        symbol="TSLA",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+        repeat_after_exit=True,
+        cycle_state="position_open",
+    )
+    store.upsert(plan)
+    control = AutomationControl(mode="Auto entries and exits", full_automation_enabled=True)
+    adapter = SimpleNamespace()
+    common_args = (
+        control,
+        adapter,
+        [],
+        [],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+    )
+
+    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0}, max_to_send=1)
+    assert store.read()[0].cycle_state == "waiting_for_signal_reset"
+
+    monkeypatch.setattr("agentloop_trader.worker._repeat_signal_state", lambda *args: (True, ""))
+    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0}, max_to_send=1)
+    assert store.read()[0].cycle_state == "waiting_for_signal_reset"
+    assert store.read()[0].status == "Waiting for a new BUY"
+
+    monkeypatch.setattr("agentloop_trader.worker._repeat_signal_state", lambda *args: (False, ""))
+    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0}, max_to_send=1)
+    assert store.read()[0].cycle_state == "waiting_for_buy"
+    assert store.read()[0].enabled is True
+
+
 def test_worker_reuses_recent_price_history_for_queued_setups(monkeypatch):
     calls = []
     data = SimpleNamespace(copy=lambda: "copied-bars")

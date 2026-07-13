@@ -415,6 +415,32 @@ def _control_for_watch_plan(control: AutomationControl, plan: BuyWatchPlan) -> A
     )
 
 
+def _repeat_signal_state(
+    control: AutomationControl,
+    adapter: AlpacaBrokerAdapterStub,
+    fetch_bars: Callable[[str, str, str, str], Any],
+) -> tuple[bool | None, str]:
+    """Read the saved strategy without allowing an order submission."""
+    try:
+        account_equity = _account_value(adapter.account_records(), "portfolio value", 0.0)
+        if account_equity <= 0:
+            return None, "Alpaca account value is unavailable; the repeating setup cannot check for a new BUY yet."
+        data = fetch_bars(control.symbol, control.history, control.interval, control.price_data_source)
+        result = selected_strategy_result(data, control.strategy_settings, account_equity, _risk_limits(control))
+        return result.get("live", {}).get("trade_intent") is not None, ""
+    except Exception as exc:
+        return None, f"Could not check whether the prior BUY signal cleared: {exc}"
+
+
+def _repeat_cooldown_remaining(plan: BuyWatchPlan, now: datetime) -> float:
+    cooldown_minutes = max(0.0, _number(plan.strategy_settings.get("reentry_cooldown_minutes"), 0.0))
+    completed_at = _parse_time(plan.last_cycle_completed_at)
+    if cooldown_minutes <= 0 or completed_at is None:
+        return 0.0
+    elapsed_minutes = max(0.0, (now - completed_at).total_seconds() / 60)
+    return max(0.0, cooldown_minutes - elapsed_minutes)
+
+
 def _send_watchlist_entries(
     control: AutomationControl,
     adapter: AlpacaBrokerAdapterStub,
@@ -452,8 +478,82 @@ def _send_watchlist_entries(
     for plan in enabled:
         if sent >= max(0, max_to_send):
             break
+        checked_at = datetime.now(PACIFIC_TIME).isoformat()
+        if plan.repeat_after_exit:
+            clean_symbol = plan.symbol.strip().upper()
+            position_open = clean_symbol in _open_symbols(current_positions)
+            buy_order_open = clean_symbol in _open_buy_order_symbols(current_orders)
+            if position_open:
+                store.update(
+                    plan.plan_id,
+                    cycle_state="position_open",
+                    status="Position open",
+                    detail="Repeat after exit is On. Waiting for this position to close before looking for another BUY.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: position open; repeat remains on.")
+                continue
+            if buy_order_open:
+                store.update(
+                    plan.plan_id,
+                    cycle_state="order_pending",
+                    status="Buy order active",
+                    detail="Repeat after exit is On. Waiting for the current buy order to fill or finish.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: buy order active; repeat remains on.")
+                continue
+            if plan.cycle_state in {"order_pending", "position_open"}:
+                store.update(
+                    plan.plan_id,
+                    cycle_state="waiting_for_signal_reset",
+                    last_cycle_completed_at=checked_at,
+                    status="Waiting for a new BUY",
+                    detail="The previous order or position finished. The prior BUY signal must turn off before this setup can buy again.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: previous cycle finished; waiting for the BUY signal to reset.")
+                continue
+            if plan.cycle_state == "waiting_for_signal_reset":
+                plan_control = _control_for_watch_plan(control, plan)
+                signal_active, signal_error = _repeat_signal_state(plan_control, adapter, fetch_bars)
+                if signal_active is None:
+                    store.update(
+                        plan.plan_id,
+                        status="Blocked",
+                        detail=signal_error,
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: {signal_error}")
+                elif signal_active:
+                    store.update(
+                        plan.plan_id,
+                        status="Waiting for a new BUY",
+                        detail="Repeat after exit is On. The previous BUY signal is still active and must turn off before rearming.",
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: waiting for the previous BUY signal to turn off.")
+                else:
+                    store.update(
+                        plan.plan_id,
+                        cycle_state="waiting_for_buy",
+                        status="Waiting for BUY",
+                        detail="Repeat after exit is On. The prior signal cleared; waiting for a new BUY signal.",
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: signal reset; waiting for a new BUY.")
+                continue
+            cooldown_remaining = _repeat_cooldown_remaining(plan, datetime.now(PACIFIC_TIME))
+            if cooldown_remaining > 0:
+                store.update(
+                    plan.plan_id,
+                    status="Cooling down",
+                    detail=f"Repeat after exit is On. Waiting {cooldown_remaining:.0f} more minutes before another BUY.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: cooling down before another BUY.")
+                continue
         if plan.price_data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"}:
-            checked_at = datetime.now(PACIFIC_TIME).isoformat()
             message = "Queued automatic buys require Alpaca price data for a current order price."
             store.update(
                 plan.plan_id,
@@ -464,7 +564,6 @@ def _send_watchlist_entries(
             messages.append(f"{plan.symbol} {plan.strategy_label}: {message}")
             continue
         if plan.symbol not in (latest_prices or {}):
-            checked_at = datetime.now(PACIFIC_TIME).isoformat()
             message = (
                 f"Latest Alpaca trade request failed: {latest_price_error}"
                 if latest_price_error
@@ -490,17 +589,27 @@ def _send_watchlist_entries(
             latest_price=(latest_prices or {}).get(plan.symbol),
             require_latest_price=True,
         )
-        checked_at = datetime.now(PACIFIC_TIME).isoformat()
         if count:
             sent += count
-            store.update(
-                plan.plan_id,
-                enabled=False,
-                status="Order sent",
-                detail=message,
-                last_checked_at=checked_at,
-                order_sent_at=checked_at,
-            )
+            if plan.repeat_after_exit:
+                store.update(
+                    plan.plan_id,
+                    enabled=True,
+                    cycle_state="order_pending",
+                    status="Buy order sent",
+                    detail="Repeat after exit is On. Waiting for this order and position cycle to finish.",
+                    last_checked_at=checked_at,
+                    order_sent_at=checked_at,
+                )
+            else:
+                store.update(
+                    plan.plan_id,
+                    enabled=False,
+                    status="Order sent",
+                    detail=message,
+                    last_checked_at=checked_at,
+                    order_sent_at=checked_at,
+                )
             current_positions = _strict_broker_records(adapter, "position_records")
             current_orders = _strict_broker_records(adapter, "order_records")
         else:

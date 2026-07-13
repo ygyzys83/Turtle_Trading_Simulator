@@ -565,6 +565,19 @@ The app now treats crypto as an explicit asset type rather than pretending it is
 
 The crypto integration checkpoint passed 296 tests. No broker order was submitted while building or testing it.
 
+## Repeating Buy Watchlist Setups (July 13, 2026)
+
+Buy watchlist setups now have an explicit `Repeat After Exit` setting, shown as On or Off in the queue and in Saved setup details.
+
+- Off preserves the original one-time behavior: the setup disables itself after sending one buy order.
+- On remains durably enabled across repeated buy, position, and exit cycles.
+- While its buy order or position is active, the worker waits and does not submit another buy for that setup.
+- After the order or position finishes, the prior BUY signal must first turn off. This prevents immediate re-entry from the same unchanged signal or completed bar.
+- Once the signal resets and the saved re-entry cooldown has elapsed, the setup waits for a new BUY signal and may trade again.
+- The repeating setup remains On until the user pauses, updates, or removes it. Existing risk limits, duplicate-order checks, the Kill Switch, automation mode, and the worker-session automatic-buy cap still apply.
+
+The repeat lifecycle and one-time fallback passed the full 299-test suite. No broker order was submitted during testing.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

@@ -4186,10 +4186,16 @@ elif command_center_view == "New Trade":
         help=(
             "Saves the current ticker, interval, strategy, strategy inputs, risk limits, and paper-order instructions. "
             f"The background worker checks each enabled setup independently. The queue is capped at {MAX_BUY_WATCHLIST_ITEMS} setups. "
+            "Select a queued setup below to turn Repeat after exit On or Off for that individual setup. "
             "Allowed symbols is only a whitelist; it does not add rows here."
         ),
     )
     watchlist_plans = buy_watchlist_store.read()
+    current_watch_plan_id = buy_watch_plan_id(ticker, interval, strategy_label, asset_class)
+    existing_current_plan = next(
+        (plan for plan in watchlist_plans if plan.plan_id == current_watch_plan_id),
+        None,
+    )
     watchlist_cols = st.columns([1, 1, 2])
     add_watch_disabled = data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"} or ticker.strip().upper() == "SYNTH"
     if watchlist_cols[0].button(
@@ -4199,7 +4205,7 @@ elif command_center_view == "New Trade":
         key="add_current_buy_watch_plan",
     ):
         plan = BuyWatchPlan(
-            plan_id=buy_watch_plan_id(ticker, interval, strategy_label, asset_class),
+            plan_id=current_watch_plan_id,
             symbol=ticker,
             interval=interval,
             history=period,
@@ -4211,6 +4217,7 @@ elif command_center_view == "New Trade":
             order_style=paper_buy_order_style,
             limit_adjustment_pct=float(paper_buy_limit_adjustment_pct),
             custom_limit_price=float(paper_buy_custom_limit_price),
+            repeat_after_exit=bool(existing_current_plan.repeat_after_exit) if existing_current_plan else False,
             enabled=True,
             status="Waiting for BUY",
             detail="Waiting for the saved strategy's required BUY rules.",
@@ -4229,7 +4236,7 @@ elif command_center_view == "New Trade":
     if watchlist_plans:
         st.dataframe(pd.DataFrame(buy_watchlist_records(watchlist_plans)), width="stretch", hide_index=True)
         watch_labels = {
-            f"{plan.symbol} | {plan.interval} | {plan.strategy_label}": plan
+            f"{plan.symbol} | {plan.interval} | {plan.strategy_label} | Repeat {'On' if plan.repeat_after_exit else 'Off'}": plan
             for plan in watchlist_plans
         }
         selected_watch_label = st.selectbox(
@@ -4238,6 +4245,38 @@ elif command_center_view == "New Trade":
             key="selected_buy_watch_plan",
         )
         selected_watch_plan = watch_labels[selected_watch_label]
+        selected_repeat_key = f"manage_repeat_after_exit_{selected_watch_plan.plan_id}"
+        if selected_repeat_key not in st.session_state:
+            st.session_state[selected_repeat_key] = bool(selected_watch_plan.repeat_after_exit)
+        selected_repeat_after_exit = st.checkbox(
+            "Repeat after exit for this setup",
+            key=selected_repeat_key,
+            help=(
+                "On keeps only this selected setup enabled across future buy, position, and exit cycles. After an exit, the worker waits "
+                "for the old BUY signal to turn off, applies the saved re-entry cooldown, and then waits for a new BUY signal. Off makes "
+                "this setup one-time: it disables after sending its next buy order."
+            ),
+        )
+        if bool(selected_repeat_after_exit) != bool(selected_watch_plan.repeat_after_exit):
+            repeat_changes = {"repeat_after_exit": bool(selected_repeat_after_exit)}
+            if selected_repeat_after_exit and selected_watch_plan.status == "Order sent":
+                repeat_changes.update(
+                    enabled=True,
+                    status="Repeat enabled",
+                    detail="Repeat after exit is On. The worker will detect the current order or position state.",
+                )
+            elif not selected_repeat_after_exit and selected_watch_plan.cycle_state in {
+                "order_pending",
+                "position_open",
+                "waiting_for_signal_reset",
+            }:
+                repeat_changes.update(
+                    enabled=False,
+                    status="Repeat off",
+                    detail="Repeat after exit is Off. Any current position remains managed, but this setup will not buy again.",
+                )
+            buy_watchlist_store.update(selected_watch_plan.plan_id, **repeat_changes)
+            st.rerun()
         with st.expander("Saved setup details", expanded=True):
             st.dataframe(
                 pd.DataFrame(buy_watch_plan_detail_records(selected_watch_plan)),

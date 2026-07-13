@@ -83,6 +83,7 @@ def test_saved_setup_details_show_strategy_risk_order_and_exit_inputs():
         },
         order_style="Limit below current price",
         limit_adjustment_pct=0.25,
+        repeat_after_exit=True,
     )
 
     rows = buy_watch_plan_detail_records(plan)
@@ -94,4 +95,14 @@ def test_saved_setup_details_show_strategy_risk_order_and_exit_inputs():
     assert by_input["Max new order size"] == "5.0%"
     assert by_input["Buy limit discount"] == "0.25%"
     assert by_input["Start ATR trail after"] == "2.0R"
+    assert by_input["Repeat after exit"] == "On"
     assert by_input["Order reference price"] == "Latest available Alpaca IEX trade at execution"
+
+
+def test_watchlist_records_show_repeat_after_exit_state():
+    repeating = _plan(symbol="TSLA")
+    repeating = BuyWatchPlan(**{**repeating.__dict__, "repeat_after_exit": True})
+
+    record = buy_watchlist_records([repeating])[0]
+
+    assert record["Repeat After Exit"] == "On"
