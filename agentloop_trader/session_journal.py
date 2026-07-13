@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any
 from uuid import uuid4
 
+from agentloop_trader.fees import estimate_alpaca_equity_order_fees
 from agentloop_trader.models import PACIFIC_TIME
 
 
@@ -92,12 +93,17 @@ def alpaca_paper_activity_records(snapshot: PaperSessionSnapshot) -> list[dict]:
         order for order in snapshot.tracked_alpaca_orders
         if _enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"}
     ]
+    estimated_fees, fee_orders, missing_fee_orders = _filled_order_fee_summary(alpaca_filled)
+    fee_value = _money(estimated_fees) if fee_orders else "Not available for saved fills"
+    if fee_orders and missing_fee_orders:
+        fee_value += f" ({missing_fee_orders} older fill(s) missing details)"
     return [
         {"Metric": "Saved Alpaca orders", "Value": len(snapshot.tracked_alpaca_orders)},
         {"Metric": "Filled Alpaca shares", "Value": _format_number(alpaca_filled_qty)},
         {"Metric": "Filled Alpaca orders", "Value": len(alpaca_filled)},
         {"Metric": "Canceled Alpaca orders", "Value": len(alpaca_canceled)},
         {"Metric": "Alpaca orders waiting to fill", "Value": len(alpaca_waiting)},
+        {"Metric": "Estimated live fees on filled orders", "Value": fee_value},
     ]
 
 
@@ -116,6 +122,9 @@ def paper_trading_review_records(
         if _enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"}
     ]
     account_value = _money(alpaca_account_value) if alpaca_account_value is not None else "Not connected"
+    alpaca_filled = [order for order in snapshot.tracked_alpaca_orders if _enum_value(order.get("status")) == "filled"]
+    estimated_fees, fee_orders, _ = _filled_order_fee_summary(alpaca_filled)
+    fee_read = _money(estimated_fees) if fee_orders else "Not available"
     if blocked_count:
         next_step = "Review blocked orders before changing automation."
     elif waiting_orders:
@@ -132,8 +141,29 @@ def paper_trading_review_records(
         {"Area": "Paper exits sent", "Read": exit_count, "Plain English": "Manual and automatic paper exits recorded this session."},
         {"Area": "Paper cancels sent", "Read": cancel_count, "Plain English": "Paper order cancels recorded this session."},
         {"Area": "Issues to review", "Read": blocked_count, "Plain English": "Blocked or rejected order events recorded this session."},
+        {
+            "Area": "Estimated live fees",
+            "Read": fee_read,
+            "Plain English": "What current Alpaca regulatory fees would approximately cost. Alpaca paper did not deduct this amount.",
+        },
         {"Area": "Next step", "Read": next_step, "Plain English": "The useful action from here."},
     ]
+
+
+def _filled_order_fee_summary(orders: list[dict]) -> tuple[float, int, int]:
+    total = 0.0
+    estimated_count = 0
+    missing_count = 0
+    for order in orders:
+        side = _enum_value(order.get("side", ""))
+        quantity = _as_float(order.get("filled_quantity") or order.get("quantity"))
+        price = _as_float(order.get("average_fill_price") or order.get("filled_avg_price"))
+        if side not in {"buy", "sell"} or quantity <= 0 or price <= 0:
+            missing_count += 1
+            continue
+        total += estimate_alpaca_equity_order_fees(side=side, quantity=quantity, price=price).total
+        estimated_count += 1
+    return round(total, 2), estimated_count, missing_count
 
 
 def paper_testing_progress_records(

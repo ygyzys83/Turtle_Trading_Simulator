@@ -3,6 +3,10 @@ from __future__ import annotations
 import numpy as np
 
 from agentloop_trader.data import generate_synthetic_prices
+from agentloop_trader.fees import (
+    estimate_alpaca_equity_order_fees,
+    estimate_alpaca_equity_round_trip_fees,
+)
 from agentloop_trader.indicators import calc_atr, calc_rsi, calc_sma
 from agentloop_trader.market_data import validate_price_bars
 from agentloop_trader.models import BacktestResult, RiskLimits, StrategyConfig, TradeIntent
@@ -41,6 +45,7 @@ def _build_stats(
     total_bars: int,
     risk_limits: RiskLimits | None = None,
     market_data=None,
+    open_entry_fee: float = 0.0,
 ) -> dict:
     account = float(account)
     final_balance = float(final_balance)
@@ -86,8 +91,8 @@ def _build_stats(
     )
 
     return {
-        "final_equity": round(result.final_equity),
-        "total_pnl": round(result.total_pnl),
+        "final_equity": round(result.final_equity, 2),
+        "total_pnl": round(result.total_pnl, 2),
         "return_pct": result.return_pct,
         "win_rate": result.win_rate,
         "wins": result.wins,
@@ -99,6 +104,10 @@ def _build_stats(
         "profit_factor": result.profit_factor,
         "max_drawdown_pct": result.max_drawdown_pct,
         "exposure_pct": result.exposure_pct,
+        "estimated_alpaca_fees": round(
+            sum(float(trade.get("estimated_alpaca_fees", 0.0)) for trade in trade_log) + float(open_entry_fee),
+            2,
+        ),
         "result": result,
         **capital,
     }
@@ -128,7 +137,18 @@ def _backtest_limited_quantity(
     max_quantities = [raw_quantity, limits.max_quantity]
     risk_per_share = abs(entry_price - stop_price)
     max_risk_dollars = account_equity * limits.max_risk_per_trade_pct / 100
-    max_quantities.append(int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0)
+    risk_limited_quantity = int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0
+    while risk_limited_quantity > 0:
+        buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+            quantity=risk_limited_quantity,
+            entry_price=entry_price,
+            exit_price=stop_price,
+        )
+        total_stop_risk = risk_per_share * risk_limited_quantity + buy_fees.total + sell_fees.total
+        if total_stop_risk <= max_risk_dollars:
+            break
+        risk_limited_quantity -= 1
+    max_quantities.append(risk_limited_quantity)
 
     max_position_notional = account_equity * limits.max_position_notional_pct / 100
     max_portfolio_notional = account_equity * limits.max_portfolio_exposure_pct / 100
@@ -160,9 +180,22 @@ def _trade_record(
     entry_price = round(float(entry_price), 2)
     exit_price = round(float(exit_price), 2)
     stop_price = round(float(stop_price), 2)
-    pnl = (exit_price - entry_price) * shares
+    gross_pnl = (exit_price - entry_price) * shares
+    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+        quantity=shares,
+        entry_price=entry_price,
+        exit_price=exit_price,
+    )
+    estimated_fees = buy_fees.total + sell_fees.total
+    pnl = gross_pnl - estimated_fees
     notional = entry_price * shares
-    risk_dollars = abs(entry_price - stop_price) * shares
+    price_risk_dollars = abs(entry_price - stop_price) * shares
+    risk_buy_fees, risk_sell_fees = estimate_alpaca_equity_round_trip_fees(
+        quantity=shares,
+        entry_price=entry_price,
+        exit_price=stop_price,
+    )
+    risk_dollars = price_risk_dollars + risk_buy_fees.total + risk_sell_fees.total
     adverse_price = min(entry_price, float(lowest_price_since_entry)) if lowest_price_since_entry is not None else entry_price
     max_adverse_pnl = (adverse_price - entry_price) * shares
     return {
@@ -177,14 +210,33 @@ def _trade_record(
         "shares": shares,
         "notional": round(notional, 2),
         "risk_dollars": round(risk_dollars, 2),
+        "price_risk_dollars": round(price_risk_dollars, 2),
         "risk_pct": round(risk_dollars / account * 100, 2) if account else 0,
         "max_adverse_pnl": round(max_adverse_pnl, 2),
         "max_adverse_pct": round(max_adverse_pnl / account * 100, 2) if account else 0,
         "stop": stop_price,
         "exit_rule": exit_rule,
+        "gross_pnl": round(gross_pnl, 2),
+        "estimated_buy_fees": buy_fees.total,
+        "estimated_sell_fees": sell_fees.total,
+        "estimated_alpaca_fees": round(estimated_fees, 2),
         "pnl": round(pnl, 2),
         "pct_acct": round(pnl / account * 100, 2) if account else 0,
     }
+
+
+def _entry_fee(price: float, shares: int) -> float:
+    return estimate_alpaca_equity_order_fees(side="buy", quantity=shares, price=price).total
+
+
+def _exit_balance_change(entry_price: float, exit_price: float, shares: int) -> float:
+    gross_pnl = (round(float(exit_price), 2) - round(float(entry_price), 2)) * int(shares)
+    sell_fee = estimate_alpaca_equity_order_fees(
+        side="sell",
+        quantity=shares,
+        price=round(float(exit_price), 2),
+    ).total
+    return gross_pnl - sell_fee
 
 
 def _profit_protection_stop(
@@ -494,6 +546,7 @@ def simulate_turtle_strategy(
     low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
+    open_entry_fee = 0.0
     start = max(entry_w, exit_w, ma_w)
 
     live_bar = n_bars - 1
@@ -525,7 +578,9 @@ def simulate_turtle_strategy(
                 )
                 if size > 0:
                     in_trade = True
-                    entry_price = p
+                    entry_price = round(float(p), 2)
+                    open_entry_fee = _entry_fee(entry_price, size)
+                    balance -= open_entry_fee
                     stop_price = stop
                     initial_stop_price = stop
                     high_since_entry = float(p)
@@ -539,7 +594,7 @@ def simulate_turtle_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += (protective_fill - entry_price) * shares
+                balance += _exit_balance_change(entry_price, protective_fill, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
@@ -547,6 +602,7 @@ def simulate_turtle_strategy(
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             low_since_entry = min(low_since_entry, low_value)
@@ -564,8 +620,7 @@ def simulate_turtle_strategy(
                 strategy_exit_price=float(don_low),
             )
             if p <= stop_price:
-                pnl = (p - entry_price) * shares
-                balance += pnl
+                balance += _exit_balance_change(entry_price, p, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -581,6 +636,7 @@ def simulate_turtle_strategy(
                     lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             equity_curve.append(mark_to_market)
@@ -690,7 +746,10 @@ def simulate_turtle_strategy(
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
+    stats = _build_stats(
+        account, final_equity, trade_log, equity_curve, exposure_bars, n_bars,
+        risk_limits, market_data, open_entry_fee,
+    )
     return prices, smas, atrs, trade_log, live, stats, labels
 
 
@@ -737,6 +796,7 @@ def simulate_trend_pullback_strategy(
     low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
+    open_entry_fee = 0.0
     start = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window)
     live_bar = n_bars - 1
 
@@ -781,7 +841,9 @@ def simulate_trend_pullback_strategy(
                 )
                 if size > 0:
                     in_trade = True
-                    entry_price = p
+                    entry_price = round(float(p), 2)
+                    open_entry_fee = _entry_fee(entry_price, size)
+                    balance -= open_entry_fee
                     stop_price = stop
                     initial_stop_price = stop
                     high_since_entry = float(p)
@@ -795,7 +857,7 @@ def simulate_trend_pullback_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += (protective_fill - entry_price) * shares
+                balance += _exit_balance_change(entry_price, protective_fill, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
@@ -803,6 +865,7 @@ def simulate_trend_pullback_strategy(
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             low_since_entry = min(low_since_entry, low_value)
@@ -821,8 +884,7 @@ def simulate_trend_pullback_strategy(
             )
             exit_hit = p <= stop_price
             if exit_hit:
-                pnl = (p - entry_price) * shares
-                balance += pnl
+                balance += _exit_balance_change(entry_price, p, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -838,6 +900,7 @@ def simulate_trend_pullback_strategy(
                     lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             equity_curve.append(mark_to_market)
@@ -954,7 +1017,10 @@ def simulate_trend_pullback_strategy(
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
+    stats = _build_stats(
+        account, final_equity, trade_log, equity_curve, exposure_bars, n_bars,
+        risk_limits, market_data, open_entry_fee,
+    )
     return prices, trend_smas, atrs, trade_log, live, stats, labels
 
 
@@ -988,6 +1054,7 @@ def simulate_trendline_breakout_strategy(
     low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
+    open_entry_fee = 0.0
     start = max(trendline_w, exit_w, ma_w, 14)
     live_bar = n_bars - 1
 
@@ -1023,7 +1090,9 @@ def simulate_trendline_breakout_strategy(
                 )
                 if size > 0:
                     in_trade = True
-                    entry_price = p
+                    entry_price = round(float(p), 2)
+                    open_entry_fee = _entry_fee(entry_price, size)
+                    balance -= open_entry_fee
                     stop_price = stop
                     initial_stop_price = stop
                     high_since_entry = float(p)
@@ -1037,7 +1106,7 @@ def simulate_trendline_breakout_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += (protective_fill - entry_price) * shares
+                balance += _exit_balance_change(entry_price, protective_fill, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
@@ -1045,6 +1114,7 @@ def simulate_trendline_breakout_strategy(
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             low_since_entry = min(low_since_entry, low_value)
@@ -1062,8 +1132,7 @@ def simulate_trendline_breakout_strategy(
                 strategy_exit_price=float(exit_level),
             )
             if p <= stop_price:
-                pnl = (p - entry_price) * shares
-                balance += pnl
+                balance += _exit_balance_change(entry_price, p, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -1079,6 +1148,7 @@ def simulate_trendline_breakout_strategy(
                     lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             equity_curve.append(mark_to_market)
@@ -1113,7 +1183,10 @@ def simulate_trendline_breakout_strategy(
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
+    stats = _build_stats(
+        account, final_equity, trade_log, equity_curve, exposure_bars, n_bars,
+        risk_limits, market_data, open_entry_fee,
+    )
     return prices, smas, atrs, trade_log, live, stats, labels
 
 
@@ -1153,6 +1226,7 @@ def simulate_trendline_retest_strategy(
     low_since_entry = 0.0
     exit_rule = "Exit rule"
     balance = float(account)
+    open_entry_fee = 0.0
     start = max(trendline_w, exit_w, ma_w, momentum_w, 14)
     live_bar = n_bars - 1
 
@@ -1209,7 +1283,9 @@ def simulate_trendline_retest_strategy(
                         retest_seen = False
                         breakout_line = None
                         breakout_bar = None
-                        entry_price = p
+                        entry_price = round(float(p), 2)
+                        open_entry_fee = _entry_fee(entry_price, size)
+                        balance -= open_entry_fee
                         stop_price = stop
                         initial_stop_price = stop
                         high_since_entry = float(p)
@@ -1223,7 +1299,7 @@ def simulate_trendline_retest_strategy(
             if protective_fill is not None:
                 low_since_entry = min(low_since_entry, protective_fill)
                 equity_curve.append(balance + (low_since_entry - entry_price) * shares)
-                balance += (protective_fill - entry_price) * shares
+                balance += _exit_balance_change(entry_price, protective_fill, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
                     entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
@@ -1231,6 +1307,7 @@ def simulate_trendline_retest_strategy(
                     account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             low_since_entry = min(low_since_entry, low_value)
@@ -1248,8 +1325,7 @@ def simulate_trendline_retest_strategy(
                 strategy_exit_price=float(exit_level),
             )
             if p <= stop_price:
-                pnl = (p - entry_price) * shares
-                balance += pnl
+                balance += _exit_balance_change(entry_price, p, shares)
                 trade_log.append(_trade_record(
                     trade_number=len(trade_log) + 1,
                     symbol=symbol,
@@ -1265,6 +1341,7 @@ def simulate_trendline_retest_strategy(
                     lowest_price_since_entry=low_since_entry,
                 ))
                 in_trade = False
+                open_entry_fee = 0.0
                 equity_curve.append(balance)
                 continue
             equity_curve.append(mark_to_market)
@@ -1301,7 +1378,10 @@ def simulate_trendline_retest_strategy(
     if not equity_curve or equity_curve[-1] != live_balance:
         equity_curve.append(live_balance)
     final_equity = live_balance
-    stats = _build_stats(account, final_equity, trade_log, equity_curve, exposure_bars, n_bars, risk_limits, market_data)
+    stats = _build_stats(
+        account, final_equity, trade_log, equity_curve, exposure_bars, n_bars,
+        risk_limits, market_data, open_entry_fee,
+    )
     return prices, smas, atrs, trade_log, live, stats, labels
 
 

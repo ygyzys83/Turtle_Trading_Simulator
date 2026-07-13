@@ -226,7 +226,7 @@ def test_buy_and_hold_benchmark_uses_the_exact_requested_price_range():
 
     assert result.return_percent == 20.0
     assert result.max_drawdown_percent == 20.0
-    assert result.final_equity == 12_000.0
+    assert result.final_equity == 11_999.71
     assert subset.return_percent == 9.09
     assert subset.bars == 3
 

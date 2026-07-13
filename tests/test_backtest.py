@@ -212,7 +212,8 @@ def test_backtest_trade_rows_obey_position_notional_limit():
     first_trade = trade_log[0]
     assert first_trade["notional"] <= 50_000 * 0.10
     assert first_trade["shares"] == int((50_000 * 0.10) // first_trade["entry"])
-    assert first_trade["risk_dollars"] == round((first_trade["entry"] - first_trade["stop"]) * first_trade["shares"], 2)
+    assert first_trade["price_risk_dollars"] == round((first_trade["entry"] - first_trade["stop"]) * first_trade["shares"], 2)
+    assert first_trade["risk_dollars"] > first_trade["price_risk_dollars"]
 
 
 def test_trend_pullback_backtest_returns_expected_contract():

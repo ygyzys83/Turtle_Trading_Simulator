@@ -34,7 +34,9 @@ from agentloop_trader.automation import (
 from agentloop_trader.automation_runtime import (
     AutomationControl,
     AutomationControlStore,
+    DEFAULT_LOCK_PATH,
     WorkerStatusStore,
+    request_worker_stop,
     start_worker_process,
     worker_status_is_active,
     worker_status_records,
@@ -96,6 +98,11 @@ from agentloop_trader.evidence import (
     build_evidence_package,
     evidence_package_records,
     write_evidence_package,
+)
+from agentloop_trader.fees import (
+    ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
+    estimate_alpaca_equity_order_fees,
+    estimate_alpaca_equity_round_trip_fees,
 )
 from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
@@ -992,6 +999,10 @@ def paper_buy_price_records(
         if intent.limit_price is None
         else "Do not buy above the listed limit price."
     )
+    fee_price = float(intent.limit_price or intent.entry_price or reference_price or 0.0)
+    buy_fee = estimate_alpaca_equity_order_fees(
+        side="buy", quantity=intent.quantity, price=fee_price,
+    ) if fee_price > 0 else None
     return [
         {"Field": "Order sent to Alpaca", "Value": order_type},
         {"Field": "Shares", "Value": f"{intent.quantity:,}"},
@@ -999,6 +1010,10 @@ def paper_buy_price_records(
         {"Field": "Price instruction", "Value": order_style},
         {"Field": "Price adjustment", "Value": adjustment_label},
         {"Field": "Highest buy price", "Value": max_price},
+        {
+            "Field": "Estimated live buy fee",
+            "Value": money_or_missing(buy_fee.total if buy_fee is not None else None),
+        },
         {"Field": "Plain English", "Value": limit_rule},
     ]
 
@@ -1095,8 +1110,14 @@ def decision_ticket_records() -> list[dict]:
             {"Item": "Ticker", "Value": ticker},
             {"Item": "Strategy", "Value": strategy_label},
         ]
-    dollars_at_risk = max(0.0, (intent.entry_price - intent.stop_loss) * intent.quantity) if intent.stop_loss is not None else None
+    dollars_at_risk = estimated_intent_risk_with_fees(intent)
     risk_pct_account = (dollars_at_risk / paper_order_risk_equity * 100) if dollars_at_risk is not None and paper_order_risk_equity else None
+    fee_exit_price = intent.stop_loss or intent.entry_price
+    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+        quantity=intent.quantity,
+        entry_price=intent.entry_price,
+        exit_price=fee_exit_price,
+    )
     return [
         {"Item": "Decision", "Value": final_answer},
         {"Item": "Reason", "Value": final_detail},
@@ -1108,8 +1129,24 @@ def decision_ticket_records() -> list[dict]:
         {"Item": "Stop loss", "Value": money_or_missing(intent.stop_loss)},
         {"Item": "Dollars at risk", "Value": money_or_missing(dollars_at_risk)},
         {"Item": "Account risk", "Value": pct_or_missing(risk_pct_account)},
+        {
+            "Item": "Estimated round-trip Alpaca fees",
+            "Value": money_or_missing(buy_fees.total + sell_fees.total),
+        },
         {"Item": "Next action", "Value": operator_state["Next Action"]},
     ]
+
+
+def estimated_intent_risk_with_fees(trade_intent: TradeIntent | None) -> float | None:
+    if trade_intent is None or trade_intent.entry_price is None or trade_intent.stop_loss is None:
+        return None
+    price_risk = abs(float(trade_intent.entry_price) - float(trade_intent.stop_loss)) * trade_intent.quantity
+    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+        quantity=trade_intent.quantity,
+        entry_price=trade_intent.entry_price,
+        exit_price=trade_intent.stop_loss,
+    )
+    return round(price_risk + buy_fees.total + sell_fees.total, 2)
 
 
 def required_setup_reads(selected_strategy_type: str, require_rsi: bool = False) -> set[str]:
@@ -1133,7 +1170,7 @@ def trade_read_records() -> list[dict]:
         {"Section": "Decision", "Item": "Strategy", "Status / Value": strategy_label, "Plain English": "Trading rule selected in the sidebar."},
     ]
     if intent is not None:
-        dollars_at_risk = max(0.0, (intent.entry_price - intent.stop_loss) * intent.quantity) if intent.stop_loss is not None else None
+        dollars_at_risk = estimated_intent_risk_with_fees(intent)
         risk_pct_account = (dollars_at_risk / paper_order_risk_equity * 100) if dollars_at_risk is not None and paper_order_risk_equity else None
         rows.extend(
             [
@@ -1541,6 +1578,11 @@ active_automation_level = resolve_active_automation_level(
 sidebar_worker_status_store = WorkerStatusStore()
 sidebar_worker_status = sidebar_worker_status_store.read()
 sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
+sidebar_worker_present = bool(
+    sidebar_worker_active
+    or sidebar_worker_status.running
+    or DEFAULT_LOCK_PATH.exists()
+)
 sidebar_control_store = AutomationControlStore()
 if "background_worker_enabled" not in st.session_state:
     st.session_state["background_worker_enabled"] = sidebar_worker_active
@@ -1550,10 +1592,18 @@ if not sidebar_worker_active:
     st.session_state["worker_stop_pending"] = False
 if kill_switch:
     st.session_state["background_worker_enabled"] = False
-worker_status_text = "Running" if sidebar_worker_active else "Stopped"
+worker_status_text = (
+    "Running"
+    if sidebar_worker_active
+    else "Needs attention"
+    if sidebar_worker_present
+    else "Stopped"
+)
 worker_behavior_text = (
     "Monitoring continues if Streamlit closes; the Buy watchlist is active."
     if sidebar_worker_active
+    else "The heartbeat is stale. Stop Worker will terminate the verified worker process."
+    if sidebar_worker_present
     else "Only the open Streamlit page can check the loaded ticker and exits; the Buy watchlist is paused."
 )
 st.sidebar.caption(f"Worker: {worker_status_text}. {worker_behavior_text}")
@@ -1569,7 +1619,7 @@ if worker_control_cols[0].button(
     st.session_state["stop_background_worker_requested"] = False
 if worker_control_cols[1].button(
     "Stop Worker",
-    disabled=not sidebar_worker_active,
+    disabled=not sidebar_worker_present,
     help="Stop background monitoring. The open Streamlit page can still check the loaded ticker and saved exits.",
 ):
     st.session_state["background_worker_enabled"] = False
@@ -2429,7 +2479,7 @@ if stop_worker_requested:
 worker_stop_requested = bool(
     st.session_state.get("worker_stop_pending", False)
     or stop_worker_requested
-    or (previous_automation_control.stop_requested and sidebar_worker_active and not start_worker_requested)
+    or (previous_automation_control.stop_requested and not start_worker_requested)
 )
 automation_control = AutomationControl(
     enabled=bool(background_worker_enabled and active_automation_level != "Manual review only"),
@@ -2485,15 +2535,12 @@ if start_worker_requested:
         )
     st.rerun()
 elif stop_worker_requested:
-    automation_worker_status_store.write(
-        replace(
-            automation_worker_status_store.read(),
-            state="Stopping",
-            last_checked_at=datetime.now().astimezone().isoformat(),
-            last_action="Stop requested from the Streamlit sidebar.",
-            last_error="",
-        )
+    request_worker_stop(
+        automation_control_store,
+        automation_worker_status_store,
+        timeout_seconds=5.0,
     )
+    st.session_state["worker_stop_pending"] = False
     st.rerun()
 automation_worker_status = automation_worker_status_store.read()
 
@@ -4385,7 +4432,9 @@ if command_center_view == "New Trade":
             "Worst Intratrade P&L $": t.get("max_adverse_pnl", ""),
             "Stop $": t["stop"],
             "Exit Rule": str(t.get("exit_rule", "Exit rule")).title(),
-            "P&L $": t["pnl"],
+            "Gross P&L $": t.get("gross_pnl", t["pnl"]),
+            "Estimated Alpaca Fees $": t.get("estimated_alpaca_fees", 0.0),
+            "Net P&L $": t["pnl"],
             "% Account": t["pct_acct"],
         } for t in trade_log]).set_index("#")
     
@@ -4393,7 +4442,7 @@ if command_center_view == "New Trade":
             return "color: #35C46A" if val > 0 else "color: #FF6262"
     
         event = st.dataframe(
-            display_df.style.map(color_pnl, subset=["P&L $", "% Account"]),
+            display_df.style.map(color_pnl, subset=["Net P&L $", "% Account"]),
             width="stretch",
             height=min(400, 38 + 35 * len(display_df)),
             on_select="rerun",
@@ -4419,7 +4468,13 @@ if command_center_view == "New Trade":
     st.info(f"Current trading rule: {strategy_label}. Only the selected strategy can create the trade idea shown in this run.")
     c1, c2, c3, c4 = st.columns(4)
     pnl_color = "pos" if stats["total_pnl"] >= 0 else "neg"
-    metric_card(c1, "Final equity", f"${stats['final_equity']:,}", f"P&L ${stats['total_pnl']:,}", pnl_color)
+    metric_card(
+        c1,
+        "Final equity",
+        f"${stats['final_equity']:,}",
+        f"Net P&L ${stats['total_pnl']:,}; estimated Alpaca fees ${stats.get('estimated_alpaca_fees', 0):,.2f}",
+        pnl_color,
+    )
     metric_card(c2, "Account return", f"{stats['return_pct']}%", "Impact on the complete account", pnl_color)
     annualized_allocated = stats.get("annualized_allocated_return_pct")
     allocated_sub = f"${stats.get('allocated_capital', account):,.0f} ticker allocation"
@@ -4444,7 +4499,12 @@ if command_center_view == "New Trade":
         st.markdown(
             "Historical signals use completed bars. Entries use the signal-bar close. "
             "Protective stops fill at the stop price, or at the bar open after a gap below the stop. "
-            "The test does not estimate commissions, spread, or slippage."
+            f"Results include estimated Alpaca U.S. equity regulatory fees using the fee schedule effective "
+            f"{ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE} and a 0% direct-account commission assumption. "
+            "Paper trading does not deduct these fees, so they are included here as live-equivalent costs. "
+            "The estimate conservatively rounds each order's applicable fee components upward; Alpaca live "
+            "aggregates each fee type by account and day, so actual day-end charges may differ by a few cents. "
+            "Spread, slippage, market impact, taxes, and idle-cash interest are not included."
         )
         st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
     
@@ -4461,7 +4521,8 @@ if command_center_view == "New Trade":
         st.caption(
             "This compares all four strategies and buy-and-hold using the same ticker allocation set by Max symbol concentration. "
             "Account return remains visible separately. Buy and hold uses adjusted closing prices; taxes, idle-cash interest, "
-            "and trading costs are not included."
+            "spread, slippage, and market impact are not included. Strategy results are net of estimated Alpaca regulatory fees; "
+            "buy and hold includes one estimated buy and one estimated sell."
         )
         
         st.markdown("#### Test on newer price data")

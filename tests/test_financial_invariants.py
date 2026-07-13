@@ -35,7 +35,9 @@ def test_all_strategy_trade_rows_reconcile_and_obey_risk_caps():
         for trade in trade_log:
             assert trade["notional"] <= account * 0.05 + 0.01
             assert trade["risk_dollars"] <= account * 0.01 + 0.01
-            assert trade["pnl"] == round((trade["exit"] - trade["entry"]) * trade["shares"], 2)
+            assert trade["gross_pnl"] == round((trade["exit"] - trade["entry"]) * trade["shares"], 2)
+            assert trade["pnl"] == round(trade["gross_pnl"] - trade["estimated_alpaca_fees"], 2)
+            assert trade["estimated_alpaca_fees"] >= 0.04
             assert trade["max_adverse_pnl"] <= 0
 
 

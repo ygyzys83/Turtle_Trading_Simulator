@@ -38,7 +38,7 @@ def test_equal_capital_buy_and_hold_keeps_unallocated_account_cash_idle():
 
     assert result.return_percent == 20.0
     assert result.account_return_percent == 1.0
-    assert result.final_equity == 101_000
+    assert result.final_equity == 100_999.84
     assert result.max_drawdown_percent == 10.0
     assert result.annualized_return_percent is not None
 

@@ -526,6 +526,30 @@ The trade-count thresholds adapt to bar interval: 1-hour requires 20 trades for 
 
 The main UI shows only the verdict and next step. Detailed supporting, uncertain, and contradictory evidence stays inside `Why this recommendation`.
 
+## Alpaca Equity Fee Accounting (July 13, 2026)
+
+The app uses Alpaca's U.S. equity brokerage fee schedule revised July 1, 2026:
+
+- Direct self-directed API commission assumption: 0%.
+- SEC transaction fee on sells: 0.0000206 times trade value.
+- FINRA Trading Activity Fee on sells: $0.000195 per share, capped at $9.79 per trade.
+- FINRA CAT fee on buys and sells: $0.000003 per executed equivalent share for NMS equities.
+
+Alpaca aggregates each fee type by account and trading day, rounds each daily fee total up to the nearest cent, and posts the charge at day-end. Since a preview or backtest cannot know unrelated account activity, the app uses a conservative per-order estimate that rounds each applicable fee component upward.
+
+Fee behavior in the app:
+
+- Backtest trade P&L, final equity, returns, drawdown, profit factor, strategy comparisons, optimizer results, and buy-and-hold benchmarks are net of estimated Alpaca fees.
+- Historical trade rows retain gross P&L, estimated fees, and net P&L.
+- Risk sizing and dollars-at-risk include estimated fees if the stop is hit.
+- Available-cash checks include the estimated buy fee.
+- Paper and live Alpaca order previews show estimated order value, fees, and cash needed or net proceeds.
+- Paper Review estimates what filled paper orders would have cost live.
+- Alpaca paper balances remain unchanged because Alpaca paper trading does not deduct regulatory fees. The app labels paper fee figures as live-equivalent estimates.
+- Spread, slippage, market impact, taxes, ADR custody fees, margin interest, partner-specific commissions, and optional Alpaca Elite routing charges are not silently included in the base fee model.
+
+The full suite passed after this integration: 286 tests.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

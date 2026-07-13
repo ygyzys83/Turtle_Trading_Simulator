@@ -178,7 +178,7 @@ def test_constrain_trade_intent_reduces_quantity_to_strictest_risk_limit():
         available_cash=50_000,
     )
 
-    assert adjusted.quantity == 100
+    assert adjusted.quantity == 99
     assert "deterministic_risk_sizing" in adjusted.source_signals
     assert check_trade_intent(adjusted, 50_000, RiskLimits(allowed_symbols=("AAPL",))).approved
 
@@ -205,7 +205,7 @@ def test_constrain_trade_intent_respects_cash_and_notional_limits():
         available_cash=12_000,
     )
 
-    assert adjusted.quantity == 120
+    assert adjusted.quantity == 119
 
 
 def test_constrain_trade_intent_returns_zero_when_no_quantity_is_allowed():

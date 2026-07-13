@@ -9,6 +9,10 @@ from types import SimpleNamespace
 from typing import Protocol
 
 from agentloop_trader.execution import PaperBroker, PaperOrder
+from agentloop_trader.fees import (
+    ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
+    estimate_alpaca_equity_order_fees,
+)
 from agentloop_trader.models import ExecutionDecision, TradeIntent
 
 DEFAULT_ALPACA_PAPER_BASE_URL = "https://paper-api.alpaca.markets/v2"
@@ -508,6 +512,26 @@ def build_alpaca_order_preview(
 ) -> AlpacaOrderPreview:
     blocked: list[str] = []
     symbol = intent.symbol_clean if intent else ""
+    reference_price = 0.0
+    if intent is not None:
+        reference_price = float(intent.limit_price or intent.entry_price or 0.0)
+    fee_estimate = (
+        estimate_alpaca_equity_order_fees(
+            side=intent.side,
+            quantity=intent.quantity,
+            price=reference_price,
+        )
+        if intent is not None and intent.side in {"buy", "sell"} and intent.quantity > 0 and reference_price > 0
+        else None
+    )
+    estimated_order_value = fee_estimate.trade_value if fee_estimate is not None else 0.0
+    estimated_cash_change = (
+        estimated_order_value + fee_estimate.total
+        if fee_estimate is not None and intent is not None and intent.side == "buy"
+        else estimated_order_value - fee_estimate.total
+        if fee_estimate is not None
+        else 0.0
+    )
     order = {
         "broker": "alpaca",
         "mode": config.account_mode,
@@ -517,6 +541,24 @@ def build_alpaca_order_preview(
         "order_type": intent.order_type if intent else "",
         "limit_price": intent.limit_price if intent and intent.order_type == "limit" else "",
         "time_in_force": intent.time_in_force if intent else "",
+        "estimated_order_value": f"${estimated_order_value:,.2f}" if fee_estimate is not None else "Not available",
+        "estimated_alpaca_fees": f"${fee_estimate.total:,.2f}" if fee_estimate is not None else "Not available",
+        "estimated_cash_needed": (
+            f"${estimated_cash_change:,.2f}"
+            if fee_estimate is not None and intent is not None and intent.side == "buy"
+            else "Not applicable"
+        ),
+        "estimated_net_proceeds": (
+            f"${estimated_cash_change:,.2f}"
+            if fee_estimate is not None and intent is not None and intent.side == "sell"
+            else "Not applicable"
+        ),
+        "fee_estimate_note": (
+            "Live-equivalent estimate; Alpaca paper does not deduct regulatory fees."
+            if config.paper
+            else "Estimate only; Alpaca aggregates fee types daily and posts actual charges at day-end."
+        ),
+        "fee_schedule_effective": ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
         "source": "adjusted_deterministic_trade_intent",
     }
     if intent is None:
@@ -664,6 +706,12 @@ def _display_order_field(key: str) -> str:
         "action": "Action",
         "broker_order_id": "Alpaca Order ID",
         "status": "Alpaca Status",
+        "estimated_order_value": "Estimated Order Value",
+        "estimated_alpaca_fees": "Estimated Alpaca Fees",
+        "estimated_cash_needed": "Estimated Cash Needed",
+        "estimated_net_proceeds": "Estimated Net Proceeds",
+        "fee_estimate_note": "Fee Estimate Note",
+        "fee_schedule_effective": "Fee Schedule Effective",
     }.get(key, key.replace("_", " ").title())
 
 

@@ -26,7 +26,10 @@ def _snapshot():
             {"Symbol": "AAPL", "Book Value": 1000.0},
         ],
         tracked_alpaca_orders=[
-            {"status": "filled", "filled_quantity": "40"},
+            {
+                "status": "filled", "side": "buy", "filled_quantity": "40",
+                "average_fill_price": "300.00",
+            },
             {"status": "canceled", "quantity": "10"},
             {"status": "accepted", "quantity": "5"},
         ],
@@ -106,6 +109,7 @@ def test_alpaca_paper_activity_records_report_saved_broker_history():
     assert metrics["Saved Alpaca orders"] == 3
     assert metrics["Filled Alpaca shares"] == "40"
     assert metrics["Alpaca orders waiting to fill"] == 1
+    assert metrics["Estimated live fees on filled orders"] == "$0.01"
 
 
 def test_paper_trading_review_records_surface_next_step_and_account_value():
@@ -117,6 +121,7 @@ def test_paper_trading_review_records_surface_next_step_and_account_value():
     assert reads["Waiting orders"] == 1
     assert reads["Paper buys sent"] == 1
     assert reads["Paper exits sent"] == 1
+    assert reads["Estimated live fees"] == "$0.01"
     assert "Watch or cancel" in reads["Next step"]
 
 

@@ -10,6 +10,7 @@ import numpy as np
 import pandas as pd
 
 from agentloop_trader.evaluation import WalkForwardResult, evaluate_walk_forward, synthetic_ohlc_frame
+from agentloop_trader.fees import estimate_alpaca_equity_round_trip_fees
 from agentloop_trader.models import RiskLimits, StrategyConfig
 from agentloop_trader.performance import (
     allocation_metrics,
@@ -150,6 +151,7 @@ class BuyAndHoldBenchmark:
     annualized_return_percent: float | None = None
     allocated_capital: float = 0.0
     period_years: float | None = None
+    estimated_alpaca_fees: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -515,11 +517,19 @@ def buy_and_hold_benchmark(
             0.0, 0.0, float(account_equity), start_price, end_price, len(close),
             allocated_capital=allocation, period_years=years,
         )
-    sleeve_curve = close.to_numpy(dtype=float) / start_price * allocation
+    quantity = allocation / start_price
+    buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+        quantity=quantity,
+        entry_price=start_price,
+        exit_price=end_price,
+    )
+    estimated_fees = buy_fees.total + sell_fees.total
+    sleeve_curve = close.to_numpy(dtype=float) / start_price * allocation - buy_fees.total
+    sleeve_curve[-1] -= sell_fees.total
     equity_curve = float(account_equity) - allocation + sleeve_curve
     sleeve_peaks = np.maximum.accumulate(sleeve_curve)
     max_drawdown_dollars = float(np.max(sleeve_peaks - sleeve_curve))
-    raw_return = (end_price / start_price - 1) * 100
+    raw_return = ((end_price - start_price) * quantity - estimated_fees) / allocation * 100
     account_return = (equity_curve[-1] / float(account_equity) - 1) * 100
     return BuyAndHoldBenchmark(
         return_percent=round(raw_return, 2),
@@ -532,6 +542,7 @@ def buy_and_hold_benchmark(
         annualized_return_percent=annualized_return_percent(raw_return, years),
         allocated_capital=round(allocation, 2),
         period_years=round(years, 4) if years is not None else None,
+        estimated_alpaca_fees=round(estimated_fees, 2),
     )
 
 

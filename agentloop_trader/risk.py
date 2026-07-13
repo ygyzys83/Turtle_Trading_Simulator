@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from agentloop_trader.fees import (
+    estimate_alpaca_equity_order_fees,
+    estimate_alpaca_equity_round_trip_fees,
+)
 from agentloop_trader.models import (
     ExecutionDecision,
     ExecutionMode,
@@ -45,7 +49,18 @@ def constrain_trade_intent_to_limits(
     if intent.stop_loss is not None:
         risk_per_share = abs(entry_price - float(intent.stop_loss))
         max_risk_dollars = account_equity * limits.max_risk_per_trade_pct / 100
-        max_quantities.append(int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0)
+        risk_limited_quantity = int(max_risk_dollars // risk_per_share) if risk_per_share > 0 else 0
+        while risk_limited_quantity > 0:
+            buy_fees, sell_fees = estimate_alpaca_equity_round_trip_fees(
+                quantity=risk_limited_quantity,
+                entry_price=entry_price,
+                exit_price=float(intent.stop_loss),
+            )
+            estimated_stop_loss = risk_per_share * risk_limited_quantity + buy_fees.total + sell_fees.total
+            if estimated_stop_loss <= max_risk_dollars:
+                break
+            risk_limited_quantity -= 1
+        max_quantities.append(risk_limited_quantity)
 
     max_position_notional = account_equity * limits.max_position_notional_pct / 100
     max_quantities.append(int(max_position_notional // entry_price))
@@ -57,7 +72,15 @@ def constrain_trade_intent_to_limits(
     max_quantities.append(int(max(0.0, remaining_symbol_notional) // entry_price))
 
     if available_cash is not None and intent.side == "buy":
-        max_quantities.append(int(max(0.0, available_cash) // entry_price))
+        cash_limited_quantity = int(max(0.0, available_cash) // entry_price)
+        while cash_limited_quantity > 0:
+            buy_fee = estimate_alpaca_equity_order_fees(
+                side="buy", quantity=cash_limited_quantity, price=entry_price,
+            ).total
+            if entry_price * cash_limited_quantity + buy_fee <= available_cash:
+                break
+            cash_limited_quantity -= 1
+        max_quantities.append(cash_limited_quantity)
 
     adjusted_quantity = max(0, min(max_quantities))
     if adjusted_quantity == intent.quantity:
@@ -101,6 +124,18 @@ def check_trade_intent(
 
     symbol = intent.symbol_clean
     risk_dollars = intent.estimated_risk_dollars
+    estimated_buy_fee = 0.0
+    if intent.entry_price is not None and intent.quantity > 0 and intent.side == "buy":
+        estimated_buy_fee = estimate_alpaca_equity_order_fees(
+            side="buy", quantity=intent.quantity, price=float(intent.entry_price),
+        ).total
+        if intent.stop_loss is not None:
+            _, estimated_sell_fees = estimate_alpaca_equity_round_trip_fees(
+                quantity=intent.quantity,
+                entry_price=float(intent.entry_price),
+                exit_price=float(intent.stop_loss),
+            )
+            risk_dollars += estimated_buy_fee + estimated_sell_fees.total
     notional_dollars = intent.estimated_notional
 
     checks["account_equity_positive"] = account_equity > 0
@@ -192,10 +227,12 @@ def check_trade_intent(
         )
 
     if available_cash is not None:
-        checks["cash_available"] = intent.side != "buy" or notional_dollars <= available_cash
+        estimated_cash_needed = notional_dollars + estimated_buy_fee
+        checks["cash_available"] = intent.side != "buy" or estimated_cash_needed <= available_cash
         if not checks["cash_available"]:
             rejected.append(
-                f"Estimated notional ${notional_dollars:,.2f} exceeds available cash ${available_cash:,.2f}."
+                f"Estimated cash needed ${estimated_cash_needed:,.2f}, including Alpaca fees, "
+                f"exceeds available cash ${available_cash:,.2f}."
             )
 
     return RiskCheckResult(

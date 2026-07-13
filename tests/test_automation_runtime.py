@@ -1,9 +1,12 @@
+import json
+
 from agentloop_trader.automation_runtime import (
     AutomationControl,
     AutomationControlStore,
     WorkerLock,
     WorkerStatus,
     WorkerStatusStore,
+    request_worker_stop,
     start_worker_process,
     worker_status_is_active,
     worker_status_records,
@@ -85,3 +88,53 @@ def test_worker_lock_allows_one_owner(tmp_path):
     first.release()
     assert second.acquire() is True
     second.release()
+
+
+def test_request_worker_stop_persists_stop_when_worker_is_already_stopped(tmp_path):
+    control_store = AutomationControlStore(tmp_path / "control.json")
+    status_store = WorkerStatusStore(tmp_path / "status.json")
+    control_store.write(AutomationControl(enabled=True, stop_requested=False))
+    status_store.write(WorkerStatus(running=False, state="Stopped"))
+
+    status = request_worker_stop(
+        control_store,
+        status_store,
+        lock_path=tmp_path / "worker.lock",
+        timeout_seconds=0,
+    )
+
+    assert control_store.read().enabled is False
+    assert control_store.read().stop_requested is True
+    assert status.running is False
+    assert status.state == "Stopped"
+
+
+def test_request_worker_stop_force_stops_only_verified_worker_pid(monkeypatch, tmp_path):
+    control_store = AutomationControlStore(tmp_path / "control.json")
+    status_store = WorkerStatusStore(tmp_path / "status.json")
+    lock_path = tmp_path / "worker.lock"
+    lock_path.write_text(json.dumps({"pid": 1234}), encoding="utf-8")
+    control_store.write(AutomationControl(enabled=True))
+    status_store.write(WorkerStatus(running=True, pid=1234, state="Watching"))
+    alive = {"value": True}
+    terminated = []
+
+    monkeypatch.setattr("agentloop_trader.automation_runtime._process_exists", lambda pid: alive["value"])
+
+    def terminate(pid):
+        terminated.append(pid)
+        alive["value"] = False
+
+    monkeypatch.setattr("agentloop_trader.automation_runtime._terminate_worker_process", terminate)
+
+    status = request_worker_stop(
+        control_store,
+        status_store,
+        lock_path=lock_path,
+        timeout_seconds=0,
+    )
+
+    assert terminated == [1234]
+    assert status.running is False
+    assert status.state == "Stopped"
+    assert not lock_path.exists()

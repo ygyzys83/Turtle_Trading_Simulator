@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
-from dataclasses import asdict, dataclass, field
+import time
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -135,6 +137,103 @@ def start_worker_process(cwd: str | Path | None = None, python_executable: str |
         kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
     process = subprocess.Popen(command, **kwargs)
     return int(process.pid)
+
+
+def request_worker_stop(
+    control_store: AutomationControlStore | None = None,
+    status_store: WorkerStatusStore | None = None,
+    *,
+    lock_path: str | Path | None = None,
+    timeout_seconds: float = 5.0,
+) -> WorkerStatus:
+    """Request a clean stop, then terminate only the PID verified by the worker lock."""
+    control_store = control_store or AutomationControlStore()
+    status_store = status_store or WorkerStatusStore()
+    worker_lock_path = Path(lock_path) if lock_path is not None else DEFAULT_LOCK_PATH
+    control = control_store.read()
+    control_store.write(replace(control, enabled=False, stop_requested=True))
+    status = status_store.read()
+    status_store.write(replace(
+        status,
+        state="Stopping" if status.running else "Stopped",
+        last_checked_at=datetime.now(PACIFIC_TIME).isoformat(),
+        last_action="Stop requested from the Streamlit sidebar.",
+        last_error="",
+    ))
+    if not status.running:
+        return status_store.read()
+
+    deadline = time.monotonic() + max(0.0, float(timeout_seconds))
+    while time.monotonic() < deadline:
+        current = status_store.read()
+        if not current.running or not worker_lock_path.exists():
+            stopped = replace(current, running=False, state="Stopped", last_error="")
+            status_store.write(stopped)
+            return stopped
+        time.sleep(0.1)
+
+    current = status_store.read()
+    lock_pid = _worker_lock_pid(worker_lock_path)
+    if current.running and current.pid > 0 and lock_pid == current.pid:
+        _terminate_worker_process(current.pid)
+        for _ in range(20):
+            if not _process_exists(current.pid):
+                break
+            time.sleep(0.1)
+
+    process_alive = bool(current.pid > 0 and _process_exists(current.pid))
+    lock_still_owned = _worker_lock_pid(worker_lock_path) == current.pid
+    stopped_cleanly = not process_alive or not lock_still_owned
+    final = replace(
+        status_store.read(),
+        running=not stopped_cleanly,
+        state="Stopped" if stopped_cleanly else "Stop failed",
+        last_checked_at=datetime.now(PACIFIC_TIME).isoformat(),
+        last_action="Background worker stopped." if stopped_cleanly else "Worker did not stop after the shutdown request.",
+        last_error="" if stopped_cleanly else "Use Stop Worker again or close the verified worker process.",
+    )
+    status_store.write(final)
+    if stopped_cleanly and worker_lock_path.exists():
+        try:
+            worker_lock_path.unlink()
+        except OSError:
+            pass
+    return final
+
+
+def _worker_lock_pid(path: Path) -> int:
+    payload = _read_json(path)
+    try:
+        return int(payload.get("pid", 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def _process_exists(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except (OSError, ProcessLookupError):
+        return False
+
+
+def _terminate_worker_process(pid: int) -> None:
+    if os.name == "nt":
+        subprocess.run(
+            ["taskkill", "/PID", str(pid), "/T", "/F"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            creationflags=subprocess.CREATE_NO_WINDOW,
+            timeout=5,
+            check=False,
+        )
+        return
+    os.kill(pid, signal.SIGTERM)
 
 
 class WorkerLock:
