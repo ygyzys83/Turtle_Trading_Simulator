@@ -46,7 +46,7 @@ The immediate objective is not additional feature expansion. It is to run paper 
   - Workspace: Daily Trading Screen or Full Records and Evidence.
   - Command-center page: Open Positions, Ideas, New Trade, Alpaca, or Paper Review.
   - Order mode: Backtest only, Paper trading, Practice mode, or live mode.
-  - Automation setting: Manual, Auto exits, or Auto entries and exits.
+  - Automation setting: Manual, Auto exits, or Auto exits and queued buys.
   - Exact buttons, checkboxes, and expected messages.
 - The user is an experienced trader/investor. Do not add ceremony merely to protect paper trading.
 - Keep essential deterministic controls, audit records, and a Kill Switch, but do not clutter the daily workflow with repetitive checklists.
@@ -577,6 +577,19 @@ Buy watchlist setups now have an explicit `Repeat After Exit` setting, shown as 
 - The repeating setup remains On until the user pauses, updates, or removes it. Existing risk limits, duplicate-order checks, the Kill Switch, automation mode, and the worker-session automatic-buy cap still apply.
 
 The repeat lifecycle and one-time fallback passed the full 299-test suite. No broker order was submitted during testing.
+
+## Queued-Only Automatic Entries (July 13, 2026)
+
+Automatic entry sources are now deliberately separated from research:
+
+- The ticker currently open in the sidebar is research/manual-only. A TRADE result can still be sent with the explicit `Send Paper Buy to Alpaca` button, but it can never trigger an automatic BUY.
+- Automatic BUY orders can originate only from enabled setups explicitly saved in the Buy watchlist.
+- The visible automation choice is `Auto exits and queued buys`, with a separate `Allow queued buys` permission. This permission does not control automatic exits.
+- Only the Background Worker monitors queued buys. If the Buy watchlist is empty, the worker reports that no automatic buys are monitored and does not fall back to its last saved sidebar ticker.
+- The open Streamlit page timer manages saved exits and stale limit-order cancellation only. It has no automatic BUY submission path.
+- Auto exits remain independent and continue to use each open position's saved exit plan.
+
+Regression tests prove that an empty queue cannot call the worker's entry sender and that the Streamlit page contains no automatic-entry submission event.
 
 ## Instructions For The Next Codex Conversation
 

@@ -126,12 +126,21 @@ def test_buy_watchlist_readiness_distinguishes_worker_state_from_market_hours():
 def test_sidebar_automation_controls_state_their_exact_scope():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 
-    assert '"Allow automatic paper buys"' in text
+    assert '"Allow queued buys"' in text
+    assert '"Auto exits and queued buys"' in text
     assert '"Use Alpaca paper account"' not in text
     assert 'enable_alpaca_paper_orders = bool(execution_mode == "paper" and alpaca_config.paper)' in text
     assert "It does not control automatic exits." in text
-    assert "Only the open Streamlit page can check the loaded ticker and exits; the Buy watchlist is paused." in text
+    assert "The ticker currently open for research is never bought automatically." in text
+    assert "The open Streamlit page can still check saved exits; the Buy watchlist is paused." in text
     assert "Monitoring continues if Streamlit closes; the Buy watchlist is active." in text
+
+
+def test_streamlit_page_has_no_automatic_buy_submission_path():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert "elif auto_entry_status.ready:" not in text
+    assert 'event_type="auto_paper_entry_submitted"' not in text
 
 
 def test_position_stop_labels_distinguish_planned_price_from_fill_adjusted_stop():

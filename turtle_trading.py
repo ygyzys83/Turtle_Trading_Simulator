@@ -18,8 +18,6 @@ from agentloop_trader.automation import (
     AutomationDryRunStore,
     AutomationRuntimeState,
     active_automation_level as resolve_active_automation_level,
-    auto_entry_decision,
-    auto_entry_decision_records,
     auto_exit_decision,
     auto_exit_decision_records,
     automation_decision_records,
@@ -819,7 +817,7 @@ def alpaca_daily_summary_records() -> list[dict]:
         {"Item": "Buying power", "Value": money_or_missing(account_record_value(alpaca_account_records, "Buying Power")), "Plain English": f"Buying power reported by {alpaca_account_label}."},
         {"Item": "Open positions", "Value": len(alpaca_positions), "Plain English": f"Current {alpaca_account_label} positions."},
         {"Item": "Orders waiting to fill", "Value": count_waiting_alpaca_orders(alpaca_orders), "Plain English": "Open Alpaca orders not filled or canceled yet."},
-        {"Item": "Automation", "Value": active_automation_level, "Plain English": "Current app automation setting."},
+        {"Item": "Automation", "Value": automation_level_label, "Plain English": "Current app automation setting."},
     ]
 
 
@@ -828,17 +826,21 @@ def automation_status_text() -> tuple[str, str, str]:
         return "Manual", "You click paper orders manually.", "info"
     if auto_exit_status.ready:
         return "Auto exit ready", f"The app can sell {auto_exit_status.quantity} {auto_exit_status.symbol}.", "warn"
-    if auto_entry_status.ready:
-        return "Auto buy ready", f"The app can buy {auto_entry_status.quantity} {auto_entry_status.symbol}.", "ok"
-    visible_status = auto_entry_status.status if active_automation_level == "Auto entries and exits" else auto_exit_status.status
-    visible_reasons = auto_entry_status.reasons if active_automation_level == "Auto entries and exits" else auto_exit_status.reasons
-    detail = "; ".join(visible_reasons) if visible_reasons else "No automation action is ready."
-    return visible_status, detail, "warn"
+    if active_automation_level == "Auto entries and exits":
+        queued_plans = buy_watchlist_store.read() if "buy_watchlist_store" in globals() else []
+        enabled_count = sum(1 for plan in queued_plans if plan.enabled)
+        if not full_automation_enabled:
+            return "Queued buys paused", "Check Allow queued buys to let the worker monitor saved setups.", "warn"
+        if not sidebar_worker_active:
+            return "Worker stopped", "Start the worker to monitor queued buys. Auto exits can still run while this page is open.", "warn"
+        return "Watching queue", f"The worker is monitoring {enabled_count} enabled queued setup(s).", "ok"
+    detail = "; ".join(auto_exit_status.reasons) if auto_exit_status.reasons else "No automatic exit is ready."
+    return auto_exit_status.status, detail, "warn"
 
 
 def daily_automation_readiness_records(context: str) -> list[dict]:
     queued_plans = buy_watchlist_store.read() if context == "New trade" and "buy_watchlist_store" in globals() else []
-    if queued_plans:
+    if context == "New trade":
         enabled_plans = [plan for plan in queued_plans if plan.enabled]
         status_counts: dict[str, int] = {}
         for plan in enabled_plans:
@@ -848,10 +850,13 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
             detail = "Kill Switch is on. No queued paper orders can be sent."
         elif active_automation_level != "Auto entries and exits" or not full_automation_enabled:
             read = "Paused"
-            detail = "Select Auto entries and exits and check Allow automatic paper buys."
+            detail = "Select Auto exits and queued buys and check Allow queued buys."
         elif execution_mode != "paper" or not enable_alpaca_paper_orders:
             read = "Paused"
             detail = "Select Paper trading. That order mode automatically uses Alpaca paper."
+        elif not queued_plans:
+            read = "No queued buys"
+            detail = "Save a setup in the Buy watchlist before the worker can buy it automatically."
         elif not sidebar_worker_active:
             read = "Worker stopped"
             detail = "Click Start Worker. The Streamlit page timer does not monitor queued setups."
@@ -868,7 +873,7 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
         return [
             {"Area": "Buy watchlist", "Read": read, "Plain English": detail},
             {"Area": "Queued setups", "Read": f"{len(enabled_plans)} enabled / {len(queued_plans)} saved", "Plain English": status_summary},
-            {"Area": "Automation mode", "Read": automation_level_label, "Plain English": "Queued entries require Auto entries and exits with Allow automatic paper buys checked."},
+            {"Area": "Automation mode", "Read": automation_level_label, "Plain English": "Queued entries require Auto exits and queued buys with Allow queued buys checked."},
             {"Area": "Background worker", "Read": "Running" if sidebar_worker_active else "Stopped", "Plain English": "Only the background worker monitors the durable Buy watchlist."},
             {"Area": "Last worker check", "Read": automation_worker_status.last_checked_at or "Not checked yet", "Plain English": automation_worker_status.last_action or "No worker action yet."},
         ]
@@ -878,17 +883,14 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
     elif auto_exit_status.ready:
         read = "Ready to sell"
         detail = f"The app can sell {auto_exit_status.quantity} {auto_exit_status.symbol} if automation is enabled."
-    elif auto_entry_status.ready:
-        read = "Ready to buy"
-        detail = f"The app can buy {auto_entry_status.quantity} {auto_entry_status.symbol} if automation is enabled."
     elif active_automation_level == "Manual review only":
         read = "Watching only"
         detail = "Automation is off. The app will show ideas, but you click orders manually."
     else:
-        visible_reasons = auto_entry_status.reasons if active_automation_level == "Auto entries and exits" else auto_exit_status.reasons
+        visible_reasons = auto_exit_status.reasons
         read = "Blocked" if visible_reasons else "Watching only"
-        detail = visible_reasons[0] if visible_reasons else "Automation is on, but no buy or sell action is ready."
-    watched = "Open positions" if active_automation_level == "Auto exits only" else f"{ticker} buys and open positions" if active_automation_level == "Auto entries and exits" else "No automatic orders"
+        detail = visible_reasons[0] if visible_reasons else "Automation is on, but no automatic exit is ready."
+    watched = "Open positions" if active_automation_level != "Manual review only" else "No automatic orders"
     return [
         {"Area": context, "Read": read, "Plain English": detail},
         {"Area": "Automation mode", "Read": automation_level_label, "Plain English": f"Currently watching: {watched}."},
@@ -1226,7 +1228,7 @@ def automation_watch_records() -> list[dict]:
     if active_automation_level == "Auto exits only":
         watched.append("open paper positions")
     elif active_automation_level == "Auto entries and exits":
-        watched.append(f"{ticker} buy setup")
+        watched.append("saved Buy watchlist setups")
         watched.append("open paper positions")
     if auto_cancel_stale_limit_orders:
         watched.append("old BUY limit orders")
@@ -1237,36 +1239,6 @@ def automation_watch_records() -> list[dict]:
         {"Item": "Last check", "Value": st.session_state.get("last_automation_checked_at", "Not checked yet")},
         {"Item": "Last action", "Value": st.session_state.get("last_automation_action", "None")},
     ]
-
-
-def auto_entry_session_safety_blockers(symbol: str) -> list[str]:
-    events = st.session_state.get("session_audit_events", [])
-    auto_buys = [event for event in events if getattr(event, "event_type", "") == "auto_paper_entry_submitted"]
-    if len(auto_buys) >= max_auto_buys_per_session:
-        return [f"Automatic buys reached the session limit of {max_auto_buys_per_session}."]
-    if reentry_cooldown_minutes <= 0 or not symbol:
-        return []
-    latest_exit_time = None
-    for event in events:
-        if getattr(event, "event_type", "") not in {"auto_paper_exit_submitted", "alpaca_paper_exit_submitted"}:
-            continue
-        payload = getattr(event, "payload", {}) or {}
-        if str(payload.get("symbol", "")).strip().upper() != symbol:
-            continue
-        try:
-            event_time = pd.Timestamp(payload.get("checked_at") or getattr(event, "created_at", None))
-            if event_time.tzinfo is None:
-                event_time = event_time.tz_localize("America/Los_Angeles")
-            latest_exit_time = max(latest_exit_time, event_time) if latest_exit_time is not None else event_time
-        except Exception:
-            continue
-    if latest_exit_time is None:
-        return []
-    elapsed_minutes = (pd.Timestamp.now(tz="America/Los_Angeles") - latest_exit_time.tz_convert("America/Los_Angeles")).total_seconds() / 60
-    if elapsed_minutes < reentry_cooldown_minutes:
-        remaining = reentry_cooldown_minutes - elapsed_minutes
-        return [f"Waiting {remaining:.0f} more minutes before another automatic buy in {symbol}."]
-    return []
 
 
 def saved_buy_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
@@ -1357,24 +1329,6 @@ def tracked_order_state_signature(orders: list[dict]) -> tuple[tuple[str, str, s
     )
 
 
-def active_tracked_preview_hashes(orders: list[dict]) -> set[str]:
-    return {
-        str(order.get("preview_hash", "")).strip()
-        for order in orders
-        if str(order.get("preview_hash", "")).strip()
-        and str(order.get("status", order.get("Status", ""))).strip().lower() in ACTIVE_ALPACA_ORDER_STATUSES
-    }
-
-
-def sync_auto_entry_sent_hashes_with_open_orders() -> None:
-    active_hashes = active_tracked_preview_hashes(st.session_state.get("tracked_alpaca_orders", []))
-    st.session_state["auto_entry_sent_hashes"] = [
-        preview_hash
-        for preview_hash in st.session_state.get("auto_entry_sent_hashes", [])
-        if preview_hash in active_hashes
-    ]
-
-
 def refresh_tracked_alpaca_orders_from_broker() -> tuple[list[dict], bool]:
     tracked_orders = st.session_state.get("tracked_alpaca_orders", [])
     if not alpaca_status.connected or not tracked_orders:
@@ -1394,7 +1348,6 @@ def refresh_tracked_alpaca_orders_from_broker() -> tuple[list[dict], bool]:
     if changed:
         broker_state_store.replace_all(refreshed_orders)
         st.session_state["tracked_alpaca_orders"] = refreshed_orders
-        sync_auto_entry_sent_hashes_with_open_orders()
     return refreshed_orders, changed
 
 
@@ -1555,7 +1508,7 @@ kill_switch = st.sidebar.checkbox(
 automation_level_options = {
     "Manual - I click paper orders": "Manual review only",
     "Auto exits - app sells paper positions": "Auto exits only",
-    "Auto entries and exits - app trades paper": "Auto entries and exits",
+    "Auto exits and queued buys": "Auto entries and exits",
 }
 st.sidebar.markdown("### :material/smart_toy: Background Automation")
 automation_level_label = st.sidebar.selectbox(
@@ -1564,7 +1517,7 @@ automation_level_label = st.sidebar.selectbox(
     index=0,
     help=(
         "Manual means the app never sends an automatic order. Auto exits lets the open Streamlit page or the Background Worker sell paper positions from their saved exit plans. "
-        "Auto entries and exits also permits automatic paper buys for the loaded ticker; the Buy watchlist is monitored only by the Background Worker."
+        "Auto exits and queued buys also lets the Background Worker buy only setups you explicitly save in the Buy watchlist. The ticker currently open for research is never bought automatically."
     ),
 )
 automation_level = automation_level_options[automation_level_label]
@@ -1573,18 +1526,18 @@ if kill_switch:
 full_automation_enabled = False
 if automation_level == "Auto entries and exits":
     full_automation_enabled = st.sidebar.checkbox(
-        "Allow automatic paper buys",
+        "Allow queued buys",
         value=bool(st.session_state.get("enable_full_paper_automation", False)),
         key="enable_full_paper_automation",
         disabled=kill_switch,
         help=(
-            "Required before the app may send an automatic BUY to Alpaca paper. It does not control automatic exits. "
+            "Required before the Background Worker may send a BUY from an enabled Buy watchlist setup. The ticker currently open for research is never bought automatically. It does not control automatic exits. "
             "The Kill Switch turns this permission off."
         ),
     )
     full_automation_enabled = bool(full_automation_enabled and not kill_switch)
     if not full_automation_enabled:
-        st.sidebar.caption("Automatic paper buys are not allowed.")
+        st.sidebar.caption("Queued paper buys are not allowed.")
 
 active_automation_level = resolve_active_automation_level(
     automation_level,
@@ -1621,7 +1574,7 @@ worker_behavior_text = (
     if sidebar_worker_active
     else "The heartbeat is stale. Stop Worker will terminate the verified worker process."
     if sidebar_worker_present
-    else "Only the open Streamlit page can check the loaded ticker and exits; the Buy watchlist is paused."
+    else "The open Streamlit page can still check saved exits; the Buy watchlist is paused."
 )
 st.sidebar.caption(f"Worker: {worker_status_text}. {worker_behavior_text}")
 worker_control_cols = st.sidebar.columns(2)
@@ -1637,7 +1590,7 @@ if worker_control_cols[0].button(
 if worker_control_cols[1].button(
     "Stop Worker",
     disabled=not sidebar_worker_present,
-    help="Stop background monitoring. The open Streamlit page can still check the loaded ticker and saved exits.",
+    help="Stop background monitoring. The open Streamlit page can still check saved exits, but queued buys require the worker.",
 ):
     st.session_state["background_worker_enabled"] = False
     st.session_state["worker_stop_pending"] = True
@@ -1705,7 +1658,7 @@ automation_refresh_seconds = st.sidebar.selectbox(
     [5, 15, 30, 60],
     index=1,
     format_func=lambda seconds: f"{seconds} seconds",
-    help="How often the app checks for automatic paper buys or sells while automation is on.",
+    help="How often the open app checks saved exits and old limit orders. Queued buys are checked separately by the Background Worker.",
 )
 background_worker_enabled = bool(st.session_state.get("background_worker_enabled", False))
 paper_buy_order_style = st.sidebar.selectbox(
@@ -1763,7 +1716,7 @@ with st.sidebar.expander("Advanced safety", expanded=False):
         max_value=20,
         value=3,
         step=1,
-        help="Caps app-triggered automatic paper buys until you reset the paper session or restart the app.",
+        help="Caps BUY orders sent from the Buy watchlist during one worker session.",
     )
     reentry_cooldown_minutes = st.selectbox(
         "Wait after an exit before re-buying",
@@ -2192,9 +2145,7 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
     st.session_state["auto_exit_sent_hashes"] = []
-    st.session_state["auto_entry_sent_hashes"] = []
     st.session_state["last_auto_exit_decision_key"] = None
-    st.session_state["last_auto_entry_decision_key"] = None
     st.session_state["last_automation_action"] = "None"
     st.session_state["last_automation_blocked_reason"] = ""
     st.session_state["automation_event_history"] = []
@@ -2210,9 +2161,7 @@ if reset_paper_broker:
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
     st.session_state["auto_exit_sent_hashes"] = []
-    st.session_state["auto_entry_sent_hashes"] = []
     st.session_state["last_auto_exit_decision_key"] = None
-    st.session_state["last_auto_entry_decision_key"] = None
     st.session_state["last_automation_action"] = "None"
     st.session_state["last_automation_blocked_reason"] = ""
     st.session_state["automation_event_history"] = []
@@ -2223,9 +2172,7 @@ st.session_state.setdefault("shadow_decisions", [])
 st.session_state.setdefault("paper_session_id", new_session_id())
 st.session_state.setdefault("paper_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
 st.session_state.setdefault("auto_exit_sent_hashes", [])
-st.session_state.setdefault("auto_entry_sent_hashes", [])
 st.session_state.setdefault("last_auto_exit_decision_key", None)
-st.session_state.setdefault("last_auto_entry_decision_key", None)
 st.session_state.setdefault("last_automation_action", "None")
 st.session_state.setdefault("last_automation_blocked_reason", "")
 st.session_state.setdefault("automation_event_history", [])
@@ -3293,32 +3240,6 @@ exit_blockers_by_hash_for_auto = {
     )
     for preview in exit_previews
 }
-auto_entry_blockers = (
-    list(alpaca_preview.blocked_reasons)
-    + duplicate_alpaca_reasons
-    + open_order_reasons
-    + (["This paper order is already tracked in the app."] if duplicate_preview_submitted else [])
-    + auto_entry_session_safety_blockers(intent.symbol_clean if intent else "")
-)
-auto_entry_status = auto_entry_decision(
-    automation_level=active_automation_level,
-    execution_mode=execution_mode,
-    broker_connected=alpaca_status.connected,
-    broker_can_submit=alpaca_status.can_submit_orders,
-    paper_orders_enabled=enable_alpaca_paper_orders,
-    kill_switch_enabled=effective_kill_switch,
-    broker_state_stale=alpaca_state_health.stale,
-    market_open=auto_buy_session_allows_order,
-    intent_present=intent is not None,
-    risk_approved=risk_check.approved,
-    preflight_ready=preflight_check.ready,
-    preview_valid=alpaca_preview.valid,
-    preview_hash=alpaca_preview.preview_hash,
-    symbol=intent.symbol_clean if intent else "",
-    quantity=intent.quantity if intent else "",
-    blocked_reasons=auto_entry_blockers,
-    already_sent_hashes=set(st.session_state.get("auto_entry_sent_hashes", [])),
-)
 auto_exit_status = auto_exit_decision(
     automation_level=active_automation_level,
     execution_mode=execution_mode,
@@ -3339,36 +3260,6 @@ auto_exit_status = auto_exit_decision(
 
 
 def record_automation_decisions(checked_at: str) -> None:
-    auto_entry_key = (
-        active_automation_level,
-        full_automation_enabled,
-        auto_entry_status.status,
-        auto_entry_status.preview_hash,
-        tuple(auto_entry_status.reasons),
-    )
-    if active_automation_level == "Auto entries and exits" and st.session_state.get("last_auto_entry_decision_key") != auto_entry_key:
-        auto_entry_event = AuditEvent(
-            event_type="auto_entry_decision_recorded",
-            message=f"Automatic paper buy decision: {auto_entry_status.status}.",
-            payload={
-                "automation_level": automation_level,
-                "active_automation_level": active_automation_level,
-                "full_automation_enabled": full_automation_enabled,
-                "status": auto_entry_status.status,
-                "ready": auto_entry_status.ready,
-                "symbol": auto_entry_status.symbol,
-                "quantity": auto_entry_status.quantity,
-                "preview_hash": auto_entry_status.preview_hash,
-                "reasons": auto_entry_status.reasons,
-                "checked_at": checked_at,
-                "broker_writes_submitted": 0,
-            },
-        )
-        st.session_state["session_audit_events"].append(auto_entry_event)
-        if persist_audit_log:
-            audit_store.append(auto_entry_event)
-        st.session_state["last_auto_entry_decision_key"] = auto_entry_key
-
     auto_exit_key = (
         active_automation_level,
         auto_exit_status.status,
@@ -3434,7 +3325,6 @@ def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
             }
         )
         st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
-        sync_auto_entry_sent_hashes_with_open_orders()
         set_automation_action(
             f"Canceled old limit buy: {selected_order.get('Symbol', '')}",
             f"Order waited {order_age_label(age_minutes)}.",
@@ -3582,95 +3472,6 @@ def run_paper_automation_once() -> None:
     elif auto_cancel_stale_limit_buy_once(automation_checked_at):
         st.rerun()
 
-    elif auto_entry_status.ready:
-        try:
-            if intent is None:
-                raise ValueError("Automatic buy could not find a current trade idea.")
-            live_sent_hashes = active_tracked_preview_hashes(st.session_state.get("tracked_alpaca_orders", []))
-            if auto_entry_status.preview_hash in live_sent_hashes:
-                set_automation_action("Paper buy skipped", "This exact paper buy is already open at Alpaca.", automation_checked_at)
-                return
-            local_buy_reasons = local_open_buy_order_reasons(
-                intent.symbol_clean,
-                st.session_state.get("tracked_alpaca_orders", []),
-            )
-            if local_buy_reasons:
-                set_automation_action("Paper buy skipped", "; ".join(local_buy_reasons), automation_checked_at)
-                return
-            st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
-            alpaca_auto_entry_order = alpaca_adapter.submit_order(
-                intent,
-                execution_decision,
-                expected_preview_hash=auto_entry_status.preview_hash,
-            )
-            broker_order_id = str(getattr(alpaca_auto_entry_order, "id", ""))
-            if broker_order_id:
-                tracked_record = {
-                    "broker_order_id": broker_order_id,
-                    "preview_hash": auto_entry_status.preview_hash,
-                    "symbol": intent.symbol_clean,
-                    "side": intent.side,
-                    "quantity": intent.quantity,
-                    "order_type": intent.order_type,
-                    "limit_price": intent.limit_price,
-                    "status": str(getattr(alpaca_auto_entry_order, "status", "")),
-                    "submitted_at": str(getattr(alpaca_auto_entry_order, "submitted_at", "")),
-                    "source": "auto_entries_and_exits",
-                    "strategy_settings": current_strategy_settings,
-                    "exit_settings": current_exit_settings,
-                }
-                st.session_state["tracked_alpaca_orders"].append(tracked_record)
-                broker_state_store.upsert(tracked_record)
-                updated_orders = update_exit_settings_for_symbol(
-                    intent.symbol_clean,
-                    st.session_state["tracked_alpaca_orders"],
-                    current_exit_settings,
-                )
-                broker_state_store.replace_all(updated_orders)
-                st.session_state["tracked_alpaca_orders"] = updated_orders
-            order_type = "limit" if intent.order_type == "limit" else "market"
-            set_automation_action(f"Paper buy {order_type} sent: {intent.quantity} {intent.symbol_clean}", "", automation_checked_at)
-            auto_entry_submit_event = AuditEvent(
-                event_type="auto_paper_entry_submitted",
-                message="Automatic paper buy sent to Alpaca.",
-                payload={
-                    "symbol": intent.symbol_clean,
-                    "side": intent.side,
-                    "quantity": intent.quantity,
-                    "order_type": intent.order_type,
-                    "limit_price": intent.limit_price,
-                    "preview_hash": auto_entry_status.preview_hash,
-                    "broker_order_id": broker_order_id,
-                    "automation_level": automation_level,
-                    "checked_at": automation_checked_at,
-                    "broker_writes_submitted": 1,
-                    "strategy_settings": current_strategy_settings,
-                    "exit_settings": current_exit_settings,
-                },
-            )
-            st.session_state["session_audit_events"].append(auto_entry_submit_event)
-            if persist_audit_log:
-                audit_store.append(auto_entry_submit_event)
-        except Exception as exc:
-            if auto_entry_status.preview_hash not in st.session_state["auto_entry_sent_hashes"]:
-                st.session_state["auto_entry_sent_hashes"].append(auto_entry_status.preview_hash)
-            set_automation_action("Paper buy blocked", str(exc), automation_checked_at)
-            auto_entry_block_event = AuditEvent(
-                event_type="auto_paper_entry_blocked",
-                message=str(exc),
-                payload={
-                    "symbol": auto_entry_status.symbol,
-                    "preview_hash": auto_entry_status.preview_hash,
-                    "automation_level": automation_level,
-                    "checked_at": automation_checked_at,
-                    "broker_writes_submitted": 0,
-                },
-            )
-            st.session_state["session_audit_events"].append(auto_entry_block_event)
-            if persist_audit_log:
-                audit_store.append(auto_entry_block_event)
-
-
 automation_timer_enabled = active_automation_level != "Manual review only" and not background_worker_enabled
 if automation_timer_enabled:
     @st.fragment(run_every=f"{automation_refresh_seconds}s")
@@ -3713,13 +3514,11 @@ def render_automation_status() -> None:
         st.warning(f"{status_label}: {status_detail}")
     else:
         st.info(f"{status_label}: {status_detail}")
-    if auto_entry_status.ready and limit_buy_allowed_outside_market and not regular_market_open:
-        st.info("Market is closed. The app can send a paper limit buy because outside-hours limit buys are enabled. The order may wait at Alpaca before it fills.")
     if automation_level == "Auto entries and exits":
         if full_automation_enabled:
-            st.caption("Automatic buys are enabled for paper trading. Risk checks, account sizing, and duplicate-order checks still apply.")
+            st.caption("Queued buys are allowed. Only the Background Worker can buy an enabled Buy watchlist setup; the ticker open for research is never bought automatically.")
         else:
-            st.caption("Automatic paper buys are not allowed. Check Allow automatic paper buys in Background Automation to permit them.")
+            st.caption("Queued buys are paused. Check Allow queued buys in Background Automation to permit them.")
     elif automation_level == "Auto exits only":
         st.caption("Auto exits can sell Alpaca paper positions. You still approve new buys manually.")
     runtime_state = AutomationRuntimeState(
@@ -3727,12 +3526,8 @@ def render_automation_status() -> None:
         status=(
             "Exit ready"
             if auto_exit_status.ready
-            else "Buy ready"
-            if auto_entry_status.ready
             else "Manual"
             if active_automation_level == "Manual review only"
-            else auto_entry_status.status
-            if active_automation_level == "Auto entries and exits"
             else auto_exit_status.status
         ),
         last_checked_at=st.session_state.get("last_automation_checked_at", "Not checked yet"),
@@ -3753,8 +3548,6 @@ def render_automation_status() -> None:
     if show_portfolio_evidence:
         st.markdown("#### Automation runtime *")
         st.dataframe(pd.DataFrame(automation_runtime_records(runtime_state)), width="stretch", hide_index=True)
-        st.markdown("#### Automatic buy check *")
-        st.dataframe(pd.DataFrame(auto_entry_decision_records(auto_entry_status)), width="stretch", hide_index=True)
         st.markdown("#### Automatic exit check *")
         st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), width="stretch", hide_index=True)
 

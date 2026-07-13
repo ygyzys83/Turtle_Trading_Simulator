@@ -465,7 +465,7 @@ def _send_watchlist_entries(
             store.update(
                 plan.plan_id,
                 status="Paused",
-                detail="Select Auto entries and exits and check Enable Automation to monitor this setup.",
+                detail="Select Auto exits and queued buys and check Allow queued buys to monitor this setup.",
                 last_checked_at=now,
             )
         return 0, tracked_orders, "Buy watchlist is paused because automatic entries are off."
@@ -705,31 +705,8 @@ def run_once(
                 max_to_send=remaining_buys,
             )
         else:
-            latest_price = None
-            require_latest_price = control.price_data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}
-            if require_latest_price and control.mode == "Auto entries and exits" and control.full_automation_enabled:
-                try:
-                    latest_lookup = (
-                        fetch_alpaca_latest_crypto_trades
-                        if control.asset_class == "crypto"
-                        else fetch_alpaca_latest_trades
-                    )
-                    latest_price = latest_lookup(
-                        [control.symbol], adapter.config.api_key, adapter.config.api_secret,
-                    ).get(normalize_symbol(control.symbol, control.asset_class))
-                except Exception:
-                    latest_price = None
-            buy_count, tracked, buy_action = _send_entry(
-                control,
-                adapter,
-                positions,
-                orders,
-                tracked,
-                fetch_bars,
-                audit_store,
-                latest_price=latest_price,
-                require_latest_price=require_latest_price,
-            )
+            buy_count = 0
+            buy_action = "Buy watchlist is empty; no automatic buys are monitored."
         broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
 
         actions = [text for text in (cancel_action, exit_action, buy_action) if text]

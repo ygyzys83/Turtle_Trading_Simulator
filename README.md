@@ -148,7 +148,7 @@ The app will open in your browser. Use the sidebar controls to switch between sy
 
 Paper automation:
 
-Selecting `Paper trading - send orders to Alpaca paper` automatically uses the configured Alpaca paper account; there is no second account checkbox. With Streamlit open, the page can check the loaded ticker and saved exits on its refresh timer. Use `Start Worker` when monitoring must continue after Streamlit closes or when the durable Buy watchlist should be active. `Allow automatic paper buys` appears only for `Auto entries and exits`; it does not control automatic exits. The worker is paper-only and uses the same saved controls, risk limits, Alpaca paper account, and broker-state file as Streamlit.
+Selecting `Paper trading - send orders to Alpaca paper` automatically uses the configured Alpaca paper account; there is no second account checkbox. The ticker currently open in Streamlit is research/manual-only and is never an automatic BUY source. Automatic entries can come only from enabled Buy watchlist setups, and only the Background Worker monitors that queue. Select `Auto exits and queued buys`, check `Allow queued buys`, and start the worker to enable them. Automatic exits remain independent of queued-buy permission and can run from the open page or worker. The worker is paper-only and uses the same saved controls, risk limits, Alpaca paper account, and broker-state file as Streamlit.
 
 You can still start it manually for debugging:
 

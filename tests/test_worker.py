@@ -29,6 +29,34 @@ def test_worker_refuses_live_adapter():
     assert "paper-only" in status.last_error
 
 
+def test_worker_never_falls_back_to_displayed_ticker_when_buy_watchlist_is_empty(monkeypatch, tmp_path):
+    control = AutomationControl(
+        enabled=True,
+        mode="Auto entries and exits",
+        full_automation_enabled=True,
+        paper_orders_enabled=True,
+        symbol="TSLA",
+        audit_log_path=str(tmp_path / "audit.jsonl"),
+        broker_state_path=str(tmp_path / "broker.json"),
+        buy_watchlist_path=str(tmp_path / "watchlist.json"),
+    )
+    adapter = SimpleNamespace(
+        config=AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        position_records=lambda **kwargs: [],
+        order_records=lambda **kwargs: [],
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Displayed ticker must never be auto-bought")),
+    )
+
+    status = run_once(control, adapter=adapter)
+
+    assert status.state == "Watching"
+    assert status.orders_sent == 0
+    assert "Buy watchlist is empty" in status.last_action
+
+
 def test_worker_recognizes_auto_exits_only_mode(monkeypatch, tmp_path):
     control = AutomationControl(
         enabled=True,
