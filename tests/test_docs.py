@@ -143,6 +143,18 @@ def test_streamlit_page_has_no_automatic_buy_submission_path():
     assert 'event_type="auto_paper_entry_submitted"' not in text
 
 
+def test_buy_watchlist_creation_and_management_are_on_their_intended_pages():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert '["Positions & Queue", "Ideas", "New Trade", "Alpaca", "Paper Review"]' in text
+    assert 'if command_center_view == "Positions & Queue":' in text
+    assert 'if command_center_view == "Open Positions":' not in text
+    assert text.count("render_current_setup_watchlist_action()") == 2
+    assert text.count("render_buy_watchlist_manager()") == 2
+    positions_panel = text[text.index("def render_open_positions_panel()") : text.index('if command_center_view == "Positions & Queue":')]
+    assert positions_panel.index("render_buy_watchlist_manager()") < positions_panel.index("if not alpaca_positions:")
+
+
 def test_position_stop_labels_distinguish_planned_price_from_fill_adjusted_stop():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 

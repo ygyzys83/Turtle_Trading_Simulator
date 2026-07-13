@@ -25,7 +25,7 @@ A governed trading simulator, paper-trading console, and research lab for testin
 - Adds a ticker Ideas page that scans a watchlist, ranks current setup quality, and creates a concise research read.
 - Adds optional deterministic, Ollama, or Gemini research summaries. The LLM cannot send orders or override deterministic risk rules.
 - Adds an optional paper-only background worker for automation checks outside the Streamlit page refresh.
-- Adds a durable Buy watchlist capped at 10 independent setups. Each row saves its ticker, interval, strategy, inputs, risk limits, and order instructions; the worker records whether it is waiting, blocked, paused, or sent and disables it after submission.
+- Adds a durable Buy watchlist capped at 10 independent setups. Save the current researched setup from New Trade, then manage queue status, repeat behavior, saved details, pausing, and removal from Positions & Queue.
 - Queued BUY signals use cached completed bars, while one lightweight batched Alpaca latest-trades request supplies current IEX prices for order repricing and sizing on each worker cycle. A missing latest price blocks submission rather than falling back to stale history.
 - Includes a selectable trade log that highlights entries and exits on the chart.
 

@@ -44,7 +44,7 @@ The immediate objective is not additional feature expansion. It is to run paper 
 - Match instructions to exact UI labels.
 - When giving manual test instructions, always state:
   - Workspace: Daily Trading Screen or Full Records and Evidence.
-  - Command-center page: Open Positions, Ideas, New Trade, Alpaca, or Paper Review.
+  - Command-center page: Positions & Queue, Ideas, New Trade, Alpaca, or Paper Review.
   - Order mode: Backtest only, Paper trading, Practice mode, or live mode.
   - Automation setting: Manual, Auto exits, or Auto exits and queued buys.
   - Exact buttons, checkboxes, and expected messages.
@@ -78,7 +78,7 @@ The sidebar is organized in this order:
 
 The main pages are:
 
-- Open Positions: primary daily position-management and exit surface.
+- Positions & Queue: primary daily surface for open-position exits and saved automatic-BUY setups.
 - Ideas: scans a bounded ticker list and creates deterministic or optional LLM research reads.
 - New Trade: research, BUY decision, backtest, strategy comparison, and order preparation.
 - Alpaca: account summary, waiting orders, order actions, and automation status.
@@ -451,7 +451,7 @@ The normal recommendation remains one compact table. Detailed robustness evidenc
 
 The optimizer is now run explicitly with `Run Strategy Input Search` instead of a persistent checkbox. Its result is saved through ordinary Streamlit reruns and marked stale when the ticker, source, interval, history, market bars, strategy inputs, material account-equity bucket, risk limits, older-data split, or candidate count changes. A stale recommendation cannot be applied or tested on other tickers until the search is run again. Alpaca history choices now extend through `2y` for `1h` bars and `5y` for `4h` bars; Yahoo intraday choices remain shorter.
 
-The New Trade page includes a durable Buy watchlist capped at 10 setups. `Add or Update Current Setup` saves the exact ticker, interval, strategy, strategy inputs, risk limits, price source, and paper-order instructions. Ticker + interval + strategy identifies a row, so two strategies can monitor the same ticker. The worker independently records `Waiting for BUY`, `Blocked`, `Paused`, or `Order sent`, and disables a row after sending its order. A bounded in-memory bar cache prevents full price histories from being downloaded every 15 seconds. `Max automatic buys this session` still limits submissions. `Allowed symbols` remains an optional whitelist and does not create watchlist rows.
+New Trade includes `Add or Update Buy Setup`, which saves the exact ticker, interval, strategy, strategy inputs, risk limits, price source, and paper-order instructions currently being researched. Positions & Queue contains the durable Buy watchlist management surface: queue status, selected-setup controls, Repeat after exit, saved details, pausing, resuming, and removal. Ticker + interval + strategy identifies a row, so two strategies can monitor the same ticker. The worker independently records `Waiting for BUY`, `Blocked`, `Paused`, or `Order sent`, and disables a one-time row after sending its order. A bounded in-memory bar cache prevents full price histories from being downloaded every 15 seconds. `Max automatic buys this session` still limits submissions. `Allowed symbols` remains an optional whitelist and does not create watchlist rows.
 
 Selecting a queued row opens `Saved setup details`, an expanded table showing the complete saved price-data setup, strategy inputs, RSI rule, risk limits, order type and limit instructions, cancellation and re-entry behavior, automation limits, and the initial break-even/ATR trailing exit plan. It also states that sizing uses the current Alpaca paper account and order repricing uses the latest available Alpaca IEX trade at execution.
 
@@ -472,7 +472,7 @@ The app uses a professional trading-console design system built around a deep-na
 Recommended operating mode:
 
 - Workspace: Daily Trading Screen.
-- Main page for management: Open Positions.
+- Main page for management: Positions & Queue.
 - Order mode: Paper trading - send orders to Alpaca paper.
 - Automation: Auto exits - app sells paper positions.
 - Background worker: Running during the period positions should be managed.
@@ -481,7 +481,7 @@ Recommended operating mode:
 
 Daily checks:
 
-1. Open Positions: confirm each position has the intended saved interval, sell exit length, original stop, profit-protection settings, and active sell trigger.
+1. Positions & Queue: confirm each position's exit plan and each queued setup's saved strategy, status, and repeat setting.
 2. Alpaca: compare app positions and waiting orders with the Alpaca dashboard.
 3. Paper Review: inspect daily activity, fills, exits, cancellations, and performance.
 4. Full Records and Evidence only when investigating a decision, trigger, or mismatch.
@@ -590,6 +590,16 @@ Automatic entry sources are now deliberately separated from research:
 - Auto exits remain independent and continue to use each open position's saved exit plan.
 
 Regression tests prove that an empty queue cannot call the worker's entry sender and that the Streamlit page contains no automatic-entry submission event.
+
+## Positions And Queue Workspace (July 13, 2026)
+
+The command-center workflow now separates setup creation from ongoing management:
+
+- `Open Positions` was renamed `Positions & Queue`.
+- New Trade keeps only `Add or Update Buy Setup`, because that action saves the ticker and inputs currently being researched.
+- Positions & Queue contains the Buy watchlist table, `Manage queued setup`, per-setup Repeat after exit control, Saved setup details, pause/resume, removal, and queue automation status.
+- The queue remains visible and manageable even when there are no open Alpaca positions.
+- Open-position exit management remains on the same page, making Positions & Queue the daily surface for everything already being monitored by automation.
 
 ## Instructions For The Next Codex Conversation
 

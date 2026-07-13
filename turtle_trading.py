@@ -839,8 +839,9 @@ def automation_status_text() -> tuple[str, str, str]:
 
 
 def daily_automation_readiness_records(context: str) -> list[dict]:
-    queued_plans = buy_watchlist_store.read() if context == "New trade" and "buy_watchlist_store" in globals() else []
-    if context == "New trade":
+    queue_context = context in {"New trade", "Queued setups"}
+    queued_plans = buy_watchlist_store.read() if queue_context and "buy_watchlist_store" in globals() else []
+    if queue_context:
         enabled_plans = [plan for plan in queued_plans if plan.enabled]
         status_counts: dict[str, int] = {}
         for plan in enabled_plans:
@@ -3085,7 +3086,7 @@ with st.container(key="top_navigation"):
     st.title("AgentLoop Trader")
     command_center_view = st.radio(
         "Command center page",
-        ["Open Positions", "Ideas", "New Trade", "Alpaca", "Paper Review"],
+        ["Positions & Queue", "Ideas", "New Trade", "Alpaca", "Paper Review"],
         horizontal=True,
         label_visibility="collapsed",
     )
@@ -3552,6 +3553,140 @@ def render_automation_status() -> None:
         st.dataframe(pd.DataFrame(auto_exit_decision_records(auto_exit_status)), width="stretch", hide_index=True)
 
 
+def render_current_setup_watchlist_action() -> None:
+    st.markdown(
+        "#### Save this setup",
+        help=(
+            "Saves the ticker, interval, strategy, strategy inputs, risk limits, and paper-order instructions currently shown in New Trade. "
+            "The Background Worker can monitor only setups you explicitly save. Manage saved setups in Positions & Queue."
+        ),
+    )
+    watchlist_plans = buy_watchlist_store.read()
+    current_watch_plan_id = buy_watch_plan_id(ticker, interval, strategy_label, asset_class)
+    existing_current_plan = next(
+        (plan for plan in watchlist_plans if plan.plan_id == current_watch_plan_id),
+        None,
+    )
+    action_cols = st.columns([1, 1, 2])
+    add_watch_disabled = data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"} or ticker.strip().upper() == "SYNTH"
+    if action_cols[0].button(
+        "Add or Update Buy Setup",
+        disabled=add_watch_disabled,
+        help="Saves this exact ticker, interval, strategy, inputs, risk limits, and order instructions for worker monitoring.",
+        key="add_current_buy_watch_plan",
+    ):
+        plan = BuyWatchPlan(
+            plan_id=current_watch_plan_id,
+            symbol=ticker,
+            interval=interval,
+            history=period,
+            price_data_source=data_source,
+            strategy_label=strategy_label,
+            asset_class=asset_class,
+            strategy_settings=dict(current_strategy_settings),
+            risk_limits=asdict(risk_limits),
+            order_style=paper_buy_order_style,
+            limit_adjustment_pct=float(paper_buy_limit_adjustment_pct),
+            custom_limit_price=float(paper_buy_custom_limit_price),
+            repeat_after_exit=bool(existing_current_plan.repeat_after_exit) if existing_current_plan else False,
+            enabled=True,
+            status="Waiting for BUY",
+            detail="Waiting for the saved strategy's required BUY rules.",
+        )
+        try:
+            buy_watchlist_store.upsert(plan)
+            st.rerun()
+        except ValueError as exc:
+            st.error(str(exc))
+    action_cols[1].markdown(f"**Saved setups:** {len(watchlist_plans)}/{MAX_BUY_WATCHLIST_ITEMS}")
+    action_cols[2].caption("After saving, open Positions & Queue to review, pause, repeat, or remove this setup.")
+    if add_watch_disabled:
+        st.caption("Select Alpaca stock or crypto price data before saving an automatic BUY setup.")
+
+
+def render_buy_watchlist_manager() -> None:
+    st.markdown(
+        "#### Buy watchlist",
+        help=(
+            "These are the only setups the Background Worker may buy automatically. Each row keeps its own ticker, interval, strategy, "
+            "strategy inputs, risk limits, and paper-order instructions. The queue is capped at "
+            f"{MAX_BUY_WATCHLIST_ITEMS} setups."
+        ),
+    )
+    watchlist_plans = buy_watchlist_store.read()
+    if watchlist_plans:
+        st.dataframe(pd.DataFrame(buy_watchlist_records(watchlist_plans)), width="stretch", hide_index=True)
+        watch_labels = {
+            f"{plan.symbol} | {plan.interval} | {plan.strategy_label} | Repeat {'On' if plan.repeat_after_exit else 'Off'}": plan
+            for plan in watchlist_plans
+        }
+        selected_watch_label = st.selectbox(
+            "Manage queued setup",
+            list(watch_labels),
+            key="selected_buy_watch_plan",
+        )
+        selected_watch_plan = watch_labels[selected_watch_label]
+        selected_repeat_key = f"manage_repeat_after_exit_{selected_watch_plan.plan_id}"
+        if selected_repeat_key not in st.session_state:
+            st.session_state[selected_repeat_key] = bool(selected_watch_plan.repeat_after_exit)
+        selected_repeat_after_exit = st.checkbox(
+            "Repeat after exit for this setup",
+            key=selected_repeat_key,
+            help=(
+                "On keeps only this selected setup enabled across future buy, position, and exit cycles. After an exit, the worker waits "
+                "for the old BUY signal to turn off, applies the saved re-entry cooldown, and then waits for a new BUY signal. Off makes "
+                "this setup one-time: it disables after sending its next buy order."
+            ),
+        )
+        if bool(selected_repeat_after_exit) != bool(selected_watch_plan.repeat_after_exit):
+            repeat_changes = {"repeat_after_exit": bool(selected_repeat_after_exit)}
+            if selected_repeat_after_exit and selected_watch_plan.status == "Order sent":
+                repeat_changes.update(
+                    enabled=True,
+                    status="Repeat enabled",
+                    detail="Repeat after exit is On. The worker will detect the current order or position state.",
+                )
+            elif not selected_repeat_after_exit and selected_watch_plan.cycle_state in {
+                "order_pending",
+                "position_open",
+                "waiting_for_signal_reset",
+            }:
+                repeat_changes.update(
+                    enabled=False,
+                    status="Repeat off",
+                    detail="Repeat after exit is Off. Any current position remains managed, but this setup will not buy again.",
+                )
+            buy_watchlist_store.update(selected_watch_plan.plan_id, **repeat_changes)
+            st.rerun()
+        with st.expander("Saved setup details", expanded=True):
+            st.dataframe(
+                pd.DataFrame(buy_watch_plan_detail_records(selected_watch_plan)),
+                width="stretch",
+                hide_index=True,
+            )
+        manage_cols = st.columns(2)
+        toggle_label = "Pause Selected Setup" if selected_watch_plan.enabled else "Resume Selected Setup"
+        if manage_cols[0].button(toggle_label, key="toggle_selected_buy_watch_plan"):
+            buy_watchlist_store.update(
+                selected_watch_plan.plan_id,
+                enabled=not selected_watch_plan.enabled,
+                status="Paused" if selected_watch_plan.enabled else "Waiting for BUY",
+                detail=(
+                    "Paused manually."
+                    if selected_watch_plan.enabled
+                    else "Waiting for the saved strategy's required BUY rules."
+                ),
+            )
+            st.rerun()
+        if manage_cols[1].button("Remove Selected Setup", key="remove_selected_buy_watch_plan"):
+            buy_watchlist_store.remove(selected_watch_plan.plan_id)
+            st.rerun()
+    else:
+        st.caption("No queued setups. Research a ticker in New Trade, then click Add or Update Buy Setup.")
+    st.markdown("#### Queue automation status")
+    st.dataframe(pd.DataFrame(daily_automation_readiness_records("Queued setups")), width="stretch", hide_index=True)
+
+
 def render_open_positions_panel() -> None:
     position_settings_by_symbol = {
         str(position.get("Symbol", "")).strip().upper(): (
@@ -3567,11 +3702,12 @@ def render_open_positions_panel() -> None:
     metric_card(position_summary_cols[2], "Auto Exit On", auto_exit_on_count, "Position-level setting")
     metric_card(position_summary_cols[3], "Waiting Orders", count_waiting_alpaca_orders(alpaca_orders), "Alpaca paper")
     st.info(open_positions_next_step(position_settings_by_symbol))
-    st.markdown("#### Automation readiness")
+    st.markdown("#### Open position automation status")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("Open positions")), width="stretch", hide_index=True)
+    render_buy_watchlist_manager()
 
     if not alpaca_positions:
-        st.info("No Alpaca paper positions are open. When a position exists, this tab becomes the daily management panel for its exit settings and automation status.")
+        st.info("No Alpaca paper positions are open. Saved queued setups can still be monitored and managed above.")
         return
 
     st.markdown("#### Position manager")
@@ -3878,8 +4014,8 @@ def render_open_positions_panel() -> None:
             st.caption("No saved entry settings found for this position.")
 
 
-if command_center_view == "Open Positions":
-    sub_section("Open positions", "Manage each Alpaca paper position and its own exit settings.")
+if command_center_view == "Positions & Queue":
+    sub_section("Positions & queue", "Manage open paper positions, saved exit plans, and queued BUY setups.")
     render_open_positions_panel()
 elif command_center_view == "Ideas":
     sub_section("Ideas", "Scan tickers, compare strategy fit, and create a simple research read.")
@@ -3974,129 +4110,7 @@ elif command_center_view == "New Trade":
         ),
     )
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
-    st.markdown(
-        "#### Buy watchlist",
-        help=(
-            "Saves the current ticker, interval, strategy, strategy inputs, risk limits, and paper-order instructions. "
-            f"The background worker checks each enabled setup independently. The queue is capped at {MAX_BUY_WATCHLIST_ITEMS} setups. "
-            "Select a queued setup below to turn Repeat after exit On or Off for that individual setup. "
-            "Allowed symbols is only a whitelist; it does not add rows here."
-        ),
-    )
-    watchlist_plans = buy_watchlist_store.read()
-    current_watch_plan_id = buy_watch_plan_id(ticker, interval, strategy_label, asset_class)
-    existing_current_plan = next(
-        (plan for plan in watchlist_plans if plan.plan_id == current_watch_plan_id),
-        None,
-    )
-    watchlist_cols = st.columns([1, 1, 2])
-    add_watch_disabled = data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"} or ticker.strip().upper() == "SYNTH"
-    if watchlist_cols[0].button(
-        "Add or Update Current Setup",
-        disabled=add_watch_disabled,
-        help="Adds this exact ticker, interval, and strategy as one monitored setup. Adding it again updates its saved inputs.",
-        key="add_current_buy_watch_plan",
-    ):
-        plan = BuyWatchPlan(
-            plan_id=current_watch_plan_id,
-            symbol=ticker,
-            interval=interval,
-            history=period,
-            price_data_source=data_source,
-            strategy_label=strategy_label,
-            asset_class=asset_class,
-            strategy_settings=dict(current_strategy_settings),
-            risk_limits=asdict(risk_limits),
-            order_style=paper_buy_order_style,
-            limit_adjustment_pct=float(paper_buy_limit_adjustment_pct),
-            custom_limit_price=float(paper_buy_custom_limit_price),
-            repeat_after_exit=bool(existing_current_plan.repeat_after_exit) if existing_current_plan else False,
-            enabled=True,
-            status="Waiting for BUY",
-            detail="Waiting for the saved strategy's required BUY rules.",
-        )
-        try:
-            buy_watchlist_store.upsert(plan)
-            st.rerun()
-        except ValueError as exc:
-            st.error(str(exc))
-    watchlist_cols[1].markdown(f"**Queued setups:** {len(watchlist_plans)}/{MAX_BUY_WATCHLIST_ITEMS}")
-    watchlist_cols[2].caption(
-        "Signals use cached completed bars. Order pricing uses a lightweight latest Alpaca trade every worker check."
-    )
-    if add_watch_disabled:
-        st.caption("Select Alpaca stock or crypto price data before adding an automatic BUY setup.")
-    if watchlist_plans:
-        st.dataframe(pd.DataFrame(buy_watchlist_records(watchlist_plans)), width="stretch", hide_index=True)
-        watch_labels = {
-            f"{plan.symbol} | {plan.interval} | {plan.strategy_label} | Repeat {'On' if plan.repeat_after_exit else 'Off'}": plan
-            for plan in watchlist_plans
-        }
-        selected_watch_label = st.selectbox(
-            "Manage queued setup",
-            list(watch_labels),
-            key="selected_buy_watch_plan",
-        )
-        selected_watch_plan = watch_labels[selected_watch_label]
-        selected_repeat_key = f"manage_repeat_after_exit_{selected_watch_plan.plan_id}"
-        if selected_repeat_key not in st.session_state:
-            st.session_state[selected_repeat_key] = bool(selected_watch_plan.repeat_after_exit)
-        selected_repeat_after_exit = st.checkbox(
-            "Repeat after exit for this setup",
-            key=selected_repeat_key,
-            help=(
-                "On keeps only this selected setup enabled across future buy, position, and exit cycles. After an exit, the worker waits "
-                "for the old BUY signal to turn off, applies the saved re-entry cooldown, and then waits for a new BUY signal. Off makes "
-                "this setup one-time: it disables after sending its next buy order."
-            ),
-        )
-        if bool(selected_repeat_after_exit) != bool(selected_watch_plan.repeat_after_exit):
-            repeat_changes = {"repeat_after_exit": bool(selected_repeat_after_exit)}
-            if selected_repeat_after_exit and selected_watch_plan.status == "Order sent":
-                repeat_changes.update(
-                    enabled=True,
-                    status="Repeat enabled",
-                    detail="Repeat after exit is On. The worker will detect the current order or position state.",
-                )
-            elif not selected_repeat_after_exit and selected_watch_plan.cycle_state in {
-                "order_pending",
-                "position_open",
-                "waiting_for_signal_reset",
-            }:
-                repeat_changes.update(
-                    enabled=False,
-                    status="Repeat off",
-                    detail="Repeat after exit is Off. Any current position remains managed, but this setup will not buy again.",
-                )
-            buy_watchlist_store.update(selected_watch_plan.plan_id, **repeat_changes)
-            st.rerun()
-        with st.expander("Saved setup details", expanded=True):
-            st.dataframe(
-                pd.DataFrame(buy_watch_plan_detail_records(selected_watch_plan)),
-                width="stretch",
-                hide_index=True,
-            )
-        manage_cols = st.columns(2)
-        toggle_label = "Pause Selected Setup" if selected_watch_plan.enabled else "Resume Selected Setup"
-        if manage_cols[0].button(toggle_label, key="toggle_selected_buy_watch_plan"):
-            buy_watchlist_store.update(
-                selected_watch_plan.plan_id,
-                enabled=not selected_watch_plan.enabled,
-                status="Paused" if selected_watch_plan.enabled else "Waiting for BUY",
-                detail=(
-                    "Paused manually."
-                    if selected_watch_plan.enabled
-                    else "Waiting for the saved strategy's required BUY rules."
-                ),
-            )
-            st.rerun()
-        if manage_cols[1].button("Remove Selected Setup", key="remove_selected_buy_watch_plan"):
-            buy_watchlist_store.remove(selected_watch_plan.plan_id)
-            st.rerun()
-    else:
-        st.caption("No queued setups. Configure a real ticker and strategy, then add the current setup.")
-    st.markdown("#### Automation readiness")
-    st.dataframe(pd.DataFrame(daily_automation_readiness_records("New trade")), width="stretch", hide_index=True)
+    render_current_setup_watchlist_action()
     with st.expander("Compare all four current strategy fits", expanded=False):
         st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
