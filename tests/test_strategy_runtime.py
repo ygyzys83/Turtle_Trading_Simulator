@@ -1,4 +1,5 @@
 import pandas as pd
+import pytest
 
 from agentloop_trader.models import TradeIntent
 from agentloop_trader.strategy_runtime import (
@@ -230,3 +231,38 @@ def test_existing_strategy_position_keeps_strategy_exit_behavior(monkeypatch):
     assert details["ready"] is True
     assert details["trigger_price"] == 287.70
     assert details["trigger_source"] == "strategy exit"
+
+
+def test_partial_entry_bar_high_does_not_false_trigger_break_even(monkeypatch):
+    index = pd.DatetimeIndex([pd.Timestamp("2026-07-14T16:00:00+00:00")])
+    data = pd.DataFrame(
+        {"Close": [32.13], "High": [38.87], "Low": [31.90]},
+        index=index,
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.strategy_runtime.selected_strategy_result",
+        lambda market_data, settings, account: {
+            "live": {"last_p": 32.13, "last_atr": 3.53, "exit_level": 30.0, "buy_requirements": {}}
+        },
+    )
+    settings = {
+        "exit_mode": "atr_only",
+        "entry_filled_at": "2026-07-14T17:44:58+00:00",
+        "entry_stop_distance": 3.53,
+        "highest_high_since_entry": 38.87,
+        "last_exit_trigger_price": 32.09,
+        "last_exit_trigger_source": "break-even stop",
+        "breakeven_after_r": 1.0,
+        "trail_after_r": 2.0,
+        "profit_protection_enabled": True,
+        "auto_exit_enabled": True,
+    }
+
+    details = evaluate_exit_settings(settings, {"Symbol": "WYFI", "Average Entry": "32.09"}, lambda *_: data)
+
+    assert details["highest_high_since_entry"] == 32.13
+    assert details["highest_profit_r"] < 1.0
+    assert details["breakeven_stop_price"] is None
+    assert details["trigger_price"] == pytest.approx(28.56)
+    assert details["trigger_source"] == "fill-adjusted initial stop"
+    assert details["state_changed"] is True

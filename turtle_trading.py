@@ -1551,6 +1551,7 @@ def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> d
     latest = max(enumerate(matching_buys), key=lambda item: (priority(item[1]), item[0]))[1]
     settings = dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
     settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
+    settings.setdefault("entry_filled_at", latest.get("filled_at", ""))
     settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
     return settings
 
@@ -4955,7 +4956,7 @@ def render_manual_order_form() -> None:
                     "planned_limit_price": manual_intent.limit_price,
                     "planned_quantity": manual_intent.quantity,
                     "planned_entry_price": manual_intent.entry_price,
-                    "highest_high_since_entry": reference_price,
+                    "highest_high_since_entry": manual_intent.entry_price,
                     "last_exit_trigger_price": manual_intent.stop_loss,
                     "last_exit_trigger_source": "manual ATR stop",
                     "sizing_account_source": paper_order_account_source,

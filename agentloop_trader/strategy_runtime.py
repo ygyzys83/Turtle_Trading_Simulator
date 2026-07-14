@@ -297,22 +297,30 @@ def evaluate_exit_settings(
             original_stop = None
         profit_r = (current_price - entry) / initial_risk if current_price is not None and entry is not None and initial_risk else None
 
-        high_data = data.tail(1)
         entry_time = _parse_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
+        high_data = data.tail(1) if entry_time is None else data.iloc[0:0]
         bars_since_entry = 0
+        has_complete_post_entry_bar = False
         if entry_time is not None and not data.empty:
             compare = entry_time.tz_convert(data.index.tz) if getattr(data.index, "tz", None) else entry_time.tz_localize(None)
             recent = data.loc[data.index >= compare]
             if not recent.empty:
                 high_data = recent
                 bars_since_entry = max(0, len(recent) - 1)
-        current_high = _number(high_data["High"].max()) if "High" in high_data.columns else None
-        current_high = max(
-            [value for value in (current_high, _number(data.attrs.get("latest_high"))) if value is not None],
-            default=None,
-        )
+                has_complete_post_entry_bar = True
+        current_high_candidates = [value for value in (current_price, entry) if value is not None]
+        if not high_data.empty and "High" in high_data.columns:
+            current_high_candidates.append(_number(high_data["High"].max()))
+        if entry_time is None or has_complete_post_entry_bar:
+            current_high_candidates.append(_number(data.attrs.get("latest_high")))
+        current_high = max([value for value in current_high_candidates if value is not None], default=None)
         saved_high = _number(settings.get("highest_high_since_entry"))
-        high = max([value for value in (current_high, saved_high, entry) if value is not None], default=None)
+        entry_bar_is_still_incomplete = entry_time is not None and not has_complete_post_entry_bar
+        high = (
+            current_high
+            if entry_bar_is_still_incomplete
+            else max([value for value in (current_high, saved_high, entry) if value is not None], default=None)
+        )
         highest_profit_r = (high - entry) / initial_risk if high is not None and entry is not None and initial_risk else None
         protect = bool(settings.get("profit_protection_enabled", True)) and not no_price_stop
         breakeven_after = float(settings.get("breakeven_after_r", 1.0))
@@ -320,7 +328,14 @@ def evaluate_exit_settings(
         trail_mult = float(settings.get("trailing_atr_multiplier", 3.0))
         breakeven = entry if protect and highest_profit_r is not None and highest_profit_r >= breakeven_after else None
         atr_trail = high - trail_mult * current_atr if protect and highest_profit_r is not None and highest_profit_r >= trail_after and high is not None and current_atr is not None else None
+        saved_trigger_source = str(settings.get("last_exit_trigger_source") or "").strip().lower()
         saved_trigger = None if no_price_stop else _number(settings.get("last_exit_trigger_price"))
+        if saved_trigger_source == "break-even stop" and breakeven is None:
+            saved_trigger = None
+        elif saved_trigger_source == "atr trail" and atr_trail is None:
+            saved_trigger = None
+        elif saved_trigger_source == "strategy exit" and not strategy_exit_enabled:
+            saved_trigger = None
         candidates = [("strategy exit", strategy_exit), ("fill-adjusted initial stop", original_stop), ("break-even stop", breakeven), ("ATR trail", atr_trail), ("saved trigger", saved_trigger)]
         usable = [(name, value) for name, value in candidates if value is not None]
         source_name, trigger = max(usable, key=lambda item: item[1]) if usable else ("exit rule", None)
@@ -390,7 +405,10 @@ def evaluate_exit_settings(
             "trail_after_r": trail_after,
             "buy_level_snapshot": build_buy_level_snapshot(live, interval=interval, latest_price=current_price),
             "checked_at": datetime.now().astimezone().isoformat(),
-            "state_changed": bool((high or 0) > (saved_high or 0) or (trigger or 0) > (saved_trigger or 0)),
+            "state_changed": bool(
+                abs((high or 0) - (saved_high or 0)) > 0.000001
+                or abs((trigger or 0) - (_number(settings.get("last_exit_trigger_price")) or 0)) > 0.000001
+            ),
         }
     except Exception as exc:
         return {"ready": False, "reason": f"Could not check saved exit rule: {exc}", "trigger_price": None}

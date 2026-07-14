@@ -658,6 +658,14 @@ When a strategy is attached to an open position, the app shows its current requi
 
 Regression coverage includes the observed manual-position failure mode: an ATR-only IBM position around $218 must ignore an unrelated strategy exit near $288 and retain its ATR stop near $206. Existing strategy-managed positions still use their strategy exit unless the user changes the exit method.
 
+## Entry-Candle Profit Protection Correction (July 14, 2026)
+
+A manual WYFI position exposed an intrabar timing defect. The position filled partway through a 4-hour candle, but the exit evaluator treated that candle's full high, including price movement before the fill, as profit earned after entry. This falsely activated the +1R break-even stop even though the position was near 0R.
+
+The shared UI/worker evaluator now excludes the full entry candle when its timestamp begins before the recorded fill. Until a post-entry bar is available, its high-water mark uses only the actual fill and prices observed after the fill. Any previously saved break-even or ATR-trail trigger that is unsupported by the corrected R calculation is discarded, and corrected state is allowed to move downward instead of only ratcheting upward. Manual entry records also persist the actual fill timestamp and initialize their high-water mark from the planned entry rather than a pre-fill quote.
+
+Regression coverage reproduces the WYFI case: average fill $32.09, initial risk $3.53, current price $32.13, and a pre-fill candle high of $38.87. The corrected result is approximately 0.01R, no break-even stop, and a $28.56 fill-adjusted initial stop. The full checkpoint passed 322 tests. No broker order was submitted.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.
