@@ -601,6 +601,25 @@ The command-center workflow now separates setup creation from ongoing management
 - The queue remains visible and manageable even when there are no open Alpaca positions.
 - Open-position exit management remains on the same page, making Positions & Queue the daily surface for everything already being monitored by automation.
 
+## Worker State Restoration After Sleep (July 13, 2026)
+
+A fresh Streamlit session previously rendered the Automation selector at its Manual default before reading the existing worker control file. The page then wrote `Manual review only` and `enabled: false` back to the worker, leaving the Python process alive and heartbeating but in `Watching only` mode. Windows Sleep exposed this because the worker resumed normally, then reopening Streamlit disabled its actions.
+
+The app now reads persisted worker control and heartbeat state before rendering sidebar automation widgets. When a worker record is present, a fresh UI restores its saved Automation mode, Kill Switch, and queued-buy permission. With no worker record, the safe default remains Manual. A stale-but-present worker record suppresses the open-page automation timer and displays `Needs attention` until the heartbeat resumes or the worker is stopped. The sidebar now states three separate facts: worker-process state, heartbeat freshness/timestamp, and whether automation actions are On or Off.
+
+## Manual Paper Orders (July 13, 2026)
+
+New Trade now has a collapsed `Manual paper order - no BUY signal required` ticket for discretionary entries. It is separate from a strategy-generated BUY:
+
+- The user chooses dollar amount or quantity, market or exact limit price, and the initial ATR stop multiplier.
+- Strategy entry rules are intentionally bypassed, but the Kill Switch, account risk, order-size, portfolio exposure, symbol concentration, available-cash, duplicate-position, and open-order checks still apply.
+- The order uses the selected ticker or crypto pair and supports fractional crypto quantities with GTC time in force.
+- The preview clearly shows the risk-adjusted quantity, planned buy price, initial stop, order value, and estimated risk.
+- The user may save Auto exit On or Off. When On, the manual entry saves the current interval, selected exit strategy, sell exit length, ATR stop, break-even, and trailing-stop settings for the worker.
+- The Alpaca page's existing buy action was relabeled `Approved strategy paper buy` so it is clear that it still requires a strategy-generated trade intent.
+
+The manual-order checkpoint passed 308 tests. No broker order was submitted during development or testing.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

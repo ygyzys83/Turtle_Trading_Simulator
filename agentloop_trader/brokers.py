@@ -592,7 +592,11 @@ def build_alpaca_order_preview(
             else "Estimate only; Alpaca aggregates fee types daily and posts actual charges at day-end."
         ),
         "fee_schedule_effective": ALPACA_CRYPTO_FEE_SCHEDULE_URL if asset_class == "crypto" else ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
-        "source": "adjusted_deterministic_trade_intent",
+        "source": (
+            "manual_order"
+            if intent is not None and intent.proposed_by_agent == "manual_order"
+            else "adjusted_deterministic_trade_intent"
+        ),
     }
     if intent is None:
         blocked.append("No trade intent is present.")

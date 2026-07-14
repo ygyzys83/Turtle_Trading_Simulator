@@ -35,6 +35,7 @@ from agentloop_trader.automation_runtime import (
     AutomationControlStore,
     DEFAULT_LOCK_PATH,
     WorkerStatusStore,
+    automation_mode_for_new_ui_session,
     request_worker_stop,
     start_worker_process,
     worker_status_is_active,
@@ -112,6 +113,7 @@ from agentloop_trader.market_data import (
     fetch_alpaca_crypto_bars,
     fetch_yfinance_bars,
 )
+from agentloop_trader.manual_order import build_manual_buy_intent
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
 from agentloop_trader.strategy_runtime import adjust_initial_stop_settings, reprice_trade_intent
 from agentloop_trader.monitoring import (
@@ -249,6 +251,77 @@ def fetch_price_data_for_source(symbol: str, history: str, interval_value: str, 
         market_data_config = AlpacaConfig.from_env()
         return fetch_alpaca_stock_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret)
     return fetch_stock_data(symbol, history, interval_value)
+
+
+@st.cache_data(ttl=3600, max_entries=24, show_spinner=False)
+def run_strategy_suite(
+    account,
+    entry_w,
+    exit_w,
+    atr_mult,
+    risk_dec,
+    ma_w,
+    pullback_w,
+    momentum_w,
+    seed,
+    market_data,
+    risk_limits,
+    data_identity,
+    rsi_entry_filter_enabled,
+):
+    """Cache deterministic backtests while the completed price bars are unchanged."""
+    _ = data_identity
+    breakout = simulate_turtle_strategy(
+        account,
+        entry_w,
+        exit_w,
+        atr_mult,
+        risk_dec,
+        ma_w,
+        seed,
+        market_data,
+        risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
+    )
+    pullback = simulate_trend_pullback_strategy(
+        account=account,
+        pullback_w=pullback_w,
+        exit_w=exit_w,
+        atr_mult=atr_mult,
+        risk_pct_dec=risk_dec,
+        trend_w=ma_w,
+        momentum_w=momentum_w,
+        seed=seed,
+        market_data=market_data,
+        risk_limits=risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
+    )
+    trendline = simulate_trendline_breakout_strategy(
+        account=account,
+        trendline_w=entry_w,
+        exit_w=exit_w,
+        atr_mult=atr_mult,
+        risk_pct_dec=risk_dec,
+        ma_w=ma_w,
+        seed=seed,
+        market_data=market_data,
+        risk_limits=risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
+    )
+    retest = simulate_trendline_retest_strategy(
+        account=account,
+        trendline_w=entry_w,
+        exit_w=exit_w,
+        atr_mult=atr_mult,
+        risk_pct_dec=risk_dec,
+        ma_w=ma_w,
+        momentum_w=momentum_w,
+        seed=seed,
+        market_data=market_data,
+        risk_limits=risk_limits,
+        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
+    )
+    return breakout, pullback, trendline, retest
 
 
 def metric_card(col, label, value, sub, color_class=""):
@@ -1499,11 +1572,22 @@ def build_chart(
 
 
 alpaca_config = AlpacaConfig.from_env()
+sidebar_control_store = AutomationControlStore()
+saved_sidebar_control = sidebar_control_store.read()
+sidebar_worker_status_store = WorkerStatusStore()
+sidebar_worker_status = sidebar_worker_status_store.read()
+sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
+sidebar_worker_present = bool(
+    sidebar_worker_active
+    or sidebar_worker_status.running
+    or DEFAULT_LOCK_PATH.exists()
+)
 
 st.sidebar.markdown('<div class="sidebar-kill-title">Kill Switch</div>', unsafe_allow_html=True)
 kill_switch = st.sidebar.checkbox(
     "Enabled",
-    value=False,
+    value=bool(saved_sidebar_control.kill_switch_enabled),
+    key="kill_switch_enabled",
     help="Immediate hard stop. When this is on, the app blocks new paper orders and automation actions.",
 )
 automation_level_options = {
@@ -1512,16 +1596,26 @@ automation_level_options = {
     "Auto exits and queued buys": "Auto entries and exits",
 }
 st.sidebar.markdown("### :material/smart_toy: Background Automation")
+saved_automation_mode = automation_mode_for_new_ui_session(saved_sidebar_control, sidebar_worker_present)
+saved_automation_label = next(
+    (label for label, mode in automation_level_options.items() if mode == saved_automation_mode),
+    "Manual - I click paper orders",
+)
 automation_level_label = st.sidebar.selectbox(
     "Automation",
     list(automation_level_options.keys()),
-    index=0,
+    index=list(automation_level_options.keys()).index(saved_automation_label),
+    key="automation_mode_selection",
     help=(
         "Manual means the app never sends an automatic order. Auto exits lets the open Streamlit page or the Background Worker sell paper positions from their saved exit plans. "
         "Auto exits and queued buys also lets the Background Worker buy only setups you explicitly save in the Buy watchlist. The ticker currently open for research is never bought automatically."
     ),
 )
 automation_level = automation_level_options[automation_level_label]
+if "enable_full_paper_automation" not in st.session_state:
+    st.session_state["enable_full_paper_automation"] = bool(
+        saved_sidebar_control.full_automation_enabled and sidebar_worker_present
+    )
 if kill_switch:
     st.session_state["enable_full_paper_automation"] = False
 full_automation_enabled = False
@@ -1546,38 +1640,32 @@ active_automation_level = resolve_active_automation_level(
     kill_switch_enabled=kill_switch,
 )
 
-sidebar_worker_status_store = WorkerStatusStore()
-sidebar_worker_status = sidebar_worker_status_store.read()
-sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
-sidebar_worker_present = bool(
-    sidebar_worker_active
-    or sidebar_worker_status.running
-    or DEFAULT_LOCK_PATH.exists()
-)
-sidebar_control_store = AutomationControlStore()
 if "background_worker_enabled" not in st.session_state:
-    st.session_state["background_worker_enabled"] = sidebar_worker_active
+    st.session_state["background_worker_enabled"] = sidebar_worker_present
 if "worker_stop_pending" not in st.session_state:
     st.session_state["worker_stop_pending"] = False
 if not sidebar_worker_active:
     st.session_state["worker_stop_pending"] = False
 if kill_switch:
     st.session_state["background_worker_enabled"] = False
-worker_status_text = (
-    "Running"
-    if sidebar_worker_active
-    else "Needs attention"
-    if sidebar_worker_present
-    else "Stopped"
+worker_actions_enabled = bool(
+    st.session_state.get("background_worker_enabled", False)
+    and active_automation_level != "Manual review only"
+    and not kill_switch
 )
-worker_behavior_text = (
-    "Monitoring continues if Streamlit closes; the Buy watchlist is active."
-    if sidebar_worker_active
-    else "The heartbeat is stale. Stop Worker will terminate the verified worker process."
-    if sidebar_worker_present
-    else "The open Streamlit page can still check saved exits; the Buy watchlist is paused."
-)
-st.sidebar.caption(f"Worker: {worker_status_text}. {worker_behavior_text}")
+last_heartbeat = sidebar_worker_status.last_checked_at or "Not recorded"
+if sidebar_worker_active:
+    st.sidebar.caption(
+        f"Worker process: Running. Heartbeat: current ({last_heartbeat}). "
+        f"Automation actions: {'On' if worker_actions_enabled else 'Off'}."
+    )
+elif sidebar_worker_present:
+    st.sidebar.caption(
+        f"Worker process: Needs attention. Last heartbeat: {last_heartbeat}. "
+        "Automation actions are not trusted until the heartbeat resumes or the worker is stopped."
+    )
+else:
+    st.sidebar.caption("Worker process: Stopped. The Buy watchlist is paused; the open page can still check saved exits.")
 worker_control_cols = st.sidebar.columns(2)
 if worker_control_cols[0].button(
     "Start Worker",
@@ -2272,49 +2360,35 @@ risk_limits = RiskLimits(
     kill_switch_enabled=effective_kill_switch,
 )
 
+strategy_market_data = market_data
+if market_data is not None:
+    strategy_market_data = market_data.copy(deep=False)
+    strategy_market_data.attrs = {
+        key: value
+        for key, value in market_data.attrs.items()
+        if key not in {"latest_price", "latest_high", "latest_low", "latest_bar_time"}
+    }
+
 try:
-    breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = simulate_turtle_strategy(
-        account, entry_w, exit_w, atr_mult, risk_dec, ma_w, seed, market_data, risk_limits,
-        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
+    breakout_result, pullback_result, trendline_result, retest_result = run_strategy_suite(
+        account,
+        entry_w,
+        exit_w,
+        atr_mult,
+        risk_dec,
+        ma_w,
+        pullback_w,
+        momentum_w,
+        seed,
+        strategy_market_data,
+        risk_limits,
+        (ticker, data_source, interval, period),
+        rsi_entry_filter_enabled,
     )
-    pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = simulate_trend_pullback_strategy(
-        account=account,
-        pullback_w=pullback_w,
-        exit_w=exit_w,
-        atr_mult=atr_mult,
-        risk_pct_dec=risk_dec,
-        trend_w=ma_w,
-        momentum_w=momentum_w,
-        seed=seed,
-        market_data=market_data,
-        risk_limits=risk_limits,
-        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
-    )
-    trendline_prices, trendline_smas, trendline_atrs, trendline_trade_log, trendline_live, trendline_stats, trendline_labels = simulate_trendline_breakout_strategy(
-        account=account,
-        trendline_w=entry_w,
-        exit_w=exit_w,
-        atr_mult=atr_mult,
-        risk_pct_dec=risk_dec,
-        ma_w=ma_w,
-        seed=seed,
-        market_data=market_data,
-        risk_limits=risk_limits,
-        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
-    )
-    retest_prices, retest_smas, retest_atrs, retest_trade_log, retest_live, retest_stats, retest_labels = simulate_trendline_retest_strategy(
-        account=account,
-        trendline_w=entry_w,
-        exit_w=exit_w,
-        atr_mult=atr_mult,
-        risk_pct_dec=risk_dec,
-        ma_w=ma_w,
-        momentum_w=momentum_w,
-        seed=seed,
-        market_data=market_data,
-        risk_limits=risk_limits,
-        rsi_entry_filter_enabled=rsi_entry_filter_enabled,
-    )
+    breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = breakout_result
+    pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = pullback_result
+    trendline_prices, trendline_smas, trendline_atrs, trendline_trade_log, trendline_live, trendline_stats, trendline_labels = trendline_result
+    retest_prices, retest_smas, retest_atrs, retest_trade_log, retest_live, retest_stats, retest_labels = retest_result
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -4014,6 +4088,273 @@ def render_open_positions_panel() -> None:
             st.caption("No saved entry settings found for this position.")
 
 
+def render_manual_order_form() -> None:
+    with st.expander("Manual paper order - no BUY signal required", expanded=False):
+        st.caption(
+            "Use this for a discretionary paper buy. Strategy entry rules are not required, but account risk limits, "
+            "the Kill Switch, available cash, duplicate-order checks, and a stop loss still apply."
+        )
+        if execution_mode != "paper" or not alpaca_adapter.config.paper:
+            st.warning("Set Order mode to Paper trading and connect the Alpaca paper account to use this order form.")
+
+        manual_key = re.sub(r"[^A-Z0-9]+", "_", normalize_symbol(ticker, asset_class).upper()).strip("_") or "EMPTY"
+        reference_price = optional_float(live.get("last_p")) or 0.0
+        current_atr = optional_float(live.get("last_atr")) or 0.0
+        sizing_method = st.radio(
+            "Order size",
+            ["Dollar amount", "Quantity"],
+            horizontal=True,
+            key=f"manual_size_method_{manual_key}",
+        )
+        order_cols = st.columns(3)
+        manual_order_type_label = order_cols[0].selectbox(
+            "Order type",
+            ["Limit", "Market"],
+            key=f"manual_order_type_{manual_key}",
+            help="A limit order will not pay more than your limit price. A market order buys at the available market price.",
+        )
+        manual_limit_price = None
+        if manual_order_type_label == "Limit":
+            manual_limit_price = order_cols[1].number_input(
+                "Limit price",
+                min_value=0.0001,
+                value=max(0.0001, round_alpaca_price(reference_price)),
+                step=0.01 if reference_price >= 1 else 0.0001,
+                format="%.4f" if reference_price < 1 else "%.2f",
+                key=f"manual_limit_price_{manual_key}",
+            )
+        else:
+            order_cols[1].metric("Current price", money_or_missing(reference_price))
+        manual_stop_multiplier = order_cols[2].number_input(
+            "Initial stop ATR multiplier",
+            min_value=0.5,
+            max_value=5.0,
+            value=float(atr_mult),
+            step=0.1,
+            key=f"manual_stop_atr_{manual_key}",
+            help="Sets the initial stop below the planned buy price using the current ATR for the selected interval.",
+        )
+
+        size_cols = st.columns(3)
+        requested_dollars = None
+        requested_quantity = None
+        if sizing_method == "Dollar amount":
+            requested_dollars = size_cols[0].number_input(
+                "Order amount",
+                min_value=1.0,
+                value=min(5_000.0, max(1.0, float(paper_order_available_cash))),
+                step=100.0,
+                key=f"manual_dollars_{manual_key}",
+            )
+        else:
+            default_quantity = max(0.0001 if asset_class == "crypto" else 1.0, 1_000.0 / reference_price) if reference_price else 1.0
+            requested_quantity = size_cols[0].number_input(
+                "Quantity",
+                min_value=0.0001 if asset_class == "crypto" else 1.0,
+                value=float(default_quantity if asset_class == "crypto" else max(1, int(default_quantity))),
+                step=0.0001 if asset_class == "crypto" else 1.0,
+                format="%.8f" if asset_class == "crypto" else "%.0f",
+                key=f"manual_quantity_{manual_key}",
+            )
+        manual_auto_exit = size_cols[1].checkbox(
+            "Auto exit this position",
+            value=True,
+            key=f"manual_auto_exit_{manual_key}",
+            help="Saves the current interval, exit strategy, ATR stop, break-even rule, and trailing-stop settings for the worker.",
+        )
+        size_cols[2].metric("Current ATR", money_or_missing(current_atr))
+        st.caption(
+            f"Exit plan: {strategy_label} on {interval} bars, sell exit length {exit_w}. "
+            f"Automatic exit is {'on' if manual_auto_exit else 'off'}."
+        )
+
+        manual_intent = None
+        manual_error = ""
+        try:
+            manual_intent = build_manual_buy_intent(
+                symbol=ticker,
+                asset_class=asset_class,
+                current_price=reference_price,
+                atr=current_atr,
+                stop_atr_multiplier=manual_stop_multiplier,
+                order_type=manual_order_type_label,
+                requested_dollars=requested_dollars,
+                requested_quantity=requested_quantity,
+                limit_price=manual_limit_price,
+            )
+        except ValueError as exc:
+            manual_error = str(exc)
+
+        manual_symbol = manual_intent.symbol_clean if manual_intent is not None else normalize_symbol(ticker, asset_class)
+        manual_symbol_notional = 0.0
+        if not use_alpaca_account_for_paper_risk and manual_symbol in paper_broker.positions:
+            manual_symbol_notional += paper_broker.positions[manual_symbol].market_value
+        manual_symbol_notional += sum(
+            float(row.get("Market Value") or 0)
+            for row in alpaca_positions
+            if str(row.get("Symbol", "")).strip().upper() == manual_symbol
+        )
+        manual_symbol_notional += open_buy_order_notional(alpaca_orders, manual_symbol)
+        if manual_intent is not None:
+            manual_intent = constrain_trade_intent_to_limits(
+                manual_intent,
+                account_equity=paper_order_risk_equity,
+                limits=risk_limits,
+                current_portfolio_notional=paper_order_portfolio_notional,
+                symbol_current_notional=manual_symbol_notional,
+                available_cash=paper_order_available_cash,
+            )
+        manual_risk = check_trade_intent(
+            manual_intent,
+            account_equity=paper_order_risk_equity,
+            limits=risk_limits,
+            open_positions=trade_open_position_symbols,
+            open_position_count=len(trade_open_position_symbols | open_buy_order_symbols(alpaca_orders)),
+            current_portfolio_notional=paper_order_portfolio_notional,
+            symbol_current_notional=manual_symbol_notional,
+            session_pnl=paper_order_session_pnl,
+            available_cash=paper_order_available_cash,
+        )
+        manual_decision = decide_execution(execution_mode, manual_risk)
+        manual_preflight = build_preflight_check(
+            intent=manual_intent,
+            risk_check=manual_risk,
+            execution_decision=manual_decision,
+            broker_connected=alpaca_status.connected,
+            audit_logging_enabled="session_audit_events" in st.session_state,
+        )
+        manual_preview = build_alpaca_order_preview(manual_intent, manual_decision, alpaca_adapter.config)
+        manual_duplicate_reasons = duplicate_exposure_reasons(
+            manual_intent,
+            alpaca_positions,
+            allow_duplicate=allow_add_to_existing_position,
+        )
+        manual_open_order_reasons = open_order_exposure_reasons(manual_intent, alpaca_orders)
+        manual_already_submitted = preview_already_tracked(manual_preview.preview_hash, st.session_state["tracked_alpaca_orders"])
+        manual_blockers = list(dict.fromkeys([
+            *([manual_error] if manual_error else []),
+            *manual_preflight.blocked_reasons,
+            *manual_preview.blocked_reasons,
+            *manual_duplicate_reasons,
+            *manual_open_order_reasons,
+            *(["This exact manual order is already tracked in the app."] if manual_already_submitted else []),
+            *(["Refresh Alpaca positions and orders before sending this order."] if alpaca_state_health.stale else []),
+        ]))
+
+        if manual_intent is not None:
+            st.dataframe(
+                pd.DataFrame([
+                    {"Item": "Ticker", "Value": manual_intent.symbol_clean},
+                    {"Item": "Quantity after risk limits", "Value": format_quantity(manual_intent.quantity, manual_intent.asset_class)},
+                    {"Item": "Planned buy price", "Value": money_or_missing(manual_intent.entry_price)},
+                    {"Item": "Initial stop", "Value": money_or_missing(manual_intent.stop_loss)},
+                    {"Item": "Estimated order value", "Value": money_or_missing(manual_risk.notional_dollars)},
+                    {"Item": "Estimated risk", "Value": money_or_missing(manual_risk.risk_dollars)},
+                ]),
+                width="stretch",
+                hide_index=True,
+            )
+        if manual_blockers:
+            show_blockers("Manual order blocked", manual_blockers)
+        else:
+            st.success("Manual paper order is ready to send. No strategy BUY signal is required.")
+
+        manual_submit_disabled = bool(
+            manual_blockers
+            or manual_intent is None
+            or execution_mode != "paper"
+            or not alpaca_adapter.config.paper
+            or not alpaca_status.can_submit_orders
+            or not enable_alpaca_paper_orders
+        )
+        if st.button("Send Manual Paper Buy to Alpaca", disabled=manual_submit_disabled, key=f"submit_manual_buy_{manual_key}"):
+            try:
+                submitted_order = alpaca_adapter.submit_order(
+                    manual_intent,
+                    manual_decision,
+                    expected_preview_hash=manual_preview.preview_hash,
+                )
+                broker_order_id = str(getattr(submitted_order, "id", ""))
+                manual_exit_settings = {
+                    **current_exit_settings,
+                    "entry_source": "manual order",
+                    "entry_reference_price": manual_intent.entry_price,
+                    "entry_atr": current_atr,
+                    "entry_atr_pct": (current_atr / manual_intent.entry_price * 100) if manual_intent.entry_price else None,
+                    "entry_stop_atr_multiplier": manual_stop_multiplier,
+                    "entry_stop_distance": manual_intent.entry_price - manual_intent.stop_loss,
+                    "entry_stop_loss": manual_intent.stop_loss,
+                    "entry_rule_level": None,
+                    "exit_rule_level_at_entry": optional_float(live.get("exit_level")),
+                    "planned_order_type": manual_intent.order_type,
+                    "planned_limit_price": manual_intent.limit_price,
+                    "planned_quantity": manual_intent.quantity,
+                    "planned_entry_price": manual_intent.entry_price,
+                    "highest_high_since_entry": reference_price,
+                    "last_exit_trigger_price": manual_intent.stop_loss,
+                    "last_exit_trigger_source": "manual ATR stop",
+                    "sizing_account_source": paper_order_account_source,
+                    "sizing_account_equity": paper_order_risk_equity,
+                    "sizing_available_cash": paper_order_available_cash,
+                    "auto_exit_enabled": manual_auto_exit,
+                }
+                tracked_record = {
+                    "broker_order_id": broker_order_id,
+                    "preview_hash": manual_preview.preview_hash,
+                    "symbol": manual_intent.symbol_clean,
+                    "side": manual_intent.side,
+                    "quantity": manual_intent.quantity,
+                    "order_type": manual_intent.order_type,
+                    "limit_price": manual_intent.limit_price,
+                    "status": str(getattr(submitted_order, "status", "")),
+                    "submitted_at": str(getattr(submitted_order, "submitted_at", "")),
+                    "source": "manual_order",
+                    "strategy_settings": manual_exit_settings,
+                    "exit_settings": manual_exit_settings,
+                }
+                if broker_order_id:
+                    st.session_state["tracked_alpaca_orders"].append(tracked_record)
+                    broker_state_store.upsert(tracked_record)
+                    updated_orders = update_exit_settings_for_symbol(
+                        manual_intent.symbol_clean,
+                        st.session_state["tracked_alpaca_orders"],
+                        manual_exit_settings,
+                    )
+                    broker_state_store.replace_all(updated_orders)
+                    st.session_state["tracked_alpaca_orders"] = updated_orders
+                manual_event = AuditEvent(
+                    event_type="alpaca_paper_manual_buy_submitted",
+                    message="Manual paper buy submitted to Alpaca without requiring a strategy BUY signal.",
+                    payload={
+                        "symbol": manual_intent.symbol_clean,
+                        "quantity": manual_intent.quantity,
+                        "order_type": manual_intent.order_type,
+                        "limit_price": manual_intent.limit_price,
+                        "stop_loss": manual_intent.stop_loss,
+                        "preview_hash": manual_preview.preview_hash,
+                        "broker_order_id": broker_order_id,
+                        "exit_settings": manual_exit_settings,
+                    },
+                )
+                st.session_state["session_audit_events"].append(manual_event)
+                if persist_audit_log:
+                    audit_store.append(manual_event)
+                st.success("Manual paper buy order sent to Alpaca.")
+            except Exception as exc:
+                blocked_event = AuditEvent(
+                    event_type="alpaca_paper_manual_buy_blocked",
+                    message=str(exc),
+                    payload={
+                        "symbol": manual_intent.symbol_clean if manual_intent else manual_symbol,
+                        "preview_hash": manual_preview.preview_hash,
+                    },
+                )
+                st.session_state["session_audit_events"].append(blocked_event)
+                if persist_audit_log:
+                    audit_store.append(blocked_event)
+                st.error(f"Manual paper buy blocked: {exc}")
+
+
 if command_center_view == "Positions & Queue":
     sub_section("Positions & queue", "Manage open paper positions, saved exit plans, and queued BUY setups.")
     render_open_positions_panel()
@@ -4154,6 +4495,7 @@ elif command_center_view == "New Trade":
         st.caption(intent.rationale)
         with st.expander("Trade idea details", expanded=False):
             st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), width="stretch", hide_index=True)
+    render_manual_order_form()
     if show_portfolio_evidence:
         st.markdown("#### New trade evidence *")
         st.dataframe(
@@ -4846,7 +5188,7 @@ if command_center_view == "Alpaca":
     render_automation_status()
 
     st.markdown("#### Order actions")
-    st.caption("Send a buy, sell an open position, or cancel a waiting order for the configured Alpaca account.")
+    st.caption("Send an approved strategy buy, sell an open position, or cancel a waiting order for the configured Alpaca account. Discretionary buys are entered on New Trade.")
     if waiting_limit_buy_rows:
         st.markdown("#### Waiting limit buys")
         st.dataframe(pd.DataFrame(waiting_limit_buy_rows), width="stretch", hide_index=True)
@@ -4906,7 +5248,7 @@ if command_center_view == "Alpaca":
         or duplicate_preview_submitted
     )
     if intent is not None:
-        st.markdown(f"#### Manual {alpaca_order_noun} buy")
+        st.markdown(f"#### Approved strategy {alpaca_order_noun} buy")
         st.dataframe(
             pd.DataFrame(
                 paper_buy_price_records(
@@ -4948,7 +5290,7 @@ if command_center_view == "Alpaca":
         alpaca_base_disabled
         or not alpaca_status.can_submit_orders
     )
-    buy_button_label = "Send Paper Buy to Alpaca" if alpaca_adapter.config.paper else "Send Live Buy to Alpaca"
+    buy_button_label = "Send Approved Paper Buy to Alpaca" if alpaca_adapter.config.paper else "Send Approved Live Buy to Alpaca"
     if st.button(buy_button_label, disabled=alpaca_submit_disabled):
         try:
             alpaca_order = alpaca_adapter.submit_order(

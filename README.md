@@ -150,6 +150,8 @@ Paper automation:
 
 Selecting `Paper trading - send orders to Alpaca paper` automatically uses the configured Alpaca paper account; there is no second account checkbox. The ticker currently open in Streamlit is research/manual-only and is never an automatic BUY source. Automatic entries can come only from enabled Buy watchlist setups, and only the Background Worker monitors that queue. Select `Auto exits and queued buys`, check `Allow queued buys`, and start the worker to enable them. Automatic exits remain independent of queued-buy permission and can run from the open page or worker. The worker is paper-only and uses the same saved controls, risk limits, Alpaca paper account, and broker-state file as Streamlit.
 
+When Streamlit opens while a worker record exists, the sidebar restores the worker's saved Automation mode, Kill Switch, and queued-buy permission before writing control state. The sidebar separately reports worker-process state, heartbeat freshness, and whether automation actions are On or Off. Windows Sleep suspends monitoring until the computer wakes; reopening Streamlit no longer resets a resumed worker to Manual.
+
 You can still start it manually for debugging:
 
 ```powershell

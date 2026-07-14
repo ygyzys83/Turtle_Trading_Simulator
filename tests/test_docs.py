@@ -132,8 +132,20 @@ def test_sidebar_automation_controls_state_their_exact_scope():
     assert 'enable_alpaca_paper_orders = bool(execution_mode == "paper" and alpaca_config.paper)' in text
     assert "It does not control automatic exits." in text
     assert "The ticker currently open for research is never bought automatically." in text
-    assert "The open Streamlit page can still check saved exits; the Buy watchlist is paused." in text
-    assert "Monitoring continues if Streamlit closes; the Buy watchlist is active." in text
+    assert "Worker process: Running. Heartbeat: current" in text
+    assert "Automation actions: {'On' if worker_actions_enabled else 'Off'}" in text
+
+
+def test_fresh_streamlit_session_restores_running_worker_controls_before_rendering_widgets():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    control_read = text.index("saved_sidebar_control = sidebar_control_store.read()")
+    automation_widget = text.index('automation_level_label = st.sidebar.selectbox(')
+    assert control_read < automation_widget
+    assert "automation_mode_for_new_ui_session(saved_sidebar_control, sidebar_worker_present)" in text
+    assert "index=list(automation_level_options.keys()).index(saved_automation_label)" in text
+    assert "saved_sidebar_control.full_automation_enabled and sidebar_worker_present" in text
+    assert 'st.session_state["background_worker_enabled"] = sidebar_worker_present' in text
 
 
 def test_streamlit_page_has_no_automatic_buy_submission_path():

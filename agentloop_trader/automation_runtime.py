@@ -17,6 +17,7 @@ from agentloop_trader.models import PACIFIC_TIME
 DEFAULT_CONTROL_PATH = Path("automation_logs") / "automation_control.json"
 DEFAULT_STATUS_PATH = Path("automation_logs") / "automation_worker_status.json"
 DEFAULT_LOCK_PATH = Path("automation_logs") / "automation_worker.lock"
+WORKER_AUTOMATION_MODES = {"Manual review only", "Auto exits only", "Auto entries and exits"}
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,12 @@ class WorkerStatusStore:
 
     def write(self, status: WorkerStatus) -> None:
         _write_json(self.path, asdict(status))
+
+
+def automation_mode_for_new_ui_session(control: AutomationControl, worker_present: bool) -> str:
+    if not worker_present:
+        return "Manual review only"
+    return control.mode if control.mode in WORKER_AUTOMATION_MODES else "Manual review only"
 
 
 def worker_status_is_active(status: WorkerStatus, max_age_seconds: int = 120) -> bool:

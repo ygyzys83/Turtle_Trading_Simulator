@@ -6,6 +6,7 @@ from agentloop_trader.automation_runtime import (
     WorkerLock,
     WorkerStatus,
     WorkerStatusStore,
+    automation_mode_for_new_ui_session,
     request_worker_stop,
     start_worker_process,
     worker_status_is_active,
@@ -56,6 +57,14 @@ def test_worker_status_active_uses_recent_heartbeat():
 
     assert worker_status_is_active(recent, max_age_seconds=120) is True
     assert worker_status_is_active(stale, max_age_seconds=120) is False
+
+
+def test_fresh_ui_restores_mode_only_when_a_worker_record_is_present():
+    saved = AutomationControl(mode="Auto entries and exits", full_automation_enabled=True)
+
+    assert automation_mode_for_new_ui_session(saved, worker_present=True) == "Auto entries and exits"
+    assert automation_mode_for_new_ui_session(saved, worker_present=False) == "Manual review only"
+    assert automation_mode_for_new_ui_session(AutomationControl(mode="unknown"), worker_present=True) == "Manual review only"
 
 
 def test_start_worker_process_launches_worker_module(monkeypatch, tmp_path):
