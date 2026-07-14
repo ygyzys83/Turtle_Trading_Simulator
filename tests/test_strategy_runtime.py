@@ -5,6 +5,7 @@ from agentloop_trader.strategy_runtime import (
     adjust_initial_stop_settings,
     apply_buy_order_style,
     evaluate_exit_settings,
+    exit_mode_for_settings,
     reprice_trade_intent,
     saved_exit_settings_for_symbol,
     trade_intent_from_record,
@@ -177,3 +178,55 @@ def test_profit_protection_stays_active_after_price_pulls_back(monkeypatch):
     assert details["highest_profit_r"] == 5.5
     assert details["breakeven_stop_price"] == 100.0
     assert details["trailing_stop_price"] == 108.0
+
+
+def test_atr_only_manual_position_ignores_strategy_exit_above_current_price(monkeypatch):
+    index = pd.date_range("2026-07-14 15:00", periods=3, freq="h", tz="UTC")
+    data = pd.DataFrame(
+        {"Close": [219.0, 218.8, 218.6], "High": [220.0, 219.2, 219.0], "Low": [218.0, 218.0, 218.2]},
+        index=index,
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.strategy_runtime.selected_strategy_result",
+        lambda market_data, settings, account: {
+            "live": {"last_p": 218.6, "last_atr": 6.24, "exit_level": 287.70, "buy_requirements": {}}
+        },
+    )
+    settings = {
+        "exit_mode": "atr_only",
+        "entry_stop_distance": 12.48,
+        "auto_exit_enabled": True,
+    }
+
+    details = evaluate_exit_settings(settings, {"Symbol": "IBM", "Average Entry": "218.92"}, lambda *_: data)
+
+    assert details["ready"] is False
+    assert details["strategy_exit_price"] is None
+    assert details["trigger_price"] == 206.44
+    assert details["trigger_source"] == "fill-adjusted initial stop"
+
+
+def test_older_manual_order_without_exit_mode_migrates_to_atr_only():
+    assert exit_mode_for_settings({"entry_source": "manual order"}) == "atr_only"
+    assert exit_mode_for_settings({"entry_source": "worker queue"}) == "strategy_and_atr"
+
+
+def test_existing_strategy_position_keeps_strategy_exit_behavior(monkeypatch):
+    index = pd.date_range("2026-07-14 15:00", periods=3, freq="h", tz="UTC")
+    data = pd.DataFrame(
+        {"Close": [219.0, 218.8, 218.6], "High": [220.0, 219.2, 219.0], "Low": [218.0, 218.0, 218.2]},
+        index=index,
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.strategy_runtime.selected_strategy_result",
+        lambda market_data, settings, account: {
+            "live": {"last_p": 218.6, "last_atr": 6.24, "exit_level": 287.70, "buy_requirements": {}}
+        },
+    )
+    settings = {"entry_stop_distance": 12.48, "auto_exit_enabled": True}
+
+    details = evaluate_exit_settings(settings, {"Symbol": "IBM", "Average Entry": "218.92"}, lambda *_: data)
+
+    assert details["ready"] is True
+    assert details["trigger_price"] == 287.70
+    assert details["trigger_source"] == "strategy exit"

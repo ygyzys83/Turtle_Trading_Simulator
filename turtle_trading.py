@@ -117,7 +117,12 @@ from agentloop_trader.market_data import (
 )
 from agentloop_trader.manual_order import build_manual_buy_intent
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
-from agentloop_trader.strategy_runtime import adjust_initial_stop_settings, reprice_trade_intent
+from agentloop_trader.strategy_runtime import (
+    adjust_initial_stop_settings,
+    evaluate_exit_settings as evaluate_saved_exit_settings,
+    exit_mode_for_settings,
+    reprice_trade_intent,
+)
 from agentloop_trader.monitoring import (
     broker_heartbeat_records,
     daily_risk_records,
@@ -979,12 +984,14 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
     distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
     profit_r = optional_float(exit_details.get("profit_r"))
     highest_profit_r = optional_float(exit_details.get("highest_profit_r"))
+    exit_mode = exit_mode_for_settings(settings)
     rows = [
         {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
         {"Area": "Position", "Item": "Quantity", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current position quantity held at Alpaca."},
         {"Area": "Position", "Item": "Current price", "Status / Value": money_or_missing(current_price), "Plain English": "Estimated from Alpaca market value."},
         {"Area": "Position", "Item": "Average entry", "Status / Value": money_or_missing(position.get("Average Entry")), "Plain English": "Average entry price reported by Alpaca."},
         {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "On" if settings.get("auto_exit_enabled", True) else "Off", "Plain English": "Whether the app may sell this position automatically."},
+        {"Area": "Exit plan", "Item": "Exit method", "Status / Value": "ATR protection only" if exit_mode == "atr_only" else "Strategy exit + ATR protection", "Plain English": "ATR-only ignores strategy sell lines. Strategy + ATR uses both and follows whichever active protection level is highest."},
         {"Area": "Exit plan", "Item": "Price interval", "Status / Value": str(settings.get("interval", "Not saved")), "Plain English": "Bars used to calculate ATR and exit levels."},
         {"Area": "Exit plan", "Item": "Sell exit length", "Status / Value": bars_or_missing(settings.get("exit_window")), "Plain English": "Number of saved price bars used to calculate the strategy exit line."},
         {"Area": "Exit plan", "Item": "Trend filter length", "Status / Value": bars_or_missing(settings.get("moving_average_window")), "Plain English": "Saved trend filter length used to confirm the broader uptrend."},
@@ -1001,7 +1008,13 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
         {"Area": "Automation", "Item": "Room before exit", "Status / Value": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not available", "Plain English": "How far current price is above the active sell trigger."},
         {"Area": "Automation", "Item": "Current action", "Status / Value": "Exit now" if exit_details.get("ready") else "Hold", "Plain English": str(exit_details.get("reason", ""))},
     ]
-    if str(settings.get("strategy_type", "")) == "rsi_scalp":
+    if exit_mode == "atr_only":
+        strategy_items = {
+            "Sell exit length", "Trend filter length", "Pullback average length",
+            "Momentum turn length", "Strategy exit",
+        }
+        rows = [row for row in rows if row["Item"] not in strategy_items]
+    if exit_mode == "strategy_and_atr" and str(settings.get("strategy_type", "")) == "rsi_scalp":
         irrelevant = {
             "Sell exit length", "Trend filter length", "Pullback average length",
             "Momentum turn length", "Strategy exit",
@@ -2184,10 +2197,27 @@ strategy_label = st.sidebar.selectbox(
     index=1,
     key="strategy_label_input",
     help=(
-        "Choose the rule set that creates trade ideas. Breakout continuation uses prior highs. "
-        "Trend pullback continuation uses a trend filter, a pullback average, and a momentum turn. "
-        "Trendline breakout and Trendline retest continuation use descending resistance lines from swing highs. "
-        "RSI mean-reversion scalp buys a confirmed rebound from a sharp RSI decline and exits on RSI recovery, price protection, or an optional maximum holding period."
+        "Choose the complete rule set used to create historical trades, the current BUY decision, queued buys, and strategy exits. "
+        "Every rule is calculated from completed bars on the selected interval. For example, 20 bars means 20 completed 15-minute bars "
+        "when Interval is 15m, or 20 completed daily bars when Interval is 1d.\n\n"
+        "BREAKOUT CONTINUATION: Buys when the latest completed bar closes above the highest price reached during the prior Buy breakout length, "
+        "while price is above the Trend filter and that filter is strictly rising. Example: with a 20-bar lookback, if the highest High in the "
+        "previous 20 completed bars is $105.00, the latest completed bar must close above $105.00. The strategy exit is the lowest Low from the "
+        "prior Sell exit length bars.\n\n"
+        "TREND PULLBACK CONTINUATION: First requires price above a flat-or-rising Trend filter. It then requires a recent closing-price low to reach "
+        "the Pullback average zone, defined as no more than 2% above that average. Finally, the latest completed bar must turn up above the Momentum "
+        "turn average, that short average must be flat or rising, and the close must exceed the prior close. Its strategy exit is the Sell exit length "
+        "moving average.\n\n"
+        "TRENDLINE BREAKOUT: Uses the Buy breakout / trendline lookback to find two confirmed descending swing highs and project a downward-sloping "
+        "resistance line. A BUY requires the prior completed close to be at or below its projected line and the latest completed close to cross above "
+        "the new projected line, while price is above a flat-or-rising Trend filter. Its strategy exit is the lowest Low from the prior Sell exit length bars.\n\n"
+        "TRENDLINE RETEST CONTINUATION: First finds a valid Trendline breakout inside the lookback window. It then waits for a later bar whose Low comes "
+        "within 0.5 ATR above the projected broken trendline while that bar closes at or above the line. A BUY requires the latest completed close to remain "
+        "above the line, exceed the Momentum turn average, and exceed the prior close, with price above a flat-or-rising Trend filter. Its strategy exit is "
+        "the lowest Low from the prior Sell exit length bars.\n\n"
+        "RSI MEAN-REVERSION SCALP: Arms after RSI reaches the selected low level or falls by the selected number of points from a recent RSI high. It buys "
+        "only after RSI rebounds by the selected amount and price closes above the prior completed bar. It exits when RSI recovers to the saved exit level, "
+        "when enabled price protection is reached, or when the optional maximum holding period is reached."
     ),
 )
 strategy_type = strategy_options[strategy_label]
@@ -2218,8 +2248,16 @@ entry_w = st.sidebar.slider(
     key="entry_window_input",
     disabled=strategy_type in {"pullback", "rsi_scalp"},
     help=(
-        "Breakout continuation uses this many bars to find the prior high. "
-        "Trendline breakout and Trendline retest continuation use this many bars to find descending swing-high resistance."
+        "Used only by Breakout continuation, Trendline breakout, and Trendline retest continuation. A bar always means one completed bar on the selected Interval.\n\n"
+        "BREAKOUT CONTINUATION: This is the number of prior completed bars searched for the highest High. The current bar is not included in that prior-high "
+        "calculation. Example: with Interval 1h and length 20, suppose the highest High in the previous 20 completed 1-hour bars is $105.00. A BUY can pass "
+        "this rule only when the latest completed 1-hour bar closes above $105.00. Increasing the length makes price clear a longer-term high and usually creates "
+        "fewer signals. Decreasing it uses a more recent high and usually creates more signals.\n\n"
+        "TRENDLINE BREAKOUT: This is the recent window searched for confirmed swing highs. A swing high must be at least as high as the two bars immediately before "
+        "it and the two bars immediately after it. The app connects two descending swing highs and projects that line to the latest bar. A larger lookback can use older, "
+        "broader resistance; a smaller lookback focuses on newer, shorter resistance.\n\n"
+        "TRENDLINE RETEST CONTINUATION: The same window is used to find the original descending trendline breakout and then its later retest. It is not a fixed number of "
+        "bars that price must wait before buying."
     ),
 )
 exit_w = st.sidebar.slider(
@@ -2231,9 +2269,15 @@ exit_w = st.sidebar.slider(
     key="exit_window_input",
     disabled=strategy_type == "rsi_scalp",
     help=(
-        "Controls the saved strategy exit line. Breakout continuation, Trendline breakout, and Trendline retest continuation "
-        "use this many bars to find the recent low exit level. Trend pullback continuation uses this many bars to calculate "
-        "the exit average. Higher gives trades more room; lower exits faster."
+        "Used by the four trend strategies to calculate their strategy sell line from completed bars on the selected Interval. It does not replace the initial ATR stop, "
+        "break-even stop, or ATR trailing stop. When Strategy exit + ATR protection manages a position, the active sell trigger is the highest valid protection level.\n\n"
+        "BREAKOUT CONTINUATION, TRENDLINE BREAKOUT, AND TRENDLINE RETEST CONTINUATION: The strategy exit is the lowest Low from the prior selected number of completed bars. "
+        "Example: with Interval 4h and Sell exit length 10, if the lowest Low in the previous ten completed 4-hour bars is $96.00, the strategy sell line is $96.00. The position "
+        "exits when price reaches that line under the saved exit-confirmation rules.\n\n"
+        "TREND PULLBACK CONTINUATION: The strategy exit is the simple average of the closing prices in the selected number of completed bars. Example: if the ten closing prices "
+        "average $98.25, the strategy sell line is $98.25.\n\n"
+        "A shorter length follows price more closely and normally exits sooner. A longer length changes more slowly and normally gives the position more room. ATR protection can "
+        "still become the active sell trigger first if it is higher. RSI mean-reversion scalp does not use this input."
     ),
 )
 atr_mult = st.sidebar.number_input(
@@ -2246,8 +2290,11 @@ atr_mult = st.sidebar.number_input(
     key="atr_stop_multiplier_input",
     disabled=strategy_type == "rsi_scalp" and rsi_stop_mode != "standard_atr",
     help=(
-        "Sets stop distance as a multiple of ATR. Example: 1.28 means 1.28x ATR, not 1.28%. "
-        "Higher means a wider stop and smaller share size. Lower means a tighter stop and larger share size."
+        "Sets the initial price-stop distance using ATR calculated from the selected Interval. The formula is Entry price minus (current ATR x this multiplier). "
+        "This number is a multiplier, not a percentage. Example: entry $100.00, ATR $2.00, multiplier 1.50 gives a $3.00 stop distance and a $97.00 initial stop. "
+        "A higher multiplier creates a wider stop and normally a smaller position because more dollars are at risk per share. A lower multiplier creates a tighter stop and normally "
+        "a larger position. ATR is interval-specific: a 15-minute ATR and daily ATR for the same ticker are different. Trendline retest continuation may place its initial stop even "
+        "lower when the retested trendline structure requires more room."
     ),
 )
 rsi_emergency_atr_multiplier = st.sidebar.number_input(
@@ -2270,7 +2317,12 @@ risk_pct = st.sidebar.slider(
     0.5,
     step=0.5,
     key="risk_pct_input",
-    help="How much of the simulator account the strategy is allowed to risk on one trade before separate risk limits are applied.",
+    help=(
+        "Sets the strategy's target dollar risk for one trade before the separate Risk limits are enforced. Dollar risk equals account value x this percentage. Position quantity is then "
+        "approximately dollar risk divided by the distance between entry and initial stop, and may be reduced by Max risk per trade, Max new order size, cash, concentration, or quantity limits. "
+        "Example: a $100,000 account at 0.50% targets $500 of risk. If entry is $100 and the initial stop is $95, risk is $5 per share, so the unconstrained size is about 100 shares. If Max new "
+        "order size is 5%, the $10,000 order would be reduced to about $5,000, or 50 shares. This input sizes trades; it is not a percentage-loss trigger and does not itself sell a position."
+    ),
 )
 ma_w = st.sidebar.slider(
     "Trend filter length (bars)",
@@ -2280,7 +2332,13 @@ ma_w = st.sidebar.slider(
     step=50,
     key="moving_average_window_input",
     disabled=strategy_type == "rsi_scalp",
-    help="Calculates the trend filter. The app treats the ticker as healthier when price is above this average and the average is rising.",
+    help=(
+        "Used by Breakout continuation, Trend pullback continuation, Trendline breakout, and Trendline retest continuation. It is a simple moving average of the selected number of completed "
+        "closing-price bars on the selected Interval. Example: with Interval 1d and length 50, the filter is the average Close of the latest 50 completed daily bars.\n\n"
+        "For Breakout continuation, the latest completed close must be above the filter and the current filter must be strictly higher than its prior-bar value. For Trend pullback continuation, "
+        "Trendline breakout, and Trendline retest continuation, price must be above the filter and the filter may be flat or rising; it cannot be falling. A shorter length reacts faster to recent price "
+        "changes and can change trend status more often. A longer length represents a slower, broader trend and usually filters out more trades. RSI mean-reversion scalp does not use this input."
+    ),
 )
 pullback_w = st.sidebar.slider(
     "Pullback average length (bars)",
@@ -2291,9 +2349,12 @@ pullback_w = st.sidebar.slider(
     key="pullback_average_length_input",
     disabled=strategy_type != "pullback",
     help=(
-        "Used by Trend pullback continuation. This calculates the moving average used as the pullback zone. "
-        "The strategy looks for the recent low to touch or come near this average before buying. "
-        "Shorter values create shallower pullback zones; longer values create deeper, slower zones."
+        "Used only by Trend pullback continuation. It calculates a simple moving average from the selected number of completed closing-price bars. The strategy then looks back across the same "
+        "number of completed closes and asks whether the lowest recent Close reached the pullback zone. The rule passes when that recent low is at or below 102% of the current pullback average.\n\n"
+        "Example: with Interval 4h and length 20, suppose the 20-bar pullback average is $100.00. The pullback-zone ceiling is $102.00. If the lowest Close among those recent 20 completed 4-hour bars "
+        "was $101.50, the pullback rule passes; if the lowest Close was $103.00, it does not. Passing this rule does not create a BUY by itself: the trend filter and Momentum turn rules must also pass. "
+        "The qualifying touch can have occurred earlier within the lookback window; it does not have to occur on the latest bar. A shorter length follows recent price more closely. A longer length uses "
+        "a slower average and keeps older pullbacks in the test window longer."
     ),
 )
 momentum_w = st.sidebar.slider(
@@ -2305,8 +2366,15 @@ momentum_w = st.sidebar.slider(
     key="momentum_turn_length_input",
     disabled=strategy_type not in {"pullback", "trendline_retest"},
     help=(
-        "Used by Trend pullback continuation and Trendline retest continuation. This calculates the short average used to confirm "
-        "price has turned back up before buying. Shorter values react faster; longer values wait for more confirmation."
+        "Used only by Trend pullback continuation and Trendline retest continuation. It calculates a short simple moving average from the selected number of completed closes and helps confirm that "
+        "price has turned upward instead of continuing to fall.\n\n"
+        "TREND PULLBACK CONTINUATION: The latest completed close must be above the momentum average, the momentum average must be flat or higher than its prior-bar value, and the latest close must be "
+        "above the prior close. Example: on a 1-hour chart with length 5, if the 5-bar average is $50.00, its prior value was $49.90, the prior close was $49.80, and the latest close is $50.20, the momentum "
+        "rule passes.\n\n"
+        "TRENDLINE RETEST CONTINUATION: After a valid trendline breakout and retest, the latest completed close must be above this momentum average and above the prior close. The average itself is not "
+        "required to be rising for this strategy.\n\n"
+        "A shorter length reacts faster and usually confirms more turns, including more false starts. A longer length responds more slowly and usually requires a more established rebound. This input does "
+        "not set the buy price by itself; all other required rules for the selected strategy must also pass."
     ),
 )
 rsi_entry_filter_enabled = st.sidebar.checkbox(
@@ -2890,6 +2958,7 @@ current_strategy_settings = {
 }
 current_exit_settings = dict(current_strategy_settings)
 current_exit_settings["auto_exit_enabled"] = True
+current_exit_settings["exit_mode"] = "strategy_and_atr"
 
 automation_control_store = AutomationControlStore()
 automation_worker_status_store = WorkerStatusStore()
@@ -2971,7 +3040,7 @@ elif stop_worker_requested:
 automation_worker_status = automation_worker_status_store.read()
 
 
-def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
+def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
     if not settings:
         return {
             "ready": False,
@@ -3241,6 +3310,19 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         }
     except Exception as exc:
         return {"ready": False, "reason": f"Could not check saved exit rule: {exc}", "trigger_price": None}
+
+
+def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
+    if not settings:
+        return {"ready": False, "reason": "No saved exit settings for this position; auto exit is paused.", "trigger_price": None}
+    symbol = str(settings.get("symbol", "")).strip().upper()
+    matching_position = next(
+        (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == symbol),
+        {"Symbol": symbol, "Average Entry": settings.get("entry_reference_price")},
+    )
+    details = evaluate_saved_exit_settings(settings, matching_position, fetch_price_data_for_source)
+    details["atr_stop_price"] = details.get("original_stop_price")
+    return details
 
 
 def evaluate_exit_rule_from_settings(settings: dict | None) -> tuple[bool, str]:
@@ -4108,6 +4190,7 @@ def render_current_setup_watchlist_action() -> None:
         st.caption("Select Alpaca stock or crypto price data before saving an automatic BUY setup.")
 
 
+@st.fragment(run_every=f"{automation_refresh_seconds}s" if background_worker_enabled else None)
 def render_buy_watchlist_manager() -> None:
     st.markdown(
         "#### Buy watchlist",
@@ -4162,6 +4245,17 @@ def render_buy_watchlist_manager() -> None:
                 )
             buy_watchlist_store.update(selected_watch_plan.plan_id, **repeat_changes)
             st.rerun()
+        with st.expander("Current BUY requirements", expanded=True):
+            if selected_watch_plan.buy_requirement_levels:
+                st.dataframe(
+                    pd.DataFrame(selected_watch_plan.buy_requirement_levels),
+                    width="stretch",
+                    hide_index=True,
+                )
+            else:
+                st.caption(
+                    "Current levels have not been calculated for this setup yet. If the Background Worker is running, this panel will update automatically after its first pass."
+                )
         with st.expander("Saved setup details", expanded=True):
             st.dataframe(
                 pd.DataFrame(buy_watch_plan_detail_records(selected_watch_plan)),
@@ -4285,6 +4379,15 @@ def render_open_positions_panel() -> None:
         width="stretch",
         hide_index=True,
     )
+    if exit_mode_for_settings(selected_exit_settings) == "strategy_and_atr":
+        buy_snapshot = selected_exit_details.get("buy_level_snapshot") or {}
+        with st.expander("Strategy BUY requirements attached to this position", expanded=False):
+            st.caption(
+                "These are the current BUY requirements for the strategy governing this position. They explain the attached strategy; they do not add to the position automatically."
+            )
+            st.dataframe(pd.DataFrame(buy_snapshot.get("records") or []), width="stretch", hide_index=True)
+    else:
+        st.caption("This position uses ATR protection only. No strategy BUY or sell line is attached.")
     with st.expander("Quick exit changes", expanded=False):
         quick_cols = st.columns(3)
         if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
@@ -4311,11 +4414,18 @@ def render_open_positions_panel() -> None:
             st.rerun()
         if quick_cols[2].button("Use Current Sidebar Exit Settings", key=f"use_current_exit_{selected_position_symbol}"):
             quick_settings = {**current_exit_settings, "symbol": selected_position_symbol, "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", True))}
-            updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-            broker_state_store.replace_all(updated_orders)
-            st.session_state["tracked_alpaca_orders"] = updated_orders
-            st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-            st.rerun()
+            quick_preview = evaluate_exit_rule_details_from_settings(quick_settings)
+            if quick_preview.get("ready") and quick_preview.get("trigger_source") == "strategy exit":
+                st.error(
+                    "The current sidebar strategy would sell this position on the next worker check because price is already at or below "
+                    f"its strategy exit at {money_or_missing(quick_preview.get('strategy_exit_price'))}. Edit the exit settings instead."
+                )
+            else:
+                updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
+                broker_state_store.replace_all(updated_orders)
+                st.session_state["tracked_alpaca_orders"] = updated_orders
+                st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
+                st.rerun()
     if show_portfolio_evidence:
         with st.expander("Saved exit rule details *", expanded=False):
             st.dataframe(
@@ -4339,7 +4449,11 @@ def render_open_positions_panel() -> None:
 
     with st.form(f"exit_settings_{selected_position_symbol}"):
         st.markdown("#### Edit exit settings")
-        if str(selected_exit_settings.get("strategy_type", "")) == "rsi_scalp":
+        if str(selected_exit_settings.get("exit_mode") or "strategy_and_atr") == "atr_only":
+            st.caption(
+                f"ATR protection interval: {selected_exit_interval}. No strategy sell line is attached to this position."
+            )
+        elif str(selected_exit_settings.get("strategy_type", "")) == "rsi_scalp":
             st.caption(
                 f"Exit interval: {selected_exit_interval}. RSI uses completed {selected_exit_interval} bars. "
                 + ("The optional maximum holding period uses the same bars." if selected_exit_settings.get("rsi_max_holding_enabled", True) else "The maximum holding period is off.")
@@ -4366,11 +4480,25 @@ def render_open_positions_panel() -> None:
             (label for label, value in exit_strategy_options.items() if value == default_exit_strategy),
             "Breakout continuation",
         )
+        existing_exit_mode = exit_mode_for_settings(selected_exit_settings)
+        edited_exit_method_label = st.selectbox(
+            "Exit method",
+            ["ATR protection only", "Strategy exit + ATR protection"],
+            index=0 if existing_exit_mode == "atr_only" else 1,
+            key=f"exit_method_{selected_position_symbol}",
+            help=(
+                "ATR protection only ignores all strategy sell lines and uses the initial ATR stop, break-even, and ATR trail. "
+                "Strategy exit + ATR protection also lets the selected strategy close the position."
+            ),
+        )
+        edited_exit_mode = "atr_only" if edited_exit_method_label == "ATR protection only" else "strategy_and_atr"
+        strategy_exit_enabled = edited_exit_mode == "strategy_and_atr"
         edited_exit_strategy_label = st.selectbox(
             "Exit strategy",
             list(exit_strategy_options.keys()),
             index=list(exit_strategy_options.keys()).index(default_exit_strategy_label),
             key=f"exit_strategy_{selected_position_symbol}",
+            disabled=not strategy_exit_enabled,
         )
         edited_exit_strategy_type = exit_strategy_options[edited_exit_strategy_label]
         edit_cols = st.columns(3)
@@ -4381,6 +4509,7 @@ def render_open_positions_panel() -> None:
             int(selected_exit_settings.get("exit_window", exit_w)),
             step=5,
             key=f"exit_window_{selected_position_symbol}",
+            disabled=not strategy_exit_enabled,
         )
         edited_atr_mult = edit_cols[1].slider(
             "Initial stop ATR multiplier",
@@ -4402,6 +4531,7 @@ def render_open_positions_panel() -> None:
             step=50,
             key=f"exit_trend_filter_{selected_position_symbol}",
             help="Calculates the trend filter for this position's saved exit plan.",
+            disabled=not strategy_exit_enabled,
         )
         saved_entry_atr = optional_float(selected_exit_settings.get("entry_atr"))
         projected_fill_adjusted_stop = (
@@ -4457,6 +4587,7 @@ def render_open_positions_panel() -> None:
             step=5,
             key=f"exit_pullback_length_{selected_position_symbol}",
             help="Used by Trend pullback continuation as the pullback-zone average for this position.",
+            disabled=not strategy_exit_enabled,
         )
         edited_momentum_length = pullback_cols[1].slider(
             "Momentum turn length",
@@ -4466,13 +4597,14 @@ def render_open_positions_panel() -> None:
             step=1,
             key=f"exit_momentum_length_{selected_position_symbol}",
             help="Used by Trend pullback continuation and Trendline retest continuation to confirm price turned back up.",
+            disabled=not strategy_exit_enabled,
         )
         edited_rsi_length = int(selected_exit_settings.get("rsi_length", 14))
         edited_rsi_recovery = float(selected_exit_settings.get("rsi_sell_recovery_points", 35.0))
         edited_rsi_sell_cap = float(selected_exit_settings.get("rsi_overbought", 70.0))
         edited_rsi_max_hold_enabled = bool(selected_exit_settings.get("rsi_max_holding_enabled", True))
         edited_rsi_max_hold = int(selected_exit_settings.get("rsi_max_holding_bars", 100))
-        if edited_exit_strategy_type == "rsi_scalp":
+        if strategy_exit_enabled and edited_exit_strategy_type == "rsi_scalp":
             st.markdown("#### RSI mean-reversion exit")
             edited_rsi_max_hold_enabled = st.checkbox(
                 "Use maximum holding period",
@@ -4508,8 +4640,9 @@ def render_open_positions_panel() -> None:
         edited_exit_settings = adjust_initial_stop_settings({
             **selected_exit_settings,
             "symbol": selected_position_symbol,
+            "exit_mode": edited_exit_mode,
             "strategy_type": edited_exit_strategy_type,
-            "strategy_label": edited_exit_strategy_label,
+            "strategy_label": "ATR protection only" if edited_exit_mode == "atr_only" else edited_exit_strategy_label,
             "exit_window": edited_exit_window,
             "atr_stop_multiplier": edited_atr_mult,
             "moving_average_window": edited_trend_filter,
@@ -4526,26 +4659,38 @@ def render_open_positions_panel() -> None:
             "trail_after_r": edited_trail_after_r,
             "trailing_atr_multiplier": edited_trailing_atr_multiplier,
         }, edited_atr_mult)
-        updated_orders = update_exit_settings_for_symbol(
+        edited_preview = evaluate_exit_rule_details_from_settings(edited_exit_settings)
+        immediate_strategy_exit = bool(
+            edited_exit_mode == "strategy_and_atr"
+            and edited_preview.get("ready")
+            and edited_preview.get("trigger_source") == "strategy exit"
+        )
+        if immediate_strategy_exit:
+            st.error(
+                "These strategy settings would sell the position on the next worker check because the current price is already at or below "
+                f"the strategy exit at {money_or_missing(edited_preview.get('strategy_exit_price'))}. Choose ATR protection only or change the strategy settings."
+            )
+        else:
+            updated_orders = update_exit_settings_for_symbol(
             selected_position_symbol,
             st.session_state["tracked_alpaca_orders"],
             edited_exit_settings,
-        )
-        broker_state_store.replace_all(updated_orders)
-        st.session_state["tracked_alpaca_orders"] = updated_orders
-        settings_event = AuditEvent(
-            event_type="position_exit_settings_saved",
-            message="Exit settings saved for an Alpaca paper position.",
-            payload={
-                "symbol": selected_position_symbol,
-                "exit_settings": edited_exit_settings,
-                "broker_writes_submitted": 0,
-            },
-        )
-        st.session_state["session_audit_events"].append(settings_event)
-        if persist_audit_log:
-            audit_store.append(settings_event)
-        st.rerun()
+            )
+            broker_state_store.replace_all(updated_orders)
+            st.session_state["tracked_alpaca_orders"] = updated_orders
+            settings_event = AuditEvent(
+                event_type="position_exit_settings_saved",
+                message="Exit settings saved for an Alpaca paper position.",
+                payload={
+                    "symbol": selected_position_symbol,
+                    "exit_settings": edited_exit_settings,
+                    "broker_writes_submitted": 0,
+                },
+            )
+            st.session_state["session_audit_events"].append(settings_event)
+            if persist_audit_log:
+                audit_store.append(settings_event)
+            st.rerun()
 
     with st.expander("Saved entry plan", expanded=False):
         if selected_entry_settings:
@@ -4637,9 +4782,20 @@ def render_manual_order_form() -> None:
             "Auto exit this position",
             value=True,
             key=f"manual_auto_exit_{manual_key}",
-            help="Saves the current interval, exit strategy, ATR stop, break-even rule, and trailing-stop settings for the worker.",
+            help="Lets the worker manage this position using the exit method selected below.",
         )
         size_cols[2].metric("Current ATR", money_or_missing(current_atr))
+        manual_exit_method_label = st.selectbox(
+            "Exit method after this manual buy",
+            ["ATR protection only", "Strategy exit + ATR protection"],
+            index=0,
+            key=f"manual_exit_method_{manual_key}",
+            help=(
+                "ATR protection only uses the initial ATR stop, break-even rule, and ATR trailing stop. "
+                "Strategy exit + ATR protection also allows the currently selected strategy's sell rule to close the position."
+            ),
+        )
+        manual_exit_mode = "atr_only" if manual_exit_method_label == "ATR protection only" else "strategy_and_atr"
         exit_plan_text = (
             (
                 f"RSI recovery or optional {rsi_max_holding_bars}-bar maximum hold"
@@ -4650,8 +4806,12 @@ def render_manual_order_form() -> None:
             else f"sell exit length {exit_w}"
         )
         st.caption(
-            f"Exit plan: {strategy_label} on {interval} bars, {exit_plan_text}. "
-            f"Automatic exit is {'on' if manual_auto_exit else 'off'}."
+            (
+                f"Exit plan: ATR protection only on {interval} bars. The selected strategy cannot sell this manual position. "
+                if manual_exit_mode == "atr_only"
+                else f"Exit plan: {strategy_label} on {interval} bars, {exit_plan_text}. "
+            )
+            + f"Automatic exit is {'on' if manual_auto_exit else 'off'}."
         )
 
         manual_intent = None
@@ -4763,6 +4923,8 @@ def render_manual_order_form() -> None:
                 broker_order_id = str(getattr(submitted_order, "id", ""))
                 manual_exit_settings = {
                     **current_exit_settings,
+                    "exit_mode": manual_exit_mode,
+                    "strategy_label": "ATR protection only" if manual_exit_mode == "atr_only" else strategy_label,
                     "rsi_stop_mode": (
                         "standard_atr"
                         if strategy_type == "rsi_scalp" and rsi_stop_mode == "no_price_stop"
@@ -4777,7 +4939,7 @@ def render_manual_order_form() -> None:
                     "entry_stop_distance": manual_intent.entry_price - manual_intent.stop_loss,
                     "entry_stop_loss": manual_intent.stop_loss,
                     "entry_rule_level": None,
-                    "exit_rule_level_at_entry": optional_float(live.get("exit_level")),
+                    "exit_rule_level_at_entry": optional_float(live.get("exit_level")) if manual_exit_mode == "strategy_and_atr" else None,
                     "entry_rsi": optional_float(live.get("rsi")),
                     "entry_rsi_setup_low": first_available_number(
                         live.get("rsi_setup_low"),
@@ -4953,6 +5115,15 @@ elif command_center_view == "New Trade":
         ),
     )
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
+    st.markdown(
+        "#### Current BUY requirements",
+        help="Shows each required rule, its current value, the exact threshold when one exists, and the remaining distance. Pattern and RSI rules are shown honestly when they cannot be reduced to one price.",
+    )
+    st.dataframe(
+        pd.DataFrame(buy_requirement_records(live, interval=interval, latest_price=optional_float(live.get("last_p")))),
+        width="stretch",
+        hide_index=True,
+    )
     render_current_setup_watchlist_action()
     with st.expander("Compare all five current strategy fits", expanded=False):
         st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
@@ -4963,7 +5134,7 @@ elif command_center_view == "New Trade":
             st.markdown("#### Setup details *")
             st.dataframe(pd.DataFrame(setup_scorecard_rows), width="stretch", hide_index=True)
             st.markdown("#### Required BUY rules *")
-            st.dataframe(pd.DataFrame(buy_requirement_records(live)), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(buy_requirement_records(live, interval=interval)), width="stretch", hide_index=True)
             st.markdown("#### Strategy use cases *")
             st.dataframe(pd.DataFrame(strategy_use_case_records(strategy_label)), width="stretch", hide_index=True)
             st.markdown("#### Saved research reads *")
@@ -5583,7 +5754,7 @@ if command_center_view == "New Trade":
             else:
                 st.markdown('<span class="signal-flat">NO TRADE RIGHT NOW</span>', unsafe_allow_html=True)
             st.markdown("#### Required for BUY")
-            st.dataframe(pd.DataFrame(buy_requirement_records(live)), width="stretch", hide_index=True)
+            st.dataframe(pd.DataFrame(buy_requirement_records(live, interval=interval)), width="stretch", hide_index=True)
             st.markdown("#### Required for automatic SELL")
             st.dataframe(
                 pd.DataFrame(

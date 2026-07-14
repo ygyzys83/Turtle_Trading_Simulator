@@ -14,6 +14,7 @@ from agentloop_trader.backtest import (
     simulate_turtle_strategy,
 )
 from agentloop_trader.models import RiskLimits, TradeIntent
+from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
 
 STRATEGY_TYPES = {
@@ -23,6 +24,14 @@ STRATEGY_TYPES = {
     "Trendline retest continuation": "trendline_retest",
     "RSI mean-reversion scalp": "rsi_scalp",
 }
+
+
+def exit_mode_for_settings(settings: dict[str, Any] | None) -> str:
+    settings = settings or {}
+    explicit = str(settings.get("exit_mode") or "").strip()
+    if explicit:
+        return explicit
+    return "atr_only" if str(settings.get("entry_source") or "").strip().lower() == "manual order" else "strategy_and_atr"
 
 
 def _number(value: Any, default: float | None = None) -> float | None:
@@ -263,12 +272,14 @@ def evaluate_exit_settings(
         account = float(settings.get("account_size", 100000))
         result = selected_strategy_result(data, settings, account)
         live = result["live"]
+        exit_mode = exit_mode_for_settings(settings)
+        strategy_exit_enabled = exit_mode == "strategy_and_atr"
         current_price = _number(data.attrs.get("latest_price"), _number(live.get("last_p")))
-        strategy_exit = _number(live.get("exit_level"))
+        strategy_exit = _number(live.get("exit_level")) if strategy_exit_enabled else None
         current_atr = _number(live.get("last_atr"))
         current_rsi = _number(live.get("rsi"))
         entry = _number(position.get("Average Entry"), _number(settings.get("entry_reference_price"), current_price))
-        rsi_strategy = str(settings.get("strategy_type", "")) == "rsi_scalp"
+        rsi_strategy = strategy_exit_enabled and str(settings.get("strategy_type", "")) == "rsi_scalp"
         no_price_stop = rsi_strategy and str(settings.get("rsi_stop_mode", "standard_atr")) == "no_price_stop"
         atr_mult = float(settings.get("atr_stop_multiplier", 2.0))
         initial_risk = _number(settings.get("entry_stop_distance"))
@@ -355,6 +366,7 @@ def evaluate_exit_settings(
             "current_price": current_price,
             "trigger_price": trigger,
             "trigger_source": source_name,
+            "exit_mode": exit_mode,
             "strategy_exit_price": strategy_exit,
             "original_stop_price": original_stop,
             "breakeven_stop_price": breakeven,
@@ -371,6 +383,12 @@ def evaluate_exit_settings(
             "max_holding_bars": max_holding_bars if rsi_strategy and max_holding_enabled else None,
             "time_exit_ready": time_exit_ready,
             "interval": interval,
+            "exit_window": int(settings.get("exit_window", 10)),
+            "atr_multiplier": atr_mult,
+            "trailing_atr_multiplier": trail_mult,
+            "breakeven_after_r": breakeven_after,
+            "trail_after_r": trail_after,
+            "buy_level_snapshot": build_buy_level_snapshot(live, interval=interval, latest_price=current_price),
             "checked_at": datetime.now().astimezone().isoformat(),
             "state_changed": bool((high or 0) > (saved_high or 0) or (trigger or 0) > (saved_trigger or 0)),
         }

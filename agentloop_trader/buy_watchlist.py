@@ -38,6 +38,10 @@ class BuyWatchPlan:
     updated_at: str = ""
     last_checked_at: str = ""
     order_sent_at: str = ""
+    latest_price: float | None = None
+    next_buy_level: float | None = None
+    distance_to_buy_pct: float | None = None
+    buy_requirement_levels: list[dict[str, Any]] = field(default_factory=list)
 
 
 def buy_watch_plan_id(symbol: str, interval: str, strategy_label: str, asset_class: str = "equity") -> str:
@@ -126,6 +130,9 @@ def buy_watchlist_records(plans: list[BuyWatchPlan]) -> list[dict[str, Any]]:
             "Repeat After Exit": "On" if plan.repeat_after_exit else "Off",
             "Enabled": "Yes" if plan.enabled else "No",
             "Status": plan.status,
+            "Current Price": f"${plan.latest_price:,.2f}" if plan.latest_price is not None else "Not checked",
+            "Next BUY Level": f"${plan.next_buy_level:,.2f}" if plan.next_buy_level is not None else "Pattern / indicator rules",
+            "Distance To BUY": f"{plan.distance_to_buy_pct:+.2f}%" if plan.distance_to_buy_pct is not None else "Depends on rule",
             "Last checked": plan.last_checked_at or "Not checked yet",
             "Plain English": plan.detail,
         }

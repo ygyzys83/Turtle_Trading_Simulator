@@ -226,6 +226,30 @@ def test_buy_requirement_records_separate_hard_buy_rules():
     assert "must pass" in rules["Price above entry level"]["Plain English"]
 
 
+def test_breakout_buy_requirements_show_exact_price_and_distance():
+    rows = buy_requirement_records(
+        {
+            "setup_type": "breakout",
+            "last_p": 100.0,
+            "entry_level": 105.0,
+            "last_sma": 95.0,
+            "trend_window": 50,
+            "pos_size": 10,
+            "buy_requirements": {
+                "Price above 20-bar high": False,
+                "Price above rising 50-bar trend filter": True,
+                "Position size above zero": True,
+            },
+        },
+        interval="4h",
+    )
+    by_rule = {row["Required BUY Rule"]: row for row in rows}
+
+    assert by_rule["Breakout price"]["Required"] == "Completed 4h bar closes above $105.00"
+    assert by_rule["Breakout price"]["Distance"] == "+5.00%"
+    assert by_rule["Position size"]["Status"] == "Pass"
+
+
 def test_optional_quality_input_records_do_not_claim_to_create_buy():
     rows = optional_quality_input_records({"volume": True, "rsi": True, "market_condition": False})
     inputs = {row["Quality Input"]: row for row in rows}

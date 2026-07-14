@@ -872,6 +872,12 @@ def simulate_turtle_strategy(
         setup_type="breakout",
     )
     live["buy_requirements"] = buy_requirements
+    live.update({
+        "entry_window": entry_w,
+        "trend_window": ma_w,
+        "trend_filter_level": last_sma,
+        "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+    })
     live["no_trade_reason"] = no_trade_reason
     live["in_simulated_trade"] = in_trade
     live["exit_ready"] = strategy_exit_ready
@@ -1153,6 +1159,18 @@ def simulate_trend_pullback_strategy(
     live["pullback_ready"] = setup_ready
     live["trend_ok"] = trend_ok
     live["touched_pullback"] = touched_pullback
+    live.update({
+        "trend_window": trend_w,
+        "trend_filter_level": trend_smas[live_bar],
+        "pullback_window": pullback_w,
+        "pullback_average_level": pullback_level,
+        "pullback_zone_high": pullback_level * 1.02,
+        "recent_pullback_low": recent_close_low,
+        "momentum_window": momentum_w,
+        "momentum_average_level": momentum_smas[live_bar],
+        "prior_p": float(prices[live_bar - 1]),
+        "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+    })
     live["buy_requirements"] = buy_requirements
     live["no_trade_reason"] = no_trade_reason
     live["in_simulated_trade"] = in_trade
@@ -1703,6 +1721,17 @@ def _trendline_live_fields(
     live["trendline_slope"] = trendline_slope
     live["trendline_break"] = trendline_break
     live["retest_ready"] = retest_ready
+    live.update({
+        "entry_window": lookback,
+        "trend_window": ma_w,
+        "trend_filter_level": last_sma,
+        "trend_ok": trend_ok,
+        "momentum_window": momentum_w,
+        "momentum_average_level": momentum_smas[index] if momentum_smas is not None else None,
+        "prior_p": float(prices[index - 1]),
+        "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+        "retest_description": "Retest held" if retest_ready else "Retest and upward turn not complete",
+    })
     live["buy_requirements"] = buy_requirements
     live["no_trade_reason"] = no_trade_reason
     live["exit_ready"] = bool(last_p <= exit_level)
@@ -2009,6 +2038,8 @@ def simulate_rsi_mean_reversion_strategy(
         "prior_p": float(prices[live_bar - 1]),
         "rsi_sell_level": min(rsi_overbought, float(live_setup_low or rsi_oversold) + rsi_sell_recovery_points),
         "rsi_length": rsi_length,
+        "rsi_oversold": rsi_oversold,
+        "required_rsi_decline_points": rsi_decline_points,
         "rsi_stop_mode": rsi_stop_mode,
         "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
         "buy_requirements": {

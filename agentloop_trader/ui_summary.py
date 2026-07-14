@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from agentloop_trader.strategy_levels import build_buy_level_snapshot
+from agentloop_trader.strategy_runtime import exit_mode_for_settings
+
 
 def _order_status(value) -> str:
     text = str(value or "").strip().lower()
@@ -342,27 +345,8 @@ def setup_scorecard_records(
     return rows
 
 
-def buy_requirement_records(live: dict) -> list[dict]:
-    requirements = live.get("buy_requirements") or {}
-    if not requirements:
-        return [
-            {
-                "Required BUY Rule": "Selected strategy rules",
-                "Status": "Unknown",
-                "Plain English": "The strategy did not provide a rule-by-rule BUY checklist.",
-            }
-        ]
-
-    rows = []
-    for rule, passed in requirements.items():
-        rows.append(
-            {
-                "Required BUY Rule": str(rule),
-                "Status": "Pass" if passed else "Not met",
-                "Plain English": "This must pass before the app can create a BUY intent.",
-            }
-        )
-    return rows
+def buy_requirement_records(live: dict, interval: str = "", latest_price: float | None = None) -> list[dict]:
+    return build_buy_level_snapshot(live, interval=interval, latest_price=latest_price)["records"]
 
 
 def optional_quality_input_records(enabled_inputs: dict[str, bool] | None = None) -> list[dict]:
@@ -440,7 +424,9 @@ def managed_position_records(position_records: list[dict], exit_settings_by_symb
         symbol = str(position.get("Symbol", "")).strip().upper()
         settings = exit_settings_by_symbol.get(symbol, {})
         auto_exit_enabled = bool(settings.get("auto_exit_enabled", False)) if settings else False
+        exit_mode = exit_mode_for_settings(settings)
         strategy = str(settings.get("strategy_label") or settings.get("strategy_type") or "Not saved")
+        exit_method = "ATR protection only" if exit_mode == "atr_only" else f"{strategy} + ATR protection"
         rows.append(
             {
                 "Symbol": symbol,
@@ -448,7 +434,7 @@ def managed_position_records(position_records: list[dict], exit_settings_by_symb
                 "Market Value": _money(_as_float(position.get("Market Value"))),
                 "Avg Entry": _money(_as_float(position.get("Average Entry"))),
                 "Auto Exit": "On" if auto_exit_enabled else "Off",
-                "Exit Strategy": strategy,
+                "Exit Method": exit_method,
                 "Management Status": "Managed" if settings else "Needs exit settings",
             }
         )
@@ -476,10 +462,11 @@ def position_exit_plan_records(
             {"Field": "Auto Exit", "Value": "Off"},
             {"Field": "Current Exit Check", "Value": exit_reason or "No saved exit settings for this position."},
         ]
+    exit_mode = exit_mode_for_settings(settings)
     strategy = str(settings.get("strategy_label") or settings.get("strategy_type") or "Unknown")
     strategy_type = str(settings.get("strategy_type", ""))
     rows = [
-        {"Field": "Exit Strategy", "Value": strategy},
+        {"Field": "Exit Method", "Value": "ATR protection only" if exit_mode == "atr_only" else "Strategy exit + ATR protection"},
         {"Field": "Auto Exit", "Value": "On" if settings.get("auto_exit_enabled", True) else "Off"},
         {
             "Field": "Auto Exit Trigger Price",
@@ -488,7 +475,10 @@ def position_exit_plan_records(
         {"Field": "Price Interval", "Value": str(settings.get("interval", "Not saved"))},
         {"Field": "ATR Stop Distance", "Value": str(settings.get("atr_stop_multiplier", "Not saved"))},
     ]
-    if strategy_type == "rsi_scalp":
+    if exit_mode == "atr_only":
+        pass
+    elif strategy_type == "rsi_scalp":
+        rows.append({"Field": "Exit Strategy", "Value": strategy})
         rows.extend([
             {"Field": "RSI Length", "Value": _bars(settings.get("rsi_length"))},
             {"Field": "RSI Setup Low At Entry", "Value": str(settings.get("entry_rsi_setup_low", "Not recorded"))},
@@ -513,6 +503,7 @@ def position_exit_plan_records(
             },
         ])
     else:
+        rows.append({"Field": "Exit Strategy", "Value": strategy})
         rows.extend([
             {"Field": "Sell Exit Length", "Value": _bars(settings.get("exit_window"))},
             {"Field": "Trend Filter Length", "Value": _bars(settings.get("moving_average_window"))},

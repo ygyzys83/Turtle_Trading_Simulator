@@ -50,6 +50,7 @@ from agentloop_trader.strategy_runtime import (
     saved_exit_settings_for_symbol,
     update_exit_settings_for_symbol,
 )
+from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
 
 _BAR_CACHE: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
@@ -387,6 +388,7 @@ def _send_entry(
         "planned_limit_price": intent.limit_price,
         "planned_quantity": intent.quantity,
         "auto_exit_enabled": True,
+        "exit_mode": "strategy_and_atr",
         "entry_rsi": live.get("rsi"),
         "entry_rsi_setup_low": live.get("rsi_setup_low") if live.get("rsi_setup_low") is not None else live.get("rsi"),
         "entry_rsi_sell_level": (
@@ -454,6 +456,18 @@ def _repeat_cooldown_remaining(plan: BuyWatchPlan, now: datetime) -> float:
     return max(0.0, cooldown_minutes - elapsed_minutes)
 
 
+def _watch_plan_snapshot(
+    control: AutomationControl,
+    adapter: AlpacaBrokerAdapterStub,
+    fetch_bars: Callable[[str, str, str, str], Any],
+    latest_price: float | None,
+) -> dict[str, Any]:
+    account_equity = _account_value(adapter.account_records(), "portfolio value", 0.0)
+    data = fetch_bars(control.symbol, control.history, control.interval, control.price_data_source)
+    result = selected_strategy_result(data, control.strategy_settings, account_equity, _risk_limits(control))
+    return build_buy_level_snapshot(result.get("live", {}), interval=control.interval, latest_price=latest_price)
+
+
 def _send_watchlist_entries(
     control: AutomationControl,
     adapter: AlpacaBrokerAdapterStub,
@@ -492,6 +506,29 @@ def _send_watchlist_entries(
         if sent >= max(0, max_to_send):
             break
         checked_at = datetime.now(PACIFIC_TIME).isoformat()
+        plan_control = _control_for_watch_plan(control, plan)
+        try:
+            snapshot = _watch_plan_snapshot(
+                plan_control,
+                adapter,
+                fetch_bars,
+                (latest_prices or {}).get(plan.symbol),
+            )
+            store.update(
+                plan.plan_id,
+                latest_price=(latest_prices or {}).get(plan.symbol),
+                next_buy_level=snapshot.get("next_buy_level"),
+                distance_to_buy_pct=snapshot.get("distance_to_buy_pct"),
+                buy_requirement_levels=snapshot.get("records") or [],
+                last_checked_at=checked_at,
+            )
+        except Exception as exc:
+            store.update(
+                plan.plan_id,
+                buy_requirement_levels=[],
+                last_checked_at=checked_at,
+                detail=f"Could not calculate current BUY requirements: {exc}",
+            )
         if plan.repeat_after_exit:
             clean_symbol = plan.symbol.strip().upper()
             position_open = clean_symbol in _open_symbols(current_positions)
@@ -528,7 +565,6 @@ def _send_watchlist_entries(
                 messages.append(f"{plan.symbol} {plan.strategy_label}: previous cycle finished; waiting for the BUY signal to reset.")
                 continue
             if plan.cycle_state == "waiting_for_signal_reset":
-                plan_control = _control_for_watch_plan(control, plan)
                 signal_active, signal_error = _repeat_signal_state(plan_control, adapter, fetch_bars)
                 if signal_active is None:
                     store.update(
@@ -590,7 +626,6 @@ def _send_watchlist_entries(
             )
             messages.append(f"{plan.symbol} {plan.strategy_label}: {message}")
             continue
-        plan_control = _control_for_watch_plan(control, plan)
         count, tracked, message = _send_entry(
             plan_control,
             adapter,

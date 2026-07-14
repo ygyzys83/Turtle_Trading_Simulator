@@ -106,3 +106,19 @@ def test_watchlist_records_show_repeat_after_exit_state():
     record = buy_watchlist_records([repeating])[0]
 
     assert record["Repeat After Exit"] == "On"
+
+
+def test_watchlist_records_show_current_buy_level_and_distance():
+    plan = _plan(symbol="TSLA")
+    plan = BuyWatchPlan(**{
+        **plan.__dict__,
+        "latest_price": 200.0,
+        "next_buy_level": 210.0,
+        "distance_to_buy_pct": 5.0,
+    })
+
+    record = buy_watchlist_records([plan])[0]
+
+    assert record["Current Price"] == "$200.00"
+    assert record["Next BUY Level"] == "$210.00"
+    assert record["Distance To BUY"] == "+5.00%"

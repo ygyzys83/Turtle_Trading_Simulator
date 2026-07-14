@@ -650,6 +650,14 @@ A fifth deterministic strategy, `RSI mean-reversion scalp`, was added for short-
 
 No broker order was submitted during development or testing.
 
+## Manual Position Exit Ownership And BUY-Level Visibility (July 14, 2026)
+
+Manual paper buys no longer silently inherit the selected strategy's sell line. A manual order now defaults to `ATR protection only`, which uses the saved initial ATR stop, break-even protection, and ATR trailing stop. The manual-order form and each open position also allow an explicit `Strategy exit + ATR protection` choice. Existing saved positions without the new field retain their prior strategy-managed behavior for backward compatibility.
+
+When a strategy is attached to an open position, the app shows its current required BUY conditions and blocks saving a strategy exit that would immediately sell the position because price is already below that strategy line. New Trade and queued setups now show current values, exact thresholds where the strategy has a real price threshold, distance to that threshold, and honest state descriptions for path-dependent or RSI rules. The detached worker persists those queue snapshots while continuing to cache completed historical bars and use a lightweight latest Alpaca price for order pricing.
+
+Regression coverage includes the observed manual-position failure mode: an ATR-only IBM position around $218 must ignore an unrelated strategy exit near $288 and retain its ATR stop near $206. Existing strategy-managed positions still use their strategy exit unless the user changes the exit method.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.
