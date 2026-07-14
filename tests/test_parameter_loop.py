@@ -63,6 +63,23 @@ def test_generate_bounded_candidates_stays_inside_allowed_parameter_sets():
     assert all(c.moving_average_window in BOUNDED_MA_WINDOWS for c in candidates)
 
 
+def test_ten_bar_trend_filter_is_available_to_bounded_and_optimizer_searches():
+    current = StrategyConfig(
+        entry_window=20,
+        exit_window=10,
+        atr_stop_multiplier=1.5,
+        risk_per_trade_pct=0.5,
+        moving_average_window=10,
+    )
+
+    bounded = generate_bounded_candidates(current, max_candidates=12)
+    optimized = generate_optimizer_settings({**CURRENT_SETTINGS, "moving_average_window": 10})
+
+    assert 10 in BOUNDED_MA_WINDOWS
+    assert any(candidate.moving_average_window == 10 for candidate in bounded)
+    assert any(settings["moving_average_window"] == 10 for _, _, settings in optimized)
+
+
 def test_parameter_loop_preserves_risk_setting_and_ranks_candidates():
     current = StrategyConfig(
         entry_window=20,

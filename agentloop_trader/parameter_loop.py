@@ -205,11 +205,11 @@ class CandidateVerdict:
 BOUNDED_ENTRY_WINDOWS = (15, 20, 25, 30)
 BOUNDED_EXIT_WINDOWS = (5, 10, 15)
 BOUNDED_ATR_MULTIPLIERS = (1.5, 2.0, 2.5, 3.0)
-BOUNDED_MA_WINDOWS = (100, 150, 200, 250)
+BOUNDED_MA_WINDOWS = (10, 20, 50, 100, 150, 200, 250)
 OPTIMIZER_ENTRY_WINDOWS = (10, 15, 20, 25, 30, 40, 50)
 OPTIMIZER_EXIT_WINDOWS = (5, 10, 15, 20, 30)
 OPTIMIZER_ATR_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0)
-OPTIMIZER_TREND_WINDOWS = (50, 100, 150, 200)
+OPTIMIZER_TREND_WINDOWS = (10, 20, 50, 100, 150, 200)
 OPTIMIZER_PULLBACK_WINDOWS = (10, 20, 30, 50, 100, 150, 200)
 OPTIMIZER_MOMENTUM_WINDOWS = (3, 5, 10, 15, 20)
 OPTIMIZER_RSI_LENGTHS = (7, 9, 14, 21)
@@ -1795,7 +1795,7 @@ def _regime_rows(
     if data.empty or not trades:
         return []
     close = data["Close"].astype(float)
-    trend_window = max(20, int(settings.get("moving_average_window", 50)))
+    trend_window = max(10, int(settings.get("moving_average_window", 50)))
     trend_average = close.rolling(trend_window).mean()
     trend_prior = trend_average.shift(max(1, trend_window // 10))
     previous_close = close.shift(1)

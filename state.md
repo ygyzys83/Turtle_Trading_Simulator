@@ -707,6 +707,10 @@ The intended process behavior is explicit:
 - If the computer sleeps or suspends execution, the worker detects the unexpectedly long timer gap after wake, disables automation, and exits with `Stopped after sleep`. It must be deliberately restarted.
 - A normal computer shutdown ends both processes because the operating system terminates them.
 
+## Ten-Bar Trend Filter Support (July 14, 2026)
+
+The four trend strategies now allow a `Trend filter length` as short as 10 completed bars. The sidebar and per-position editor use a 10-to-300 range in 10-bar increments while retaining 50 bars as the default. Ten- and 20-bar filters are also valid optimizer candidates, and regime analysis no longer silently replaces a selected 10-bar filter with 20 bars. The UI warns that short filters react faster and generally create more trend changes and false signals.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

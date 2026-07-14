@@ -2397,10 +2397,10 @@ risk_pct = st.sidebar.slider(
 )
 ma_w = st.sidebar.slider(
     "Trend filter length (bars)",
-    50,
+    10,
     300,
     50,
-    step=50,
+    step=10,
     key="moving_average_window_input",
     disabled=strategy_type == "rsi_scalp",
     help=(
@@ -2408,7 +2408,8 @@ ma_w = st.sidebar.slider(
         "closing-price bars on the selected Interval. Example: with Interval 1d and length 50, the filter is the average Close of the latest 50 completed daily bars.\n\n"
         "For Breakout continuation, the latest completed close must be above the filter and the current filter must be strictly higher than its prior-bar value. For Trend pullback continuation, "
         "Trendline breakout, and Trendline retest continuation, price must be above the filter and the filter may be flat or rising; it cannot be falling. A shorter length reacts faster to recent price "
-        "changes and can change trend status more often. A longer length represents a slower, broader trend and usually filters out more trades. RSI mean-reversion scalp does not use this input."
+        "changes and can change trend status more often. A 10-bar filter is allowed for short-term, reactive testing but will usually create more trend changes and false signals than 20-, 50-, or "
+        "longer-bar filters. A longer length represents a slower, broader trend and usually filters out more trades. RSI mean-reversion scalp does not use this input."
     ),
 )
 pullback_w = st.sidebar.slider(
@@ -4725,12 +4726,12 @@ def render_open_positions_panel() -> None:
         )
         edited_trend_filter = edit_cols[2].slider(
             "Trend filter length",
-            50,
+            10,
             300,
             int(selected_exit_settings.get("moving_average_window", ma_w)),
-            step=50,
+            step=10,
             key=f"exit_trend_filter_{selected_position_symbol}",
-            help="Calculates the trend filter for this position's saved exit plan.",
+            help="Calculates the trend filter for this position's saved exit plan. A shorter filter reacts faster but changes trend direction more often.",
             disabled=not strategy_exit_enabled,
         )
         saved_entry_atr = optional_float(selected_exit_settings.get("entry_atr"))
