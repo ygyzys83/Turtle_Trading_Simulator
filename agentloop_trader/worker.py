@@ -56,6 +56,7 @@ from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
 _BAR_CACHE: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
 _BAR_CACHE_SECONDS = {"1m": 30, "5m": 60, "15m": 120, "30m": 180, "1h": 300, "4h": 900, "1d": 1800}
+SLEEP_RESUME_GRACE_SECONDS = 10.0
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -842,12 +843,29 @@ def run_loop(control_path: str | Path, status_path: str | Path, once: bool = Fal
             status_store.write(status)
             if once:
                 break
-            if _stop_requested_during_wait(control_store, max(5, int(control.refresh_seconds or 15))):
+            wait_seconds = max(5, int(control.refresh_seconds or 15))
+            wait_started_at = time.time()
+            stop_requested = _stop_requested_during_wait(control_store, wait_seconds)
+            wait_elapsed = time.time() - wait_started_at
+            if sleep_resume_detected(wait_elapsed, wait_seconds):
+                control_store.write(replace(control_store.read(), enabled=False, stop_requested=True))
+                status_store.write(
+                    replace(
+                        status_store.read(),
+                        running=False,
+                        state="Stopped after sleep",
+                        last_checked_at=datetime.now(PACIFIC_TIME).isoformat(),
+                        last_action="Background worker stopped after the computer slept or execution was suspended.",
+                        last_error="",
+                    )
+                )
+                break
+            if stop_requested:
                 continue
     finally:
         lock.release()
         final = status_store.read()
-        final_state = final.state if final.state == "Restart required" else "Stopped"
+        final_state = final.state if final.state in {"Restart required", "Stopped after sleep"} else "Stopped"
         status_store.write(replace(final, running=False, state=final_state))
     return 0
 
@@ -858,6 +876,15 @@ def _stop_requested_during_wait(control_store: AutomationControlStore, seconds: 
         if control_store.read().stop_requested:
             return True
     return False
+
+
+def sleep_resume_detected(
+    elapsed_seconds: float,
+    expected_wait_seconds: float,
+    grace_seconds: float = SLEEP_RESUME_GRACE_SECONDS,
+) -> bool:
+    """Fail closed when the worker resumes after a system sleep or long suspension."""
+    return float(elapsed_seconds) > float(expected_wait_seconds) + float(grace_seconds)
 
 
 def main() -> int:

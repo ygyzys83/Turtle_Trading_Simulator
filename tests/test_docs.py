@@ -82,6 +82,23 @@ def test_ui_theme_uses_one_semantic_palette_and_streamlit_theme_file():
     assert '[class*="st-"]' not in theme_module
     assert '[data-testid="stIconMaterial"]' in theme_module
     assert 'font-family: "Material Symbols Rounded"' in theme_module
+    assert 'overscroll-behavior-y: contain !important' in theme_module
+
+
+def test_readme_uses_supervised_streamlit_launcher():
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+
+    assert "python run_app.py" in readme
+    assert "prevents a second UI" in readme
+
+
+def test_long_price_load_shows_three_explicit_progress_stages():
+    app_text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert "Step 1 of 3 - Download price history." in app_text
+    assert "Step 2 of 3 - Run backtests." in app_text
+    assert "Step 3 of 3 - Prepare results." in app_text
+    assert "Wait for the finished results before changing sidebar inputs." in app_text
 
 
 def test_daily_workspace_titles_are_not_numbered():

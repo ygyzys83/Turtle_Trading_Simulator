@@ -1205,6 +1205,9 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
                 if candidate.strategy_type == "rsi_scalp" and candidate.settings.get("rsi_max_holding_enabled", True)
                 else "Off" if candidate.strategy_type == "rsi_scalp" else "Not used"
             ),
+            "Profit-Only RSI Exit": (
+                "On" if candidate.settings.get("rsi_profit_only_exit", False) else "Off"
+            ) if candidate.strategy_type == "rsi_scalp" else "Not used",
             "Middle Validation Return %": candidate.test_return_percent,
             "Middle Validation Account Return %": candidate.test_account_return_percent,
             "Annualized Allocated Return %": candidate.test_annualized_return_percent,
@@ -1262,6 +1265,9 @@ def _settings_text(settings: dict[str, Any]) -> str:
             f"arm at RSI {float(settings.get('rsi_oversold', 30)):.0f} or a {float(settings.get('rsi_decline_points', 40)):.0f}-point drop",
             f"buy after a {float(settings.get('rsi_rebound_points', 3)):.0f}-point rebound",
             f"sell after a {float(settings.get('rsi_sell_recovery_points', 35)):.0f}-point recovery or RSI {float(settings.get('rsi_overbought', 70)):.0f}",
+            "require price above estimated fee-adjusted break-even"
+            if settings.get("rsi_profit_only_exit", False)
+            else "allow RSI exits below entry",
             f"stop protection {stop_mode.replace('_', ' ')}",
             (
                 f"maximum hold {int(settings.get('rsi_max_holding_bars', 100))} bars"
@@ -2055,6 +2061,7 @@ def _normal_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "rsi_emergency_atr_multiplier": float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
         "rsi_max_holding_enabled": bool(settings.get("rsi_max_holding_enabled", True)),
         "rsi_max_holding_bars": int(settings.get("rsi_max_holding_bars", 100)),
+        "rsi_profit_only_exit": bool(settings.get("rsi_profit_only_exit", False)),
     }
 
 

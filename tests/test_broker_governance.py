@@ -1,5 +1,6 @@
 import tempfile
 from datetime import UTC, datetime
+from pathlib import Path
 
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
@@ -382,6 +383,78 @@ def test_broker_state_store_preserves_exit_settings_during_refresh():
 
     assert record["status"] == "filled"
     assert record["exit_settings"] == {"interval": "1h"}
+
+
+def test_broker_state_store_waits_for_short_lived_writer_lock(monkeypatch, tmp_path):
+    state_path = tmp_path / "broker_state.json"
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    lock_path.write_text("held by another writer", encoding="utf-8")
+    waits = []
+
+    def release_lock_after_wait(seconds):
+        waits.append(seconds)
+        lock_path.unlink()
+
+    monkeypatch.setattr(
+        "agentloop_trader.broker_governance.time_module.sleep",
+        release_lock_after_wait,
+    )
+    store = BrokerStateStore(state_path)
+
+    store.replace_all([{"broker_order_id": "1", "symbol": "WYFI"}])
+
+    assert waits == [0.02]
+    assert store.read()[0]["symbol"] == "WYFI"
+    assert not lock_path.exists()
+
+
+def test_broker_state_store_read_waits_for_active_writer(monkeypatch, tmp_path):
+    state_path = tmp_path / "broker_state.json"
+    state_path.write_text('[{"broker_order_id": "1"}]', encoding="utf-8")
+    lock_path = state_path.with_suffix(state_path.suffix + ".lock")
+    lock_path.write_text("held by another writer", encoding="utf-8")
+    waits = []
+
+    def release_lock_after_wait(seconds):
+        waits.append(seconds)
+        lock_path.unlink()
+
+    monkeypatch.setattr(
+        "agentloop_trader.broker_governance.time_module.sleep",
+        release_lock_after_wait,
+    )
+
+    records = BrokerStateStore(state_path).read()
+
+    assert waits == [0.02]
+    assert records == [{"broker_order_id": "1"}]
+
+
+def test_broker_state_store_retries_transient_windows_replace_lock(monkeypatch, tmp_path):
+    state_path = tmp_path / "broker_state.json"
+    store = BrokerStateStore(state_path)
+    real_replace = Path.replace
+    attempts = []
+    waits = []
+
+    def replace_once_unlocked(path, target):
+        attempts.append((path, target))
+        if len(attempts) == 1:
+            raise PermissionError(5, "Access is denied", str(target))
+        return real_replace(path, target)
+
+    monkeypatch.setattr(Path, "replace", replace_once_unlocked)
+    monkeypatch.setattr(
+        "agentloop_trader.broker_governance.time_module.sleep",
+        waits.append,
+    )
+
+    store.replace_all([{"broker_order_id": "1", "symbol": "AAPL"}])
+
+    assert len(attempts) == 2
+    assert waits == [0.02]
+    assert store.read()[0]["symbol"] == "AAPL"
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_market_session_advisory_identifies_weekend_closed():

@@ -7,6 +7,7 @@ from agentloop_trader.automation_runtime import (
     WorkerStatus,
     WorkerStatusStore,
     automation_mode_for_new_ui_session,
+    reconcile_worker_process_state,
     request_worker_stop,
     start_worker_process,
     worker_code_fingerprint,
@@ -75,6 +76,35 @@ def test_worker_code_fingerprint_detects_source_change(tmp_path):
     assert worker_status_uses_current_code(WorkerStatus(code_fingerprint=second), tmp_path) is True
     assert worker_status_uses_current_code(WorkerStatus(code_fingerprint=first), tmp_path) is False
     assert worker_status_uses_current_code(WorkerStatus(), tmp_path) is False
+
+
+def test_reconcile_worker_process_state_clears_dead_pid_and_lock(monkeypatch, tmp_path):
+    status_store = WorkerStatusStore(tmp_path / "status.json")
+    lock_path = tmp_path / "worker.lock"
+    status_store.write(WorkerStatus(running=True, pid=17868, state="Stop failed", last_error="still running"))
+    lock_path.write_text(json.dumps({"pid": 17868}), encoding="utf-8")
+    monkeypatch.setattr("agentloop_trader.automation_runtime._process_exists", lambda pid: False)
+
+    status = reconcile_worker_process_state(status_store, lock_path=lock_path)
+
+    assert status.running is False
+    assert status.state == "Stopped"
+    assert status.last_error == ""
+    assert not lock_path.exists()
+
+
+def test_reconcile_worker_process_state_preserves_live_worker(monkeypatch, tmp_path):
+    status_store = WorkerStatusStore(tmp_path / "status.json")
+    lock_path = tmp_path / "worker.lock"
+    original = WorkerStatus(running=True, pid=2468, state="Watching")
+    status_store.write(original)
+    lock_path.write_text(json.dumps({"pid": 2468}), encoding="utf-8")
+    monkeypatch.setattr("agentloop_trader.automation_runtime._process_exists", lambda pid: True)
+
+    status = reconcile_worker_process_state(status_store, lock_path=lock_path)
+
+    assert status == original
+    assert lock_path.exists()
 
 
 def test_fresh_ui_restores_mode_only_when_a_worker_record_is_present():

@@ -177,6 +177,11 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
         {"Area": "RSI scalp", "Input": "Buy after RSI rebound", "Saved Value": number("rsi_rebound_points", " points")},
         {"Area": "RSI scalp", "Input": "Sell after RSI recovery", "Saved Value": number("rsi_sell_recovery_points", " points")},
         {"Area": "RSI scalp", "Input": "RSI sell cap", "Saved Value": number("rsi_overbought")},
+        {
+            "Area": "RSI scalp",
+            "Input": "Require profit for RSI exit",
+            "Saved Value": "On" if settings.get("rsi_profit_only_exit", False) else "Off",
+        },
         {"Area": "RSI scalp", "Input": "RSI swing lookback", "Saved Value": number("rsi_swing_lookback", " bars")},
         {"Area": "RSI scalp", "Input": "Stop protection", "Saved Value": str(settings.get("rsi_stop_mode", "standard_atr")).replace("_", " ").title()},
         {

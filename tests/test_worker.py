@@ -4,7 +4,7 @@ from agentloop_trader.automation_runtime import AutomationControl, WorkerStatus
 from agentloop_trader.buy_watchlist import BuyWatchPlan, BuyWatchlistStore, buy_watch_plan_id
 from agentloop_trader.brokers import AlpacaConfig
 from agentloop_trader.models import TradeIntent
-from agentloop_trader.worker import _BAR_CACHE, _fetcher, _open_buy_order_notional, _send_entry, _send_exits, _send_watchlist_entries, _stop_requested_during_wait, run_once
+from agentloop_trader.worker import _BAR_CACHE, _fetcher, _open_buy_order_notional, _send_entry, _send_exits, _send_watchlist_entries, _stop_requested_during_wait, run_once, sleep_resume_detected
 
 
 def test_worker_disabled_only_records_heartbeat():
@@ -14,6 +14,12 @@ def test_worker_disabled_only_records_heartbeat():
     assert status.state == "Watching only"
     assert status.loop_count == 5
     assert status.orders_sent == 0
+
+
+def test_worker_detects_resume_after_system_sleep():
+    assert sleep_resume_detected(15.0, 15.0) is False
+    assert sleep_resume_detected(24.9, 15.0) is False
+    assert sleep_resume_detected(25.1, 15.0) is True
 
 
 class FakeLiveAdapter:

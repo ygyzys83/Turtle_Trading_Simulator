@@ -142,10 +142,10 @@ pytest -q
 Start the app with:
 
 ```powershell
-streamlit run turtle_trading.py
+python run_app.py
 ```
 
-The app will open in your browser. Use the sidebar controls to switch between synthetic data and stock data, adjust the strategy windows, risk settings, and ATR stop multiplier.
+The supervised launcher opens the app at `http://127.0.0.1:8501`, prevents a second UI from starting on another port, and cleans up the complete Streamlit process tree when you press `Ctrl+C` in the terminal. The app will open in your browser. Use the sidebar controls to switch between synthetic data and stock data, adjust the strategy windows, risk settings, and ATR stop multiplier.
 
 Paper automation:
 

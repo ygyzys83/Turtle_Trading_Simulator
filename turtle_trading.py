@@ -13,7 +13,7 @@ import re
 from agentloop_trader.audit import build_audit_events, events_to_records
 from agentloop_trader.audit_store import JsonlAuditStore
 from agentloop_trader.agents import build_trade_proposal, proposal_records
-from agentloop_trader.assets import format_quantity, normalize_symbol
+from agentloop_trader.assets import format_quantity, normalize_asset_class, normalize_symbol
 from agentloop_trader.automation import (
     AutomationDryRunStore,
     AutomationRuntimeState,
@@ -36,6 +36,7 @@ from agentloop_trader.automation_runtime import (
     DEFAULT_LOCK_PATH,
     WorkerStatusStore,
     automation_mode_for_new_ui_session,
+    reconcile_worker_process_state,
     request_worker_stop,
     start_worker_process,
     worker_code_fingerprint,
@@ -107,6 +108,7 @@ from agentloop_trader.fees import (
     ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
     estimate_alpaca_order_fees,
     estimate_alpaca_round_trip_fees,
+    fee_adjusted_break_even_price,
 )
 from agentloop_trader.indicators import calc_rsi
 from agentloop_trader.execution import PaperBroker
@@ -289,6 +291,7 @@ def run_strategy_suite(
     rsi_emergency_atr_multiplier,
     rsi_max_holding_enabled,
     rsi_max_holding_bars,
+    rsi_profit_only_exit,
 ):
     """Cache deterministic backtests while the completed price bars are unchanged."""
     _ = data_identity
@@ -357,6 +360,7 @@ def run_strategy_suite(
         rsi_emergency_atr_multiplier=rsi_emergency_atr_multiplier,
         rsi_max_holding_enabled=rsi_max_holding_enabled,
         rsi_max_holding_bars=rsi_max_holding_bars,
+        rsi_profit_only_exit=rsi_profit_only_exit,
         seed=seed,
         market_data=market_data,
         risk_limits=risk_limits,
@@ -382,6 +386,7 @@ def run_rsi_stop_mode_comparison(
     rsi_swing_lookback,
     rsi_max_holding_enabled,
     rsi_max_holding_bars,
+    rsi_profit_only_exit,
 ):
     """Compare stop modes on already-loaded bars; never fetch price data here."""
     _ = data_identity
@@ -407,6 +412,7 @@ def run_rsi_stop_mode_comparison(
             rsi_emergency_atr_multiplier=emergency_atr_mult,
             rsi_max_holding_enabled=rsi_max_holding_enabled,
             rsi_max_holding_bars=rsi_max_holding_bars,
+            rsi_profit_only_exit=rsi_profit_only_exit,
             market_data=market_data,
             risk_limits=risk_limits,
         )
@@ -880,6 +886,10 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
             {"Field": "RSI at entry", "Value": str(settings.get("entry_rsi", "Not recorded"))},
             {"Field": "RSI setup low at entry", "Value": str(settings.get("entry_rsi_setup_low", "Not recorded"))},
             {"Field": "RSI exit level saved at entry", "Value": str(settings.get("entry_rsi_sell_level", "Not recorded"))},
+            {
+                "Field": "Require profit for RSI exit",
+                "Value": "On" if settings.get("rsi_profit_only_exit", False) else "Off",
+            },
             {"Field": "Stop protection", "Value": str(settings.get("rsi_stop_mode", "standard_atr")).replace("_", " ").title()},
             {
                 "Field": "Emergency stop distance",
@@ -1027,6 +1037,18 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
             {"Area": "RSI exit", "Item": "Current RSI", "Status / Value": str(exit_details.get("current_rsi", "Not available")), "Plain English": "Current RSI calculated from the saved price interval and RSI length."},
             {"Area": "RSI exit", "Item": "RSI setup low at entry", "Status / Value": str(settings.get("entry_rsi_setup_low", "Not recorded")), "Plain English": "Lowest RSI reached while the saved buy setup was armed."},
             {"Area": "RSI exit", "Item": "RSI sell level", "Status / Value": str(exit_details.get("rsi_sell_level", "Not available")), "Plain English": "Sell when current RSI reaches this level or higher."},
+            {
+                "Area": "RSI exit",
+                "Item": "Require profit for RSI exit",
+                "Status / Value": "On" if settings.get("rsi_profit_only_exit", False) else "Off",
+                "Plain English": "When on, an RSI signal may sell only above the estimated fee-adjusted break-even price. ATR and time exits remain independent.",
+            },
+            {
+                "Area": "RSI exit",
+                "Item": "Estimated fee-adjusted break-even",
+                "Status / Value": money_or_missing(exit_details.get("rsi_fee_adjusted_break_even")),
+                "Plain English": "Estimated price where gross profit covers the entry and exit fees. A market fill can differ.",
+            },
             {
                 "Area": "RSI exit",
                 "Item": "Bars held",
@@ -1326,6 +1348,15 @@ def exit_model_records() -> list[dict]:
                 "Exit Rule": "RSI recovery",
                 "Current Setting": f"Setup low + {rsi_sell_recovery_points:g}, capped at RSI {rsi_overbought:g}",
                 "Plain English": "The sell level is saved from the RSI setup low that existed when the position was bought.",
+            },
+            {
+                "Exit Rule": "RSI profit requirement",
+                "Current Setting": "On" if rsi_profit_only_exit else "Off",
+                "Plain English": (
+                    "The RSI recovery exit must also be above estimated fee-adjusted break-even. ATR and time exits still work independently."
+                    if rsi_profit_only_exit
+                    else "The RSI recovery exit may sell below the entry price."
+                ),
             },
             {
                 "Exit Rule": "Maximum holding period",
@@ -1788,7 +1819,7 @@ alpaca_config = AlpacaConfig.from_env()
 sidebar_control_store = AutomationControlStore()
 saved_sidebar_control = sidebar_control_store.read()
 sidebar_worker_status_store = WorkerStatusStore()
-sidebar_worker_status = sidebar_worker_status_store.read()
+sidebar_worker_status = reconcile_worker_process_state(sidebar_worker_status_store)
 sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
 sidebar_worker_code_current = worker_status_uses_current_code(sidebar_worker_status)
 sidebar_worker_present = bool(
@@ -2096,6 +2127,8 @@ source_caption = "synthetic price data"
 ticker = "SYNTH"
 interval = "1d"
 period = "synthetic"
+load_progress_slot = None
+load_progress_status = None
 
 if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
     ticker = normalize_symbol(
@@ -2138,23 +2171,43 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
     if not ticker:
         st.sidebar.caption("Enter a ticker or crypto pair to load price data.")
     else:
+        load_progress_slot = st.empty()
+        with load_progress_slot.container():
+            load_progress_status = st.status(
+                f"Loading {ticker}: downloading completed {interval} bars...",
+                state="running",
+                expanded=True,
+            )
+            load_progress_status.write(
+                f"**Step 1 of 3 - Download price history.** Requesting {period} of {interval} bars from "
+                f"{'Alpaca crypto' if data_source == 'Crypto (Alpaca)' else data_source}."
+            )
+            load_progress_status.write(
+                "This is still working while the spinner is moving. Small intervals can require many API pages and may take several minutes. "
+                "Wait for the finished results before changing sidebar inputs."
+            )
         try:
-            with st.spinner(f"Fetching {ticker}..."):
-                if data_source == "Crypto (Alpaca)":
-                    market_data_config = AlpacaConfig.from_env()
-                    market_data = fetch_alpaca_crypto_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
-                    source_caption = f"{ticker} via Alpaca crypto ({period}, {interval}); latest completed bar {market_data.index[-1]}"
-                    st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca crypto bars.")
-                elif data_source == "Ticker (Alpaca)":
-                    market_data_config = AlpacaConfig.from_env()
-                    market_data = fetch_alpaca_stock_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
-                    source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest completed bar {market_data.index[-1]}"
-                    st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca bars. Free IEX data can be delayed.")
-                else:
-                    market_data = fetch_stock_data(ticker, period, interval)
-                    source_caption = f"{ticker} via yfinance ({period}, {interval}); latest completed bar {market_data.index[-1]}"
-                    st.sidebar.caption(f"Loaded {len(market_data):,} completed yfinance bars. Yahoo intraday data may be delayed or limited.")
+            if data_source == "Crypto (Alpaca)":
+                market_data_config = AlpacaConfig.from_env()
+                market_data = fetch_alpaca_crypto_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
+                source_caption = f"{ticker} via Alpaca crypto ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca crypto bars.")
+            elif data_source == "Ticker (Alpaca)":
+                market_data_config = AlpacaConfig.from_env()
+                market_data = fetch_alpaca_stock_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
+                source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca bars. Free IEX data can be delayed.")
+            else:
+                market_data = fetch_stock_data(ticker, period, interval)
+                source_caption = f"{ticker} via yfinance ({period}, {interval}); latest completed bar {market_data.index[-1]}"
+                st.sidebar.caption(f"Loaded {len(market_data):,} completed yfinance bars. Yahoo intraday data may be delayed or limited.")
+            load_progress_status.write(f"Downloaded **{len(market_data):,} completed bars** for {ticker}.")
         except Exception as exc:
+            load_progress_status.update(
+                label=f"Could not load {ticker} price history.",
+                state="error",
+                expanded=True,
+            )
             st.error(f"Could not load {data_source} price data: {exc}")
             st.stop()
 st.session_state["last_loaded_symbol"] = ticker
@@ -2191,6 +2244,7 @@ if optimizer_apply_settings:
     )
     st.session_state["rsi_max_holding_enabled_input"] = bool(optimizer_apply_settings.get("rsi_max_holding_enabled", True))
     st.session_state["rsi_max_holding_bars_input"] = int(optimizer_apply_settings.get("rsi_max_holding_bars", 100))
+    st.session_state["rsi_profit_only_exit_input"] = bool(optimizer_apply_settings.get("rsi_profit_only_exit", False))
 
 st.sidebar.markdown("### :material/tune: Strategy settings")
 account = st.sidebar.number_input(
@@ -2434,6 +2488,21 @@ rsi_overbought = st.sidebar.slider(
     "RSI sell cap", 55.0, 90.0, 70.0, step=1.0, key="rsi_overbought_input",
     disabled=strategy_type != "rsi_scalp",
     help="Used by RSI mean-reversion scalp. This caps the RSI recovery target so the app never waits above this RSI level to sell.",
+)
+rsi_profit_only_exit = st.sidebar.checkbox(
+    "Require profit for RSI exit",
+    value=False,
+    key="rsi_profit_only_exit_input",
+    disabled=strategy_type != "rsi_scalp",
+    help=(
+        "Optional rule for RSI mean-reversion scalp. When on, reaching the RSI sell level is not enough by itself: "
+        "the current price must also be above the estimated fee-adjusted break-even price. Example: if the average "
+        "entry is $100.00 and estimated round-trip fees require about $100.08 to break even, an RSI sell signal at "
+        "$99.50 waits; the app checks again after each completed Interval bar. This rule blocks only the RSI recovery "
+        "exit. The initial or emergency ATR stop, break-even stop, trailing ATR stop, and optional maximum holding-period "
+        "exit can still sell independently. A market order can fill differently, so this reduces intended losing RSI "
+        "exits but cannot guarantee a profitable fill."
+    ),
 )
 rsi_swing_lookback = st.sidebar.slider(
     "RSI decline lookback (bars)", 6, 60, 24, step=3, key="rsi_swing_lookback_input",
@@ -2754,6 +2823,16 @@ if market_data is not None:
         if key not in {"latest_price", "latest_high", "latest_low", "latest_bar_time"}
     }
 
+if load_progress_status is not None:
+    load_progress_status.update(
+        label=f"Loading {ticker}: running strategy calculations...",
+        state="running",
+        expanded=True,
+    )
+    load_progress_status.write(
+        f"**Step 2 of 3 - Run backtests.** Testing all five strategies across {len(strategy_market_data):,} completed bars."
+    )
+
 try:
     breakout_result, pullback_result, trendline_result, retest_result, rsi_scalp_result = run_strategy_suite(
         account,
@@ -2780,6 +2859,7 @@ try:
         rsi_emergency_atr_multiplier,
         rsi_max_holding_enabled,
         rsi_max_holding_bars,
+        rsi_profit_only_exit,
     )
     breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = breakout_result
     pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = pullback_result
@@ -2787,8 +2867,24 @@ try:
     retest_prices, retest_smas, retest_atrs, retest_trade_log, retest_live, retest_stats, retest_labels = retest_result
     rsi_scalp_prices, rsi_scalp_smas, rsi_scalp_atrs, rsi_scalp_trade_log, rsi_scalp_live, rsi_scalp_stats, rsi_scalp_labels = rsi_scalp_result
 except ValueError as exc:
+    if load_progress_status is not None:
+        load_progress_status.update(
+            label=f"Could not calculate {ticker} strategy results.",
+            state="error",
+            expanded=True,
+        )
     st.error(str(exc))
     st.stop()
+
+if load_progress_status is not None:
+    load_progress_status.update(
+        label=f"Loading {ticker}: preparing the trading screen...",
+        state="running",
+        expanded=True,
+    )
+    load_progress_status.write(
+        "**Step 3 of 3 - Prepare results.** Building the current trade decision, risk checks, research read, tables, and charts."
+    )
 
 strategy_results = {
     "Breakout continuation": {
@@ -2917,6 +3013,7 @@ if run_walk_forward:
             rsi_emergency_atr_multiplier=rsi_emergency_atr_multiplier,
             rsi_max_holding_enabled=rsi_max_holding_enabled,
             rsi_max_holding_bars=rsi_max_holding_bars,
+            rsi_profit_only_exit=rsi_profit_only_exit,
         )
     except ValueError as exc:
         walk_forward_error = str(exc)
@@ -2957,6 +3054,7 @@ current_strategy_settings = {
     "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
     "rsi_max_holding_enabled": rsi_max_holding_enabled,
     "rsi_max_holding_bars": rsi_max_holding_bars,
+    "rsi_profit_only_exit": rsi_profit_only_exit,
     "paper_buy_order_type": paper_buy_order_style,
     "paper_buy_limit_adjustment_pct": paper_buy_limit_adjustment_pct,
     "paper_buy_custom_limit_price": paper_buy_custom_limit_price,
@@ -3109,6 +3207,7 @@ def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> d
                 rsi_emergency_atr_multiplier=float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
                 rsi_max_holding_enabled=bool(settings.get("rsi_max_holding_enabled", True)),
                 rsi_max_holding_bars=int(settings.get("rsi_max_holding_bars", 100)),
+                rsi_profit_only_exit=bool(settings.get("rsi_profit_only_exit", False)),
                 seed=None,
                 market_data=data,
             )
@@ -3268,7 +3367,33 @@ def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> d
             if saved_strategy_type == "rsi_scalp" and saved_setup_low is not None
             else None
         )
-        rsi_exit_ready = bool(rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level)
+        rsi_exit_signal_ready = bool(
+            rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level
+        )
+        rsi_profit_only_exit = bool(settings.get("rsi_profit_only_exit", False))
+        rsi_completed_bar_price = optional_float(saved_live.get("last_p")) or current_price
+        position_quantity = optional_float(matching_position.get("Quantity")) or 0.0
+        rsi_fee_adjusted_break_even = (
+            fee_adjusted_break_even_price(
+                asset_class=normalize_asset_class(
+                    str(matching_position.get("Asset Type") or settings.get("asset_class") or ""),
+                    symbol,
+                ),
+                quantity=position_quantity,
+                entry_price=entry_reference_price,
+            )
+            if saved_strategy_type == "rsi_scalp" and entry_reference_price is not None and position_quantity > 0
+            else entry_reference_price
+        )
+        rsi_profit_condition_ready = bool(
+            not rsi_profit_only_exit
+            or (
+                rsi_completed_bar_price is not None
+                and rsi_fee_adjusted_break_even is not None
+                and rsi_completed_bar_price > rsi_fee_adjusted_break_even
+            )
+        )
+        rsi_exit_ready = rsi_exit_signal_ready and rsi_profit_condition_ready
         max_holding_enabled = bool(settings.get("rsi_max_holding_enabled", True))
         max_holding_bars = int(settings.get("rsi_max_holding_bars", 100))
         time_exit_ready = bool(
@@ -3289,6 +3414,18 @@ def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> d
             else
             f"Exit now because {symbol} is at or below the {trigger_source} at ${trigger_price:,.2f}."
             if price_exit_ready and trigger_price
+            else (
+                f"Hold. RSI reached {rsi_sell_level:.1f}, but the completed-bar close of ${rsi_completed_bar_price:,.2f} is not above the estimated "
+                f"fee-adjusted break-even price of ${rsi_fee_adjusted_break_even:,.2f}. The app will check again "
+                f"after each completed {saved_interval} bar."
+            )
+            if (
+                rsi_exit_signal_ready
+                and not rsi_profit_condition_ready
+                and rsi_completed_bar_price is not None
+                and rsi_sell_level is not None
+                and rsi_fee_adjusted_break_even is not None
+            )
             else f"Hold. Auto exit will trigger if {symbol} falls to ${trigger_price:,.2f} or lower. This uses the highest active protection level."
             if trigger_price
             else str(saved_live.get("exit_reason", "The saved RSI or time exit is not triggered."))
@@ -3314,6 +3451,11 @@ def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> d
             "current_atr": current_atr,
             "current_rsi": current_rsi,
             "rsi_sell_level": rsi_sell_level,
+            "rsi_exit_signal_ready": rsi_exit_signal_ready,
+            "rsi_profit_only_exit": rsi_profit_only_exit if saved_strategy_type == "rsi_scalp" else None,
+            "rsi_fee_adjusted_break_even": rsi_fee_adjusted_break_even if saved_strategy_type == "rsi_scalp" else None,
+            "rsi_completed_bar_price": rsi_completed_bar_price if saved_strategy_type == "rsi_scalp" else None,
+            "rsi_profit_condition_ready": rsi_profit_condition_ready if saved_strategy_type == "rsi_scalp" else None,
             "rsi_exit_ready": rsi_exit_ready,
             "bars_since_entry": bars_since_entry,
             "max_holding_enabled": max_holding_enabled if saved_strategy_type == "rsi_scalp" else None,
@@ -3400,6 +3542,7 @@ optimizer_setting_keys = (
     "rsi_emergency_atr_multiplier",
     "rsi_max_holding_enabled",
     "rsi_max_holding_bars",
+    "rsi_profit_only_exit",
 )
 optimizer_market_fingerprint = "synthetic-default"
 if market_data is not None:
@@ -3681,6 +3824,14 @@ if optimizer_search_completed and strategy_optimizer_result is not None:
     st.session_state["session_audit_events"].append(parameter_event)
     if persist_audit_log:
         audit_store.append(parameter_event)
+
+if load_progress_status is not None:
+    load_progress_status.update(
+        label=f"{ticker} is ready - {len(strategy_market_data):,} bars loaded and calculated.",
+        state="complete",
+        expanded=False,
+    )
+    load_progress_slot.empty()
 
 with st.container(key="top_navigation"):
     st.title("AgentLoop Trader")
@@ -4651,10 +4802,20 @@ def render_open_positions_panel() -> None:
         edited_rsi_length = int(selected_exit_settings.get("rsi_length", 14))
         edited_rsi_recovery = float(selected_exit_settings.get("rsi_sell_recovery_points", 35.0))
         edited_rsi_sell_cap = float(selected_exit_settings.get("rsi_overbought", 70.0))
+        edited_rsi_profit_only_exit = bool(selected_exit_settings.get("rsi_profit_only_exit", False))
         edited_rsi_max_hold_enabled = bool(selected_exit_settings.get("rsi_max_holding_enabled", True))
         edited_rsi_max_hold = int(selected_exit_settings.get("rsi_max_holding_bars", 100))
         if strategy_exit_enabled and edited_exit_strategy_type == "rsi_scalp":
             st.markdown("#### RSI mean-reversion exit")
+            edited_rsi_profit_only_exit = st.checkbox(
+                "Require profit for RSI exit",
+                value=edited_rsi_profit_only_exit,
+                key=f"exit_rsi_profit_only_{selected_position_symbol}",
+                help=(
+                    "When on, an RSI recovery signal waits until price is above estimated fee-adjusted break-even. "
+                    "The ATR stop, break-even stop, trailing ATR stop, and optional maximum holding-period exit can still sell independently."
+                ),
+            )
             edited_rsi_max_hold_enabled = st.checkbox(
                 "Use maximum holding period",
                 value=edited_rsi_max_hold_enabled,
@@ -4700,6 +4861,7 @@ def render_open_positions_panel() -> None:
             "rsi_length": edited_rsi_length,
             "rsi_sell_recovery_points": edited_rsi_recovery,
             "rsi_overbought": edited_rsi_sell_cap,
+            "rsi_profit_only_exit": edited_rsi_profit_only_exit,
             "rsi_max_holding_enabled": edited_rsi_max_hold_enabled,
             "rsi_max_holding_bars": edited_rsi_max_hold,
             "auto_exit_enabled": exit_auto_enabled,
@@ -5495,7 +5657,7 @@ if command_center_view == "New Trade":
                 ticker, data_source, interval, period, atr_mult, rsi_emergency_atr_multiplier,
                 risk_pct, rsi_length, rsi_oversold, rsi_overbought, rsi_decline_points,
                 rsi_rebound_points, rsi_sell_recovery_points, rsi_swing_lookback,
-                rsi_max_holding_enabled, rsi_max_holding_bars,
+                rsi_max_holding_enabled, rsi_max_holding_bars, rsi_profit_only_exit,
             )
             if st.button("Compare Stop Protection Modes", key="compare_rsi_stop_modes"):
                 with st.spinner("Comparing the three stop modes on the loaded bars..."):
@@ -5518,6 +5680,7 @@ if command_center_view == "New Trade":
                             rsi_swing_lookback,
                             rsi_max_holding_enabled,
                             rsi_max_holding_bars,
+                            rsi_profit_only_exit,
                         ),
                     }
             saved_stop_comparison = st.session_state.get("rsi_stop_mode_comparison")

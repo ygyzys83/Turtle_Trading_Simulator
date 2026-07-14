@@ -14,6 +14,16 @@ Primary Streamlit entry point:
 
 `turtle_trading.py`
 
+Preferred terminal launcher:
+
+`python run_app.py`
+
+The launcher keeps Streamlit in a supervised Windows process group, uses the fixed local port `8501`, refuses to start a duplicate UI, and cleans up the complete Streamlit process tree when `Ctrl+C` is pressed. This avoids PyCharm terminal sessions leaving the Streamlit launcher or Python child process behind, including after Windows sleep.
+
+Broker-state reads and writes now share the same cross-process file lock. Atomic JSON replacement also retries brief Windows access-denied conflicts, such as a reader, antivirus scanner, or indexing process holding the destination file for a moment. Failed replacements leave the prior broker-state JSON intact and clean up the writer's temporary file.
+
+Long ticker loads now show one animated three-stage progress panel: downloading completed price bars, running all five backtests, and preparing the trade decision, risk checks, research, tables, and charts. The panel reports the requested ticker, interval, history, and loaded bar count, warns that small intervals can take several minutes, and explicitly asks the operator to wait before changing inputs. It disappears when the completed trading screen is ready and changes to an error state if price loading or strategy calculation fails.
+
 Python package:
 
 `agentloop_trader\`
@@ -675,6 +685,27 @@ The detached worker process that started at 10:21 AM PT was not restarted after 
 Detached workers now record a fingerprint of the automation source files and their start time. A worker stops itself with `Restart required` if those files change, and the Streamlit UI fails closed when it detects a running worker without the current fingerprint. The old PID 20756 was confirmed stopped and automation control disabled before testing concluded.
 
 `Positions & Queue` now includes `Recent automatic exits`, showing time, ticker, shares, decision price, sell trigger, trigger rule, Alpaca fill, exact reason, and Alpaca order ID from the durable audit and broker records. The WYFI row therefore remains visible even after the position has closed. The full checkpoint passed 324 tests. No broker order was submitted during this repair.
+
+Worker startup status now also reconciles the recorded PID and lock with the operating system. If a worker process has already exited but left `running: true` or a lock file behind, the app clears both automatically and restores the correct Start/Stop button states. Windows process checks use the native process handle and exit code instead of relying on `os.kill(pid, 0)`. The observed dead PID 17868 was reconciled to Stopped, its stale lock was removed, and the full checkpoint passed 326 tests.
+
+An intermittent broker-state write traceback was also corrected. `broker_governance.py` imported both the standard `time` module and `datetime.time` under the same name, so a normal file-lock collision attempted `datetime.time.time()` and crashed. The two imports now use explicit aliases. A regression deliberately holds the broker-state lock while another write waits, then verifies the write completes and preserves the state file. No stale broker-state lock remained, and the full checkpoint passed 327 tests.
+
+## Optional Profit-Only RSI Exit (July 14, 2026)
+
+`RSI mean-reversion scalp` now has an optional `Require profit for RSI exit` setting, default Off. When On, reaching the saved RSI recovery level is only the RSI signal; the completed-bar close must also be above an estimated fee-adjusted break-even price before that RSI exit may sell. The estimate includes both entry and exit fees, the position quantity, and equity-versus-crypto fee rules. A market fill can still differ, so the UI does not promise a guaranteed profit.
+
+This setting gates only the RSI recovery exit. The initial or emergency ATR stop, +1R break-even protection, trailing ATR stop, and optional maximum holding-period exit remain independent and can still close the position. The setting is saved with queued setups and entries, restored by research recommendations, editable for each RSI-managed open position, displayed in saved setup/entry/position details, and used consistently by backtests, the Streamlit view, and the detached worker.
+
+## UI And Worker Process Boundaries (July 14, 2026)
+
+The intended process behavior is explicit:
+
+- `python run_app.py` runs Streamlit inside the launcher process. There is no separate UI child process that can be orphaned.
+- One `Ctrl-C`, PyCharm's red Stop button, or closing PyCharm terminates the UI and Streamlit server immediately.
+- The background automation worker is the only detached process. It is not terminated when the UI or PyCharm closes.
+- `Stop Worker` requests a clean worker shutdown and force-stops only the PID verified by the worker lock when necessary.
+- If the computer sleeps or suspends execution, the worker detects the unexpectedly long timer gap after wake, disables automation, and exits with `Stopped after sleep`. It must be deliberately restarted.
+- A normal computer shutdown ends both processes because the operating system terminates them.
 
 ## Instructions For The Next Codex Conversation
 

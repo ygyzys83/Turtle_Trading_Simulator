@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import json
 import os
-import time
+import time as time_module
+from contextlib import contextmanager
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, datetime, time as datetime_time
 from pathlib import Path
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -519,7 +520,7 @@ def market_session_advisory(now: datetime | None = None) -> dict:
     eastern = ZoneInfo("America/New_York")
     current = (now or datetime.now(UTC)).astimezone(eastern)
     is_weekday = current.weekday() < 5
-    regular_open = time(9, 30) <= current.time() <= time(16, 0)
+    regular_open = datetime_time(9, 30) <= current.time() <= datetime_time(16, 0)
     open_now = is_weekday and regular_open
     message = "Regular US equity session is open." if open_now else "Regular US equity session appears closed; paper market orders may queue."
     return {
@@ -535,6 +536,10 @@ class BrokerStateStore:
         self.path = Path(path) if path is not None else DEFAULT_BROKER_STATE_PATH
 
     def read(self) -> list[dict]:
+        with self._exclusive_lock():
+            return self._read_unlocked()
+
+    def _read_unlocked(self) -> list[dict]:
         if not self.path.exists():
             return []
         try:
@@ -544,15 +549,49 @@ class BrokerStateStore:
         return data if isinstance(data, list) else []
 
     def upsert(self, record: dict) -> None:
-        records = self.read()
-        key = record.get("broker_order_id")
-        records = [item for item in records if item.get("broker_order_id") != key]
-        record = dict(record)
-        record.setdefault("created_at", datetime.now(PACIFIC_TIME).isoformat())
-        records.append(record)
-        self.replace_all(records)
+        with self._exclusive_lock():
+            records = self._read_unlocked()
+            key = record.get("broker_order_id")
+            records = [item for item in records if item.get("broker_order_id") != key]
+            record = dict(record)
+            record.setdefault("created_at", datetime.now(PACIFIC_TIME).isoformat())
+            records.append(record)
+            self._replace_all_unlocked(records)
 
     def replace_all(self, records: list[dict]) -> None:
+        with self._exclusive_lock():
+            self._replace_all_unlocked(records)
+
+    def _replace_all_unlocked(self, records: list[dict]) -> None:
+        current = self._read_unlocked()
+        merged: dict[str, dict] = {}
+        unkeyed: list[dict] = []
+        for row in current + list(records):
+            record = dict(row)
+            key = str(record.get("broker_order_id") or record.get("Alpaca Order ID") or "").strip()
+            if not key:
+                unkeyed.append(record)
+                continue
+            prior = merged.get(key, {})
+            merged_record = {**prior, **record}
+            for settings_key in ("strategy_settings", "exit_settings"):
+                if not record.get(settings_key) and prior.get(settings_key):
+                    merged_record[settings_key] = prior[settings_key]
+            merged[key] = merged_record
+        payload = list(merged.values()) + unkeyed
+        temporary = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
+        temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
+        try:
+            self._replace_with_retry(temporary)
+        finally:
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    @contextmanager
+    def _exclusive_lock(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         lock_path = self.path.with_suffix(self.path.suffix + ".lock")
         lock_fd = None
@@ -562,37 +601,29 @@ class BrokerStateStore:
                 break
             except FileExistsError:
                 try:
-                    if time.time() - lock_path.stat().st_mtime > 30:
+                    if time_module.time() - lock_path.stat().st_mtime > 30:
                         lock_path.unlink()
                         continue
                 except OSError:
                     pass
-                time.sleep(0.02)
+                time_module.sleep(0.02)
         if lock_fd is None:
             raise RuntimeError("Alpaca tracking file is busy; try again.")
         try:
             os.close(lock_fd)
-            current = self.read()
-            merged: dict[str, dict] = {}
-            unkeyed: list[dict] = []
-            for row in current + list(records):
-                record = dict(row)
-                key = str(record.get("broker_order_id") or record.get("Alpaca Order ID") or "").strip()
-                if not key:
-                    unkeyed.append(record)
-                    continue
-                prior = merged.get(key, {})
-                merged_record = {**prior, **record}
-                for settings_key in ("strategy_settings", "exit_settings"):
-                    if not record.get(settings_key) and prior.get(settings_key):
-                        merged_record[settings_key] = prior[settings_key]
-                merged[key] = merged_record
-            payload = list(merged.values()) + unkeyed
-            temporary = self.path.with_suffix(self.path.suffix + f".{os.getpid()}.tmp")
-            temporary.write_text(json.dumps(payload, indent=2, sort_keys=True), encoding="utf-8")
-            temporary.replace(self.path)
+            yield
         finally:
             try:
                 lock_path.unlink()
             except OSError:
                 pass
+
+    def _replace_with_retry(self, temporary: Path, attempts: int = 50, delay_seconds: float = 0.02) -> None:
+        for attempt in range(attempts):
+            try:
+                temporary.replace(self.path)
+                return
+            except PermissionError:
+                if attempt == attempts - 1:
+                    raise
+                time_module.sleep(delay_seconds)

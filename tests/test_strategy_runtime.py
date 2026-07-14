@@ -266,3 +266,70 @@ def test_partial_entry_bar_high_does_not_false_trigger_break_even(monkeypatch):
     assert details["trigger_price"] == pytest.approx(28.56)
     assert details["trigger_source"] == "fill-adjusted initial stop"
     assert details["state_changed"] is True
+
+
+def test_rsi_profit_only_exit_waits_above_fee_adjusted_break_even(monkeypatch):
+    index = pd.date_range("2026-07-14 15:00", periods=3, freq="5min", tz="UTC")
+    data = pd.DataFrame(
+        {"Close": [100.0, 99.5, 99.0], "High": [100.2, 99.7, 99.2], "Low": [99.8, 99.3, 98.8]},
+        index=index,
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.strategy_runtime.selected_strategy_result",
+        lambda market_data, settings, account: {
+            "live": {"last_p": 99.0, "last_atr": 1.0, "rsi": 70.0, "exit_level": None}
+        },
+    )
+    settings = {
+        "strategy_type": "rsi_scalp",
+        "rsi_stop_mode": "no_price_stop",
+        "entry_rsi_setup_low": 30.0,
+        "rsi_sell_recovery_points": 35.0,
+        "rsi_overbought": 70.0,
+        "rsi_profit_only_exit": True,
+        "rsi_max_holding_enabled": False,
+        "auto_exit_enabled": True,
+        "asset_class": "equity",
+    }
+    position = {"Symbol": "AAPL", "Asset Type": "equity", "Quantity": "10", "Average Entry": "100"}
+
+    details = evaluate_exit_settings(settings, position, lambda *_: data)
+
+    assert details["rsi_exit_signal_ready"] is True
+    assert details["rsi_profit_condition_ready"] is False
+    assert details["rsi_exit_ready"] is False
+    assert details["ready"] is False
+    assert details["rsi_fee_adjusted_break_even"] > 100
+    assert "not above the estimated fee-adjusted break-even" in details["reason"]
+
+
+def test_atr_stop_remains_independent_of_rsi_profit_requirement(monkeypatch):
+    index = pd.date_range("2026-07-14 15:00", periods=3, freq="5min", tz="UTC")
+    data = pd.DataFrame(
+        {"Close": [100.0, 96.0, 94.0], "High": [100.2, 96.2, 94.2], "Low": [99.8, 95.8, 93.8]},
+        index=index,
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.strategy_runtime.selected_strategy_result",
+        lambda market_data, settings, account: {
+            "live": {"last_p": 94.0, "last_atr": 1.0, "rsi": 40.0, "exit_level": None}
+        },
+    )
+    settings = {
+        "strategy_type": "rsi_scalp",
+        "rsi_stop_mode": "standard_atr",
+        "entry_stop_distance": 5.0,
+        "entry_rsi_setup_low": 30.0,
+        "rsi_profit_only_exit": True,
+        "rsi_max_holding_enabled": False,
+        "auto_exit_enabled": True,
+    }
+
+    details = evaluate_exit_settings(
+        settings,
+        {"Symbol": "AAPL", "Quantity": "10", "Average Entry": "100"},
+        lambda *_: data,
+    )
+
+    assert details["ready"] is True
+    assert details["trigger_source"] == "fill-adjusted initial stop"

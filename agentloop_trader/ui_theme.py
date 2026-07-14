@@ -405,6 +405,12 @@ TRADING_CONSOLE_CSS = """
         overflow: hidden;
     }
 
+    /* Keep wheel movement inside bounded tables at their scroll limits. */
+    [data-testid="stDataFrame"],
+    [data-testid="stDataFrame"] * {
+        overscroll-behavior-y: contain !important;
+    }
+
     [data-testid="stDataFrame"] canvas,
     [data-testid="stTable"] {
         font-size: 0.76rem !important;

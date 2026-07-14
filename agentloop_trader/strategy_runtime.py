@@ -6,6 +6,7 @@ from typing import Any, Callable
 
 import pandas as pd
 
+from agentloop_trader.assets import normalize_asset_class
 from agentloop_trader.backtest import (
     simulate_rsi_mean_reversion_strategy,
     simulate_trendline_breakout_strategy,
@@ -13,6 +14,7 @@ from agentloop_trader.backtest import (
     simulate_trend_pullback_strategy,
     simulate_turtle_strategy,
 )
+from agentloop_trader.fees import fee_adjusted_break_even_price
 from agentloop_trader.models import RiskLimits, TradeIntent
 from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
@@ -83,6 +85,7 @@ def _run_one(
             rsi_emergency_atr_multiplier=float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
             rsi_max_holding_enabled=bool(settings.get("rsi_max_holding_enabled", True)),
             rsi_max_holding_bars=int(settings.get("rsi_max_holding_bars", 100)),
+            rsi_profit_only_exit=bool(settings.get("rsi_profit_only_exit", False)),
             market_data=market_data,
             risk_limits=risk_limits,
         )
@@ -348,7 +351,34 @@ def evaluate_exit_settings(
             if rsi_strategy and saved_setup_low is not None
             else None
         )
-        rsi_exit_ready = bool(rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level)
+        rsi_exit_signal_ready = bool(
+            rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level
+        )
+        rsi_profit_only_exit = bool(settings.get("rsi_profit_only_exit", False))
+        rsi_completed_bar_price = _number(live.get("last_p"), current_price)
+        quantity = _number(position.get("Quantity"), 0.0) or 0.0
+        asset_class = normalize_asset_class(
+            str(position.get("Asset Type") or settings.get("asset_class") or ""),
+            symbol,
+        )
+        rsi_fee_adjusted_break_even = (
+            fee_adjusted_break_even_price(
+                asset_class=asset_class,
+                quantity=quantity,
+                entry_price=entry,
+            )
+            if rsi_strategy and entry is not None and quantity > 0
+            else entry
+        )
+        rsi_profit_condition_ready = bool(
+            not rsi_profit_only_exit
+            or (
+                rsi_completed_bar_price is not None
+                and rsi_fee_adjusted_break_even is not None
+                and rsi_completed_bar_price > rsi_fee_adjusted_break_even
+            )
+        )
+        rsi_exit_ready = rsi_exit_signal_ready and rsi_profit_condition_ready
         max_holding_enabled = bool(settings.get("rsi_max_holding_enabled", True))
         max_holding_bars = int(settings.get("rsi_max_holding_bars", 100))
         time_exit_ready = bool(
@@ -369,6 +399,18 @@ def evaluate_exit_settings(
             else
             f"Exit now because {symbol} is at or below the {source_name} at ${trigger:,.2f}."
             if price_exit_ready and trigger is not None
+            else (
+                f"Hold. RSI reached {rsi_sell_level:.1f}, but the completed-bar close of ${rsi_completed_bar_price:,.2f} is not above the "
+                f"estimated fee-adjusted break-even price of ${rsi_fee_adjusted_break_even:,.2f}. "
+                "The app will check again after each completed price bar."
+            )
+            if (
+                rsi_exit_signal_ready
+                and not rsi_profit_condition_ready
+                and rsi_completed_bar_price is not None
+                and rsi_sell_level is not None
+                and rsi_fee_adjusted_break_even is not None
+            )
             else f"Hold. Automatic exit triggers at ${trigger:,.2f} or lower using the highest active protection level."
             if trigger is not None
             else "Hold. The saved RSI recovery and maximum holding-period exits are not triggered."
@@ -392,6 +434,11 @@ def evaluate_exit_settings(
             "current_atr": current_atr,
             "current_rsi": current_rsi,
             "rsi_sell_level": rsi_sell_level,
+            "rsi_exit_signal_ready": rsi_exit_signal_ready,
+            "rsi_profit_only_exit": rsi_profit_only_exit if rsi_strategy else None,
+            "rsi_fee_adjusted_break_even": rsi_fee_adjusted_break_even if rsi_strategy else None,
+            "rsi_completed_bar_price": rsi_completed_bar_price if rsi_strategy else None,
+            "rsi_profit_condition_ready": rsi_profit_condition_ready if rsi_strategy else None,
             "rsi_exit_ready": rsi_exit_ready,
             "bars_since_entry": bars_since_entry,
             "max_holding_enabled": max_holding_enabled if rsi_strategy else None,

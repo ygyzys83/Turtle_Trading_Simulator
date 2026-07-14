@@ -9,6 +9,7 @@ from agentloop_trader.data import generate_synthetic_prices
 from agentloop_trader.fees import (
     estimate_alpaca_order_fees,
     estimate_alpaca_round_trip_fees,
+    fee_adjusted_break_even_price,
 )
 from agentloop_trader.indicators import calc_atr, calc_rsi, calc_sma
 from agentloop_trader.market_data import validate_price_bars
@@ -1761,6 +1762,7 @@ def simulate_rsi_mean_reversion_strategy(
     rsi_emergency_atr_multiplier: float = 5.0,
     rsi_max_holding_enabled: bool = True,
     rsi_max_holding_bars: int = 100,
+    rsi_profit_only_exit: bool = False,
     seed: int | None = None,
     market_data=None,
     risk_limits: RiskLimits | None = None,
@@ -1914,7 +1916,14 @@ def simulate_rsi_mean_reversion_strategy(
                     strategy_exit_price=None,
                 )
             rsi_sell_level = min(rsi_overbought, float(entry_setup_low or rsi_oversold) + rsi_sell_recovery_points)
-            rsi_exit = rsi >= rsi_sell_level
+            rsi_exit_signal = rsi >= rsi_sell_level
+            fee_break_even = fee_adjusted_break_even_price(
+                asset_class=asset_class,
+                quantity=shares,
+                entry_price=entry_price,
+            )
+            rsi_profit_ready = not rsi_profit_only_exit or price > fee_break_even
+            rsi_exit = rsi_exit_signal and rsi_profit_ready
             time_exit = bool(rsi_max_holding_enabled and i - entry_bar >= rsi_max_holding_bars)
             price_exit = bool(stop_price is not None and price <= stop_price)
             if rsi_exit or time_exit or price_exit:
@@ -2003,7 +2012,21 @@ def simulate_rsi_mean_reversion_strategy(
         )
 
     saved_sell_level = min(rsi_overbought, float(entry_setup_low or rsi_oversold) + rsi_sell_recovery_points)
-    simulated_rsi_exit = bool(in_trade and last_rsi is not None and last_rsi >= saved_sell_level)
+    simulated_rsi_exit_signal = bool(in_trade and last_rsi is not None and last_rsi >= saved_sell_level)
+    live_fee_break_even = (
+        fee_adjusted_break_even_price(
+            asset_class=asset_class,
+            quantity=shares,
+            entry_price=entry_price,
+        )
+        if in_trade
+        else None
+    )
+    simulated_rsi_profit_ready = bool(
+        not rsi_profit_only_exit
+        or (live_fee_break_even is not None and last_price > live_fee_break_even)
+    )
+    simulated_rsi_exit = simulated_rsi_exit_signal and simulated_rsi_profit_ready
     simulated_time_exit = bool(
         rsi_max_holding_enabled and in_trade and live_bar - entry_bar >= rsi_max_holding_bars
     )
@@ -2042,6 +2065,9 @@ def simulate_rsi_mean_reversion_strategy(
         "required_rsi_decline_points": rsi_decline_points,
         "rsi_stop_mode": rsi_stop_mode,
         "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
+        "rsi_profit_only_exit": rsi_profit_only_exit,
+        "rsi_fee_adjusted_break_even": live_fee_break_even,
+        "rsi_profit_condition_ready": simulated_rsi_profit_ready,
         "buy_requirements": {
             f"RSI({rsi_length}) reached {rsi_oversold:g} or fell {rsi_decline_points:g} points": setup_armed or setup_ready,
             f"RSI rebounded {rsi_rebound_points:g} points from the setup low": bool(rebound is not None and rebound >= rsi_rebound_points),
@@ -2049,7 +2075,12 @@ def simulate_rsi_mean_reversion_strategy(
             "Position size above zero": pos_size > 0,
         },
         "sell_requirements": {
-            f"RSI reached setup low + {rsi_sell_recovery_points:g} points, capped at {rsi_overbought:g}": simulated_rsi_exit,
+            f"RSI reached setup low + {rsi_sell_recovery_points:g} points, capped at {rsi_overbought:g}": simulated_rsi_exit_signal,
+            (
+                "Completed-bar close is above estimated fee-adjusted break-even"
+                if rsi_profit_only_exit
+                else "Profit-only RSI exit is off"
+            ): simulated_rsi_profit_ready,
             f"Position reached maximum hold of {rsi_max_holding_bars} bars": simulated_time_exit,
             "Price protection reached": False,
         },
@@ -2058,6 +2089,11 @@ def simulate_rsi_mean_reversion_strategy(
         "exit_reason": (
             f"Exit now because RSI reached {saved_sell_level:.1f}."
             if simulated_rsi_exit
+            else (
+                f"Hold. RSI reached {saved_sell_level:.1f}, but ${last_price:,.2f} is not above the estimated "
+                f"fee-adjusted break-even price of ${live_fee_break_even:,.2f}. Check again after the next completed bar."
+            )
+            if simulated_rsi_exit_signal and rsi_profit_only_exit and live_fee_break_even is not None
             else f"Exit now because the {rsi_max_holding_bars}-bar maximum hold was reached."
             if simulated_time_exit
             else f"Hold until RSI reaches the saved recovery level, price protection is hit, or {rsi_max_holding_bars} bars pass."

@@ -221,3 +221,30 @@ def estimate_alpaca_round_trip_fees(
             trailing_30d_volume=trailing_30d_volume,
         ),
     )
+
+
+def fee_adjusted_break_even_price(
+    *,
+    asset_class: str,
+    quantity: float,
+    entry_price: float,
+    liquidity: str = "taker",
+    trailing_30d_volume: float = 0.0,
+) -> float:
+    """Return the estimated exit price where gross profit covers both order fees."""
+    qty = max(0.0, float(quantity))
+    entry = max(0.0, float(entry_price))
+    if qty <= 0 or entry <= 0:
+        return entry
+    candidate = entry
+    for _ in range(6):
+        buy, sell = estimate_alpaca_round_trip_fees(
+            asset_class=asset_class,
+            quantity=qty,
+            entry_price=entry,
+            exit_price=candidate,
+            liquidity=liquidity,
+            trailing_30d_volume=trailing_30d_volume,
+        )
+        candidate = entry + (buy.total + sell.total) / qty
+    return round(candidate, 8 if str(asset_class).lower() == "crypto" else 4)

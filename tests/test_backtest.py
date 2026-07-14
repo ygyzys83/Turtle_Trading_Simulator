@@ -2,6 +2,7 @@ from agentloop_trader.backtest import (
     _BacktestSessionRisk,
     _backtest_session_keys,
     _build_stats,
+    simulate_rsi_mean_reversion_strategy,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
     simulate_trend_pullback_strategy,
@@ -478,6 +479,39 @@ def test_final_backtest_equity_includes_latest_open_position_value():
 
     assert live["in_simulated_trade"] is True
     assert stats["final_equity"] == round(live["balance"], 2)
+
+
+def test_rsi_profit_only_exit_waits_until_price_is_above_break_even(monkeypatch):
+    prices = [100.0] * 14 + [99.0, 100.0, 99.0, 101.0, 101.0]
+    data = pd.DataFrame(
+        {
+            "Open": prices,
+            "Close": prices,
+            "High": [price + 0.1 for price in prices],
+            "Low": [price - 0.1 for price in prices],
+            "Volume": [1_000_000] * len(prices),
+        },
+        index=pd.date_range("2026-01-01", periods=len(prices), freq="5min"),
+    )
+    data.attrs["symbol"] = "RSI"
+    rsi_values = [50.0] * 14 + [30.0, 34.0, 70.0, 71.0, 60.0]
+    monkeypatch.setattr(backtest_module, "calc_rsi", lambda values, length: rsi_values)
+
+    ordinary = simulate_rsi_mean_reversion_strategy(
+        50_000, 1.5, 0.005, rsi_length=5, rsi_swing_lookback=6,
+        rsi_sell_recovery_points=35, rsi_max_holding_enabled=False,
+        rsi_stop_mode="no_price_stop", rsi_profit_only_exit=False, market_data=data,
+    )[3]
+    profit_only = simulate_rsi_mean_reversion_strategy(
+        50_000, 1.5, 0.005, rsi_length=5, rsi_swing_lookback=6,
+        rsi_sell_recovery_points=35, rsi_max_holding_enabled=False,
+        rsi_stop_mode="no_price_stop", rsi_profit_only_exit=True, market_data=data,
+    )[3]
+
+    assert ordinary[0]["exit_bar"] == 16
+    assert ordinary[0]["exit"] == 99.0
+    assert profit_only[0]["exit_bar"] == 17
+    assert profit_only[0]["exit"] == 101.0
 
 
 def test_strategy_comparison_records_are_display_ready():

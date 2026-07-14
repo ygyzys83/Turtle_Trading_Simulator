@@ -113,6 +113,7 @@ def evaluate_walk_forward(
     rsi_emergency_atr_multiplier: float = 5.0,
     rsi_max_holding_enabled: bool = True,
     rsi_max_holding_bars: int = 100,
+    rsi_profit_only_exit: bool = False,
 ) -> WalkForwardResult:
     warmup_bars = max(entry_w, exit_w, ma_w, pullback_w, momentum_w, rsi_length, rsi_swing_lookback, 14) + 4
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=seed)
@@ -150,6 +151,7 @@ def evaluate_walk_forward(
         "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
         "rsi_max_holding_enabled": rsi_max_holding_enabled,
         "rsi_max_holding_bars": rsi_max_holding_bars,
+        "rsi_profit_only_exit": rsi_profit_only_exit,
     }
     train_trade_log = _run_one(strategy_type, train_data, settings, account, risk_limits)["trade_log"]
     train_stats = _closed_trade_stats(

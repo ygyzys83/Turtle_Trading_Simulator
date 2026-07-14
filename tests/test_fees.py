@@ -4,6 +4,7 @@ from agentloop_trader.fees import (
     ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE,
     estimate_alpaca_equity_order_fees,
     estimate_alpaca_equity_round_trip_fees,
+    fee_adjusted_break_even_price,
 )
 
 
@@ -43,7 +44,19 @@ def test_round_trip_includes_buy_and_sell_costs():
 
     assert buy.total == 0.01
     assert sell.total == 0.15
-    assert buy.total + sell.total == 0.16
+
+
+def test_fee_adjusted_break_even_covers_equity_round_trip_fees():
+    price = fee_adjusted_break_even_price(
+        asset_class="equity", quantity=100, entry_price=50,
+    )
+    buy, sell = estimate_alpaca_equity_round_trip_fees(
+        quantity=100, entry_price=50, exit_price=price,
+    )
+
+    assert price > 50
+    assert (price - 50) * 100 >= buy.total + sell.total
+    assert buy.total + sell.total == pytest.approx(0.15)
 
 
 def test_invalid_side_is_rejected():

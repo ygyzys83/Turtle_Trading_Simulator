@@ -136,6 +136,39 @@ def worker_status_is_active(status: WorkerStatus, max_age_seconds: int = 120) ->
     return datetime.now(PACIFIC_TIME) - checked.astimezone(PACIFIC_TIME) <= timedelta(seconds=max_age_seconds)
 
 
+def reconcile_worker_process_state(
+    status_store: WorkerStatusStore | None = None,
+    *,
+    lock_path: str | Path | None = None,
+) -> WorkerStatus:
+    """Clear a stale running status or lock after its worker process has exited."""
+    status_store = status_store or WorkerStatusStore()
+    worker_lock_path = Path(lock_path) if lock_path is not None else DEFAULT_LOCK_PATH
+    status = status_store.read()
+    lock_pid = _worker_lock_pid(worker_lock_path)
+    process_pid = status.pid if status.pid > 0 else lock_pid
+    process_running = bool(process_pid > 0 and _process_exists(process_pid))
+    if process_running:
+        return status
+
+    if worker_lock_path.exists() and (lock_pid <= 0 or not _process_exists(lock_pid)):
+        try:
+            worker_lock_path.unlink()
+        except OSError:
+            pass
+    if status.running or status.state in {"Starting", "Stopping", "Stop failed", "Restart required"}:
+        status = replace(
+            status,
+            running=False,
+            state="Stopped",
+            last_checked_at=datetime.now(PACIFIC_TIME).isoformat(),
+            last_action="Worker process is not running. Stale status and lock were cleared.",
+            last_error="",
+        )
+        status_store.write(status)
+    return status
+
+
 def worker_code_fingerprint(project_root: str | Path | None = None) -> str:
     """Identify the local source files that can change detached worker behavior."""
     root = Path(project_root) if project_root is not None else Path(__file__).resolve().parents[1]
@@ -167,7 +200,11 @@ def start_worker_process(cwd: str | Path | None = None, python_executable: str |
         "stderr": subprocess.DEVNULL,
     }
     if os.name == "nt":
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.CREATE_NO_WINDOW
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP
+            | subprocess.CREATE_NO_WINDOW
+            | subprocess.DETACHED_PROCESS
+        )
     process = subprocess.Popen(command, **kwargs)
     return int(process.pid)
 
@@ -245,6 +282,23 @@ def _worker_lock_pid(path: Path) -> int:
 def _process_exists(pid: int) -> bool:
     if pid <= 0:
         return False
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            process_query_limited_information = 0x1000
+            still_active = 259
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(process_query_limited_information, False, pid)
+            if not handle:
+                return False
+            exit_code = ctypes.c_ulong()
+            try:
+                return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code)) and exit_code.value == still_active)
+            finally:
+                kernel32.CloseHandle(handle)
+        except (AttributeError, OSError):
+            return False
     try:
         os.kill(pid, 0)
         return True

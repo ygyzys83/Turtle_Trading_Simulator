@@ -122,3 +122,19 @@ def test_watchlist_records_show_current_buy_level_and_distance():
     assert record["Current Price"] == "$200.00"
     assert record["Next BUY Level"] == "$210.00"
     assert record["Distance To BUY"] == "+5.00%"
+
+
+def test_saved_rsi_setup_shows_profit_only_exit_setting():
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("BTC/USD", "5m", "RSI mean-reversion scalp"),
+        symbol="BTC/USD",
+        interval="5m",
+        history="1mo",
+        price_data_source="Crypto (Alpaca)",
+        strategy_label="RSI mean-reversion scalp",
+        strategy_settings={"strategy_type": "rsi_scalp", "rsi_profit_only_exit": True},
+    )
+
+    by_input = {row["Input"]: row["Saved Value"] for row in buy_watch_plan_detail_records(plan)}
+
+    assert by_input["Require profit for RSI exit"] == "On"
