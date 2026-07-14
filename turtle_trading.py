@@ -38,7 +38,9 @@ from agentloop_trader.automation_runtime import (
     automation_mode_for_new_ui_session,
     request_worker_stop,
     start_worker_process,
+    worker_code_fingerprint,
     worker_status_is_active,
+    worker_status_uses_current_code,
     worker_status_records,
 )
 from agentloop_trader.backtest import (
@@ -192,6 +194,7 @@ from agentloop_trader.scanner import DEFAULT_SCAN_SYMBOLS, ScannerCandidateStore
 from agentloop_trader.session_journal import (
     PaperSessionSnapshot,
     alpaca_paper_activity_records,
+    automatic_exit_records,
     new_session_id,
     paper_performance_records,
     paper_testing_progress_records,
@@ -1787,11 +1790,18 @@ saved_sidebar_control = sidebar_control_store.read()
 sidebar_worker_status_store = WorkerStatusStore()
 sidebar_worker_status = sidebar_worker_status_store.read()
 sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
+sidebar_worker_code_current = worker_status_uses_current_code(sidebar_worker_status)
 sidebar_worker_present = bool(
     sidebar_worker_active
     or sidebar_worker_status.running
     or DEFAULT_LOCK_PATH.exists()
 )
+if sidebar_worker_active and not sidebar_worker_code_current:
+    # Fail closed when Streamlit has newer automation logic than the detached process.
+    st.session_state["background_worker_enabled"] = False
+    st.session_state["worker_stop_pending"] = True
+    stale_control = sidebar_control_store.read()
+    sidebar_control_store.write(replace(stale_control, enabled=False, stop_requested=True))
 
 st.sidebar.markdown('<div class="sidebar-kill-title">Kill Switch</div>', unsafe_allow_html=True)
 kill_switch = st.sidebar.checkbox(
@@ -1862,9 +1872,15 @@ worker_actions_enabled = bool(
     st.session_state.get("background_worker_enabled", False)
     and active_automation_level != "Manual review only"
     and not kill_switch
+    and sidebar_worker_code_current
 )
 last_heartbeat = sidebar_worker_status.last_checked_at or "Not recorded"
-if sidebar_worker_active:
+if sidebar_worker_active and not sidebar_worker_code_current:
+    st.sidebar.error(
+        "Worker restart required: the app code changed after this worker started. "
+        "Automation has been stopped. Wait for Stopped, then click Start Worker."
+    )
+elif sidebar_worker_active:
     st.sidebar.caption(
         f"Worker process: Running. Heartbeat: current ({last_heartbeat}). "
         f"Automation actions: {'On' if worker_actions_enabled else 'Off'}."
@@ -3007,15 +3023,18 @@ automation_control_store.write(automation_control)
 if start_worker_requested:
     try:
         worker_pid = start_worker_process(Path.cwd())
+        worker_started_at = datetime.now().astimezone().isoformat()
         automation_worker_status_store.write(
             replace(
                 automation_worker_status_store.read(),
                 running=True,
                 pid=worker_pid,
                 state="Starting",
-                last_checked_at=datetime.now().astimezone().isoformat(),
+                last_checked_at=worker_started_at,
                 last_action="Started from the Streamlit sidebar.",
                 last_error="",
+                code_fingerprint=worker_code_fingerprint(),
+                started_at=worker_started_at,
             )
         )
     except Exception as exc:
@@ -4191,6 +4210,37 @@ def render_current_setup_watchlist_action() -> None:
         st.caption("Select Alpaca stock or crypto price data before saving an automatic BUY setup.")
 
 
+def persist_repeat_after_exit_change(plan_id: str, widget_key: str) -> None:
+    """Persist Repeat after exit only in response to an explicit widget change."""
+    selected_plan = next(
+        (plan for plan in buy_watchlist_store.read() if plan.plan_id == plan_id),
+        None,
+    )
+    if selected_plan is None:
+        return
+    repeat_after_exit = bool(st.session_state.get(widget_key, selected_plan.repeat_after_exit))
+    if repeat_after_exit == bool(selected_plan.repeat_after_exit):
+        return
+    repeat_changes = {"repeat_after_exit": repeat_after_exit}
+    if repeat_after_exit and selected_plan.status == "Order sent":
+        repeat_changes.update(
+            enabled=True,
+            status="Repeat enabled",
+            detail="Repeat after exit is On. The worker will detect the current order or position state.",
+        )
+    elif not repeat_after_exit and selected_plan.cycle_state in {
+        "order_pending",
+        "position_open",
+        "waiting_for_signal_reset",
+    }:
+        repeat_changes.update(
+            enabled=False,
+            status="Repeat off",
+            detail="Repeat after exit is Off. Any current position remains managed, but this setup will not buy again.",
+        )
+    buy_watchlist_store.update(selected_plan.plan_id, **repeat_changes)
+
+
 @st.fragment(run_every=f"{automation_refresh_seconds}s" if background_worker_enabled else None)
 def render_buy_watchlist_manager() -> None:
     st.markdown(
@@ -4215,37 +4265,21 @@ def render_buy_watchlist_manager() -> None:
         )
         selected_watch_plan = watch_labels[selected_watch_label]
         selected_repeat_key = f"manage_repeat_after_exit_{selected_watch_plan.plan_id}"
-        if selected_repeat_key not in st.session_state:
-            st.session_state[selected_repeat_key] = bool(selected_watch_plan.repeat_after_exit)
-        selected_repeat_after_exit = st.checkbox(
+        # The durable queue record is authoritative whenever this fragment renders.
+        # The callback persists only an actual user toggle, so a widget default can
+        # never overwrite the first saved setup during app startup.
+        st.session_state[selected_repeat_key] = bool(selected_watch_plan.repeat_after_exit)
+        st.checkbox(
             "Repeat after exit for this setup",
             key=selected_repeat_key,
+            on_change=persist_repeat_after_exit_change,
+            args=(selected_watch_plan.plan_id, selected_repeat_key),
             help=(
                 "On keeps only this selected setup enabled across future buy, position, and exit cycles. After an exit, the worker waits "
                 "for the old BUY signal to turn off, applies the saved re-entry cooldown, and then waits for a new BUY signal. Off makes "
                 "this setup one-time: it disables after sending its next buy order."
             ),
         )
-        if bool(selected_repeat_after_exit) != bool(selected_watch_plan.repeat_after_exit):
-            repeat_changes = {"repeat_after_exit": bool(selected_repeat_after_exit)}
-            if selected_repeat_after_exit and selected_watch_plan.status == "Order sent":
-                repeat_changes.update(
-                    enabled=True,
-                    status="Repeat enabled",
-                    detail="Repeat after exit is On. The worker will detect the current order or position state.",
-                )
-            elif not selected_repeat_after_exit and selected_watch_plan.cycle_state in {
-                "order_pending",
-                "position_open",
-                "waiting_for_signal_reset",
-            }:
-                repeat_changes.update(
-                    enabled=False,
-                    status="Repeat off",
-                    detail="Repeat after exit is Off. Any current position remains managed, but this setup will not buy again.",
-                )
-            buy_watchlist_store.update(selected_watch_plan.plan_id, **repeat_changes)
-            st.rerun()
         with st.expander("Current BUY requirements", expanded=True):
             if selected_watch_plan.buy_requirement_levels:
                 st.dataframe(
@@ -4304,6 +4338,20 @@ def render_open_positions_panel() -> None:
     st.markdown("#### Open position automation status")
     st.dataframe(pd.DataFrame(daily_automation_readiness_records("Open positions")), width="stretch", hide_index=True)
     render_buy_watchlist_manager()
+    recent_auto_exits = automatic_exit_records(
+        current_evidence_records,
+        st.session_state["tracked_alpaca_orders"],
+        limit=5,
+    )
+    if recent_auto_exits:
+        st.markdown(
+            "#### Recent automatic exits",
+            help=(
+                "Shows why the app or Background Worker recently sent each automatic paper sell. Decision Price is the price seen when "
+                "the decision was made. Sell Trigger is the saved level it compared against. Trigger Rule identifies the exact exit rule."
+            ),
+        )
+        st.dataframe(pd.DataFrame(recent_auto_exits), width="stretch", hide_index=True)
 
     if not alpaca_positions:
         st.info("No Alpaca paper positions are open. Saved queued setups can still be monitored and managed above.")

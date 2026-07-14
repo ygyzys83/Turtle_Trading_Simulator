@@ -16,6 +16,7 @@ from agentloop_trader.automation_runtime import (
     WorkerLock,
     WorkerStatus,
     WorkerStatusStore,
+    worker_code_fingerprint,
 )
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
@@ -791,8 +792,33 @@ def run_loop(control_path: str | Path, status_path: str | Path, once: bool = Fal
     if not lock.acquire():
         status_store.write(WorkerStatus(running=False, state="Already running", last_error="Another worker lock is active."))
         return 2
+    startup_fingerprint = worker_code_fingerprint()
+    started_at = datetime.now(PACIFIC_TIME).isoformat()
+    status_store.write(
+        replace(
+            status_store.read(),
+            running=True,
+            pid=os.getpid(),
+            state="Starting",
+            code_fingerprint=startup_fingerprint,
+            started_at=started_at,
+            last_error="",
+        )
+    )
     try:
         while True:
+            if worker_code_fingerprint() != startup_fingerprint:
+                status_store.write(
+                    replace(
+                        status_store.read(),
+                        running=False,
+                        state="Restart required",
+                        last_checked_at=datetime.now(PACIFIC_TIME).isoformat(),
+                        last_action="Worker stopped because the app code changed. Start Worker to load the updated logic.",
+                        last_error="",
+                    )
+                )
+                break
             control = control_store.read()
             if control.stop_requested:
                 status_store.write(
@@ -808,6 +834,11 @@ def run_loop(control_path: str | Path, status_path: str | Path, once: bool = Fal
                 )
                 break
             status = run_once(control, status_store.read())
+            status = replace(
+                status,
+                code_fingerprint=startup_fingerprint,
+                started_at=started_at,
+            )
             status_store.write(status)
             if once:
                 break
@@ -816,7 +847,8 @@ def run_loop(control_path: str | Path, status_path: str | Path, once: bool = Fal
     finally:
         lock.release()
         final = status_store.read()
-        status_store.write(replace(final, running=False, state="Stopped"))
+        final_state = final.state if final.state == "Restart required" else "Stopped"
+        status_store.write(replace(final, running=False, state=final_state))
     return 0
 
 

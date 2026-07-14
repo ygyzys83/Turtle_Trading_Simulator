@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import signal
 import subprocess
@@ -62,6 +63,8 @@ class WorkerStatus:
     orders_sent: int = 0
     cancels_sent: int = 0
     exits_sent: int = 0
+    code_fingerprint: str = ""
+    started_at: str = ""
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -131,6 +134,28 @@ def worker_status_is_active(status: WorkerStatus, max_age_seconds: int = 120) ->
     if checked.tzinfo is None:
         checked = checked.replace(tzinfo=PACIFIC_TIME)
     return datetime.now(PACIFIC_TIME) - checked.astimezone(PACIFIC_TIME) <= timedelta(seconds=max_age_seconds)
+
+
+def worker_code_fingerprint(project_root: str | Path | None = None) -> str:
+    """Identify the local source files that can change detached worker behavior."""
+    root = Path(project_root) if project_root is not None else Path(__file__).resolve().parents[1]
+    source_files = [root / "turtle_trading.py"]
+    source_files.extend(sorted((root / "agentloop_trader").glob("*.py")))
+    digest = hashlib.sha256()
+    for path in source_files:
+        if not path.is_file():
+            continue
+        try:
+            stat = path.stat()
+            relative = path.relative_to(root).as_posix()
+            digest.update(f"{relative}|{stat.st_size}|{stat.st_mtime_ns}\n".encode("utf-8"))
+        except OSError:
+            continue
+    return digest.hexdigest()[:16]
+
+
+def worker_status_uses_current_code(status: WorkerStatus, project_root: str | Path | None = None) -> bool:
+    return bool(status.code_fingerprint and status.code_fingerprint == worker_code_fingerprint(project_root))
 
 
 def start_worker_process(cwd: str | Path | None = None, python_executable: str | None = None) -> int:
@@ -294,6 +319,8 @@ def worker_status_records(status: WorkerStatus) -> list[dict[str, Any]]:
     return [
         {"Item": "Background worker", "Value": "Running" if status.running else "Not running"},
         {"Item": "State", "Value": str(status.state)},
+        {"Item": "Worker code", "Value": "Current" if worker_status_uses_current_code(status) else "Restart required"},
+        {"Item": "Worker started", "Value": status.started_at or "Not recorded"},
         {"Item": "Last check", "Value": status.last_checked_at or "Not checked yet"},
         {"Item": "Last action", "Value": status.last_action or "None"},
         {"Item": "Orders sent", "Value": str(status.orders_sent)},

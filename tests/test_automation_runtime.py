@@ -9,7 +9,9 @@ from agentloop_trader.automation_runtime import (
     automation_mode_for_new_ui_session,
     request_worker_stop,
     start_worker_process,
+    worker_code_fingerprint,
     worker_status_is_active,
+    worker_status_uses_current_code,
     worker_status_records,
 )
 
@@ -57,6 +59,22 @@ def test_worker_status_active_uses_recent_heartbeat():
 
     assert worker_status_is_active(recent, max_age_seconds=120) is True
     assert worker_status_is_active(stale, max_age_seconds=120) is False
+
+
+def test_worker_code_fingerprint_detects_source_change(tmp_path):
+    package = tmp_path / "agentloop_trader"
+    package.mkdir()
+    worker_file = package / "worker.py"
+    worker_file.write_text("VERSION = 1\n", encoding="utf-8")
+
+    first = worker_code_fingerprint(tmp_path)
+    worker_file.write_text("VERSION = 200\n", encoding="utf-8")
+    second = worker_code_fingerprint(tmp_path)
+
+    assert first != second
+    assert worker_status_uses_current_code(WorkerStatus(code_fingerprint=second), tmp_path) is True
+    assert worker_status_uses_current_code(WorkerStatus(code_fingerprint=first), tmp_path) is False
+    assert worker_status_uses_current_code(WorkerStatus(), tmp_path) is False
 
 
 def test_fresh_ui_restores_mode_only_when_a_worker_record_is_present():

@@ -666,6 +666,16 @@ The shared UI/worker evaluator now excludes the full entry candle when its times
 
 Regression coverage reproduces the WYFI case: average fill $32.09, initial risk $3.53, current price $32.13, and a pre-fill candle high of $38.87. The corrected result is approximately 0.01R, no break-even stop, and a $28.56 fill-adjusted initial stop. The full checkpoint passed 322 tests. No broker order was submitted.
 
+The per-setup `Repeat after exit` checkbox also now treats the saved watchlist record as authoritative during Streamlit startup. Its value is persisted only by an explicit checkbox change, preventing the first queued setup from being silently reset to Off by the widget's default state.
+
+## WYFI Stale-Worker Exit And Durable Explanation (July 14, 2026)
+
+The detached worker process that started at 10:21 AM PT was not restarted after the entry-candle correction. At 11:15:38 AM PT, that old process sold 142 WYFI shares after comparing a $32.01 decision price with the falsely saved $32.09 break-even trigger. Its audit payload confirmed that it was still using the invalid $38.87 pre-fill candle high. The correct ATR-only trigger was the $28.56 fill-adjusted initial stop, so this exit was a logic error caused by stale in-memory worker code.
+
+Detached workers now record a fingerprint of the automation source files and their start time. A worker stops itself with `Restart required` if those files change, and the Streamlit UI fails closed when it detects a running worker without the current fingerprint. The old PID 20756 was confirmed stopped and automation control disabled before testing concluded.
+
+`Positions & Queue` now includes `Recent automatic exits`, showing time, ticker, shares, decision price, sell trigger, trigger rule, Alpaca fill, exact reason, and Alpaca order ID from the durable audit and broker records. The WYFI row therefore remains visible even after the position has closed. The full checkpoint passed 324 tests. No broker order was submitted during this repair.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

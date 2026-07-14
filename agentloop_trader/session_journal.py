@@ -68,6 +68,44 @@ def session_timeline_records(audit_records: list[dict], limit: int = 100) -> lis
     return rows
 
 
+def automatic_exit_records(
+    audit_records: list[dict],
+    tracked_orders: list[dict] | None = None,
+    limit: int = 10,
+) -> list[dict[str, Any]]:
+    """Explain recent automatic exits without requiring the raw activity log."""
+    tracked_by_id = {
+        str(order.get("broker_order_id", "")): order
+        for order in (tracked_orders or [])
+        if str(order.get("broker_order_id", ""))
+    }
+    rows: list[dict[str, Any]] = []
+    automatic_types = {"worker_paper_exit_sent", "auto_paper_exit_submitted"}
+    for record in reversed(audit_records):
+        if record.get("event_type") not in automatic_types:
+            continue
+        payload = record.get("payload", {}) if isinstance(record.get("payload"), dict) else {}
+        details = payload.get("exit_details", {}) if isinstance(payload.get("exit_details"), dict) else {}
+        broker_order_id = str(payload.get("broker_order_id", ""))
+        tracked = tracked_by_id.get(broker_order_id, {})
+        rows.append(
+            {
+                "Time": record.get("created_at", ""),
+                "Ticker": payload.get("symbol", ""),
+                "Shares": _format_number(_as_float(payload.get("quantity"))),
+                "Decision Price": _optional_money(details.get("current_price")),
+                "Sell Trigger": _optional_money(details.get("trigger_price")),
+                "Trigger Rule": details.get("trigger_source") or "Not recorded by older in-page exit",
+                "Alpaca Fill": _optional_money(tracked.get("average_fill_price")),
+                "Reason": payload.get("reason") or record.get("message", ""),
+                "Alpaca Order ID": broker_order_id,
+            }
+        )
+        if len(rows) >= max(1, int(limit)):
+            break
+    return rows
+
+
 def paper_performance_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     local_filled = [order for order in snapshot.local_orders if _enum_value(order.get("Status")) == "filled"]
     local_notional = sum(_as_float(order.get("Notional")) for order in local_filled)
@@ -237,3 +275,12 @@ def _format_number(value: float) -> str:
 
 def _money(value: float) -> str:
     return f"${value:,.2f}"
+
+
+def _optional_money(value: Any) -> str:
+    if value in (None, ""):
+        return "Not recorded"
+    try:
+        return _money(float(value))
+    except (TypeError, ValueError):
+        return "Not recorded"

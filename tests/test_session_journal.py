@@ -1,6 +1,7 @@
 from agentloop_trader.session_journal import (
     PaperSessionSnapshot,
     alpaca_paper_activity_records,
+    automatic_exit_records,
     new_session_id,
     paper_performance_records,
     paper_testing_progress_records,
@@ -91,6 +92,40 @@ def test_session_timeline_records_extract_key_payload_fields():
     assert rows[0]["Symbol"] == "AAPL"
     assert rows[0]["Review ID"] == "abc"
     assert rows[1]["Status"] == "canceled"
+
+
+def test_automatic_exit_records_explain_worker_trigger_and_fill():
+    audit_records = [{
+        "created_at": "2026-07-14T11:15:38-07:00",
+        "event_type": "worker_paper_exit_sent",
+        "message": "Background worker sent an Alpaca paper exit.",
+        "payload": {
+            "symbol": "WYFI",
+            "quantity": 142,
+            "broker_order_id": "exit-123",
+            "reason": "Exit now because WYFI is at or below the break-even stop at $32.09.",
+            "exit_details": {
+                "current_price": 32.01,
+                "trigger_price": 32.09,
+                "trigger_source": "break-even stop",
+            },
+        },
+    }]
+    tracked_orders = [{"broker_order_id": "exit-123", "average_fill_price": "32.00"}]
+
+    rows = automatic_exit_records(audit_records, tracked_orders)
+
+    assert rows == [{
+        "Time": "2026-07-14T11:15:38-07:00",
+        "Ticker": "WYFI",
+        "Shares": "142",
+        "Decision Price": "$32.01",
+        "Sell Trigger": "$32.09",
+        "Trigger Rule": "break-even stop",
+        "Alpaca Fill": "$32.00",
+        "Reason": "Exit now because WYFI is at or below the break-even stop at $32.09.",
+        "Alpaca Order ID": "exit-123",
+    }]
 
 
 def test_paper_performance_records_report_only_local_simulator_metrics():
