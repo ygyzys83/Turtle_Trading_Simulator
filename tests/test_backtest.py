@@ -1,4 +1,6 @@
 from agentloop_trader.backtest import (
+    _BacktestSessionRisk,
+    _backtest_session_keys,
     _build_stats,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
@@ -9,6 +11,61 @@ from agentloop_trader.backtest import (
 from agentloop_trader.models import RiskLimits
 import agentloop_trader.backtest as backtest_module
 import pandas as pd
+
+
+def test_backtest_daily_loss_resets_on_each_trading_date():
+    prices = list(range(100, 114)) + [105, 107, 109, 101, 103, 105, 97, 99]
+    day_one = list(pd.date_range("2026-06-13 09:30", periods=16, freq="5min", tz="UTC"))
+    day_two = list(pd.date_range("2026-06-14 09:30", periods=2, freq="5min", tz="UTC"))
+    day_three = list(pd.date_range("2026-06-15 09:30", periods=4, freq="5min", tz="UTC"))
+    market_data = pd.DataFrame(
+        {
+            "Open": prices,
+            "Close": prices,
+            "High": [price + 0.1 for price in prices],
+            "Low": [price - 0.1 for price in prices],
+            "Volume": [1_000_000] * len(prices),
+        },
+        index=day_one + day_two + day_three,
+    )
+    market_data.attrs["symbol"] = "RESET"
+    limits = RiskLimits(
+        max_risk_per_trade_pct=100,
+        max_position_notional_pct=100,
+        max_portfolio_exposure_pct=100,
+        max_symbol_concentration_pct=100,
+        max_session_loss_pct=0.01,
+    )
+
+    _, _, _, trade_log, _, _, _ = simulate_turtle_strategy(
+        account=50_000,
+        entry_w=2,
+        exit_w=1,
+        atr_mult=1.0,
+        risk_pct_dec=0.01,
+        ma_w=2,
+        market_data=market_data,
+        risk_limits=limits,
+    )
+
+    assert len(trade_log) >= 2
+    assert trade_log[1]["entry_date"].startswith("2026-06-14")
+
+
+def test_backtest_session_dates_use_exchange_day_for_equities_and_utc_for_crypto():
+    market_data = pd.DataFrame(
+        {"Close": [100, 101]},
+        index=pd.to_datetime(["2026-07-02 00:30:00Z", "2026-07-02 14:30:00Z"]),
+    )
+    labels = ["2026-07-02 00:30", "2026-07-02 14:30"]
+
+    assert _backtest_session_keys(market_data, labels, "equity") == ["2026-07-01", "2026-07-02"]
+    assert _backtest_session_keys(market_data, labels, "crypto") == ["2026-07-02", "2026-07-02"]
+
+    tracker = _BacktestSessionRisk(["2026-07-01", "2026-07-01", "2026-07-02"])
+    assert tracker.update(0, 100_000) == 0
+    assert tracker.update(1, 97_000) == -3_000
+    assert tracker.update(2, 97_000) == 0
 
 
 def test_turtle_backtest_returns_expected_contract():

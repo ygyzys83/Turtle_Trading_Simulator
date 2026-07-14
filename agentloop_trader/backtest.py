@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import numpy as np
 
 from agentloop_trader.assets import floor_quantity, normalize_asset_class
@@ -114,6 +116,35 @@ def _build_stats(
     }
 
 
+def _backtest_session_keys(market_data, labels: list[str], asset_class: str) -> list[str]:
+    """Return the trading date used to reset historical daily-loss controls."""
+    if market_data is None:
+        return list(labels)
+    timezone = "UTC" if asset_class == "crypto" else "America/New_York"
+    try:
+        index = market_data.index
+        localized = index.tz_localize(timezone) if getattr(index, "tz", None) is None else index.tz_convert(timezone)
+        return [timestamp.date().isoformat() for timestamp in localized]
+    except (AttributeError, TypeError, ValueError):
+        return [label[:10] if len(label) >= 10 and label[4:5] == "-" else label for label in labels]
+
+
+@dataclass
+class _BacktestSessionRisk:
+    session_keys: list[str]
+    current_session: str | None = None
+    starting_equity: float | None = None
+    session_pnl: float = 0.0
+
+    def update(self, bar_index: int, account_equity: float) -> float:
+        session = self.session_keys[bar_index]
+        if session != self.current_session or self.starting_equity is None:
+            self.current_session = session
+            self.starting_equity = float(account_equity)
+        self.session_pnl = float(account_equity) - self.starting_equity
+        return self.session_pnl
+
+
 def _backtest_limited_quantity(
     *,
     raw_quantity: float,
@@ -130,8 +161,9 @@ def _backtest_limited_quantity(
         return raw_quantity
     if limits.kill_switch_enabled:
         return 0
-    max_session_loss = account_equity * limits.max_session_loss_pct / 100
-    if session_pnl <= -max_session_loss:
+    session_start_equity = max(0.0, account_equity - session_pnl)
+    max_session_loss = session_start_equity * limits.max_session_loss_pct / 100
+    if session_pnl < -max_session_loss:
         return 0
     if entry_price <= 0:
         return 0
@@ -538,6 +570,7 @@ def simulate_turtle_strategy(
 
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
     asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
+    session_risk = _BacktestSessionRisk(_backtest_session_keys(market_data, labels, asset_class))
     opens = _bar_open_prices(prices, market_data)
     entry_source = highs if highs is not None else prices
     exit_source = lows if lows is not None else prices
@@ -565,6 +598,8 @@ def simulate_turtle_strategy(
     live_bar = n_bars - 1
     for i in range(start, live_bar):
         p = prices[i]
+        current_equity = balance + ((float(p) - entry_price) * shares if in_trade else 0.0)
+        session_pnl = session_risk.update(i, current_equity)
         sma = smas[i]
         atr = atrs[i]
         if sma is None or atr is None:
@@ -586,7 +621,7 @@ def simulate_turtle_strategy(
                     account_equity=balance,
                     entry_price=float(p),
                     stop_price=float(stop),
-                    session_pnl=balance - account,
+                    session_pnl=session_pnl,
                     limits=risk_limits,
                     asset_class=asset_class,
                 )
@@ -669,6 +704,7 @@ def simulate_turtle_strategy(
     dl_last = float(np.min(exit_source[-1 - exit_w:-1]))
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
+    live_session_pnl = session_risk.update(live_bar, live_balance)
     raw_pos_size = floor_quantity((balance * risk_pct_dec) / (atr_mult * last_atr), asset_class) if last_atr else 0
     live_stop = last_p - atr_mult * last_atr if last_atr else last_p
     pos_size = _backtest_limited_quantity(
@@ -676,7 +712,7 @@ def simulate_turtle_strategy(
         account_equity=live_balance,
         entry_price=last_p,
         stop_price=live_stop,
-        session_pnl=live_balance - account,
+        session_pnl=live_session_pnl,
         limits=risk_limits,
         asset_class=asset_class,
     )
@@ -795,6 +831,7 @@ def simulate_trend_pullback_strategy(
     )
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
     asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
+    session_risk = _BacktestSessionRisk(_backtest_session_keys(market_data, labels, asset_class))
     opens = _bar_open_prices(prices, market_data)
     min_bars = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window) + 3
     if n_bars < min_bars:
@@ -839,6 +876,8 @@ def simulate_trend_pullback_strategy(
 
     for i in range(start, live_bar):
         p = float(prices[i])
+        current_equity = balance + ((p - entry_price) * shares if in_trade else 0.0)
+        session_pnl = session_risk.update(i, current_equity)
         atr = atrs[i]
         if atr is None:
             equity_curve.append(balance)
@@ -856,7 +895,7 @@ def simulate_trend_pullback_strategy(
                     account_equity=balance,
                     entry_price=float(p),
                     stop_price=float(stop),
-                    session_pnl=balance - account,
+                    session_pnl=session_pnl,
                     limits=risk_limits,
                     asset_class=asset_class,
                 )
@@ -937,6 +976,7 @@ def simulate_trend_pullback_strategy(
     setup_ready, pullback_depth, trend_ok, touched_pullback, momentum_turn, rsi_entry_ready = setup_at(live_bar)
     open_position_value = (last_p - entry_price) * shares if in_trade else 0.0
     live_balance = balance + open_position_value
+    live_session_pnl = session_risk.update(live_bar, live_balance)
     atr_stop = last_p - atr_mult * last_atr if last_atr else last_p
     recent_close_low = float(np.min(prices[-pullback_w:]))
     live_stop = min(recent_close_low, atr_stop)
@@ -947,7 +987,7 @@ def simulate_trend_pullback_strategy(
         account_equity=live_balance,
         entry_price=last_p,
         stop_price=live_stop,
-        session_pnl=live_balance - account,
+        session_pnl=live_session_pnl,
         limits=risk_limits,
         asset_class=asset_class,
     )
@@ -1064,6 +1104,7 @@ def simulate_trendline_breakout_strategy(
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
     asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
+    session_risk = _BacktestSessionRisk(_backtest_session_keys(market_data, labels, asset_class))
     opens = _bar_open_prices(prices, market_data)
     min_bars = max(trendline_w, exit_w, ma_w, 14) + 4
     if n_bars < min_bars:
@@ -1087,6 +1128,8 @@ def simulate_trendline_breakout_strategy(
 
     for i in range(start, live_bar):
         p = float(prices[i])
+        current_equity = balance + ((p - entry_price) * shares if in_trade else 0.0)
+        session_pnl = session_risk.update(i, current_equity)
         atr = atrs[i]
         sma = smas[i]
         if atr is None or sma is None:
@@ -1112,7 +1155,7 @@ def simulate_trendline_breakout_strategy(
                     account_equity=balance,
                     entry_price=p,
                     stop_price=stop,
-                    session_pnl=balance - account,
+                    session_pnl=session_pnl,
                     limits=risk_limits,
                     asset_class=asset_class,
                 )
@@ -1185,6 +1228,8 @@ def simulate_trendline_breakout_strategy(
             continue
         equity_curve.append(balance)
 
+    live_balance = balance + ((float(prices[-1]) - entry_price) * shares if in_trade else 0.0)
+    live_session_pnl = session_risk.update(live_bar, live_balance)
     live = _trendline_live_fields(
         prices=prices,
         highs=highs,
@@ -1198,8 +1243,9 @@ def simulate_trendline_breakout_strategy(
         ma_w=ma_w,
         exit_w=exit_w,
         atr_mult=atr_mult,
-        balance=balance + ((float(prices[-1]) - entry_price) * shares if in_trade else 0.0),
+        balance=live_balance,
         account=account,
+        session_pnl=live_session_pnl,
         risk_pct_dec=risk_pct_dec,
         risk_limits=risk_limits,
         symbol=symbol,
@@ -1235,6 +1281,7 @@ def simulate_trendline_retest_strategy(
 ):
     prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
     asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
+    session_risk = _BacktestSessionRisk(_backtest_session_keys(market_data, labels, asset_class))
     opens = _bar_open_prices(prices, market_data)
     min_bars = max(trendline_w, exit_w, ma_w, momentum_w, 14) + 4
     if n_bars < min_bars:
@@ -1263,6 +1310,8 @@ def simulate_trendline_retest_strategy(
 
     for i in range(start, live_bar):
         p = float(prices[i])
+        current_equity = balance + ((p - entry_price) * shares if in_trade else 0.0)
+        session_pnl = session_risk.update(i, current_equity)
         atr = atrs[i]
         sma = smas[i]
         momentum_sma = momentum_smas[i]
@@ -1305,7 +1354,7 @@ def simulate_trendline_retest_strategy(
                         account_equity=balance,
                         entry_price=p,
                         stop_price=stop,
-                        session_pnl=balance - account,
+                        session_pnl=session_pnl,
                         limits=risk_limits,
                         asset_class=asset_class,
                     )
@@ -1382,6 +1431,8 @@ def simulate_trendline_retest_strategy(
             continue
         equity_curve.append(balance)
 
+    live_balance = balance + ((float(prices[-1]) - entry_price) * shares if in_trade else 0.0)
+    live_session_pnl = session_risk.update(live_bar, live_balance)
     live = _trendline_live_fields(
         prices=prices,
         highs=highs,
@@ -1395,8 +1446,9 @@ def simulate_trendline_retest_strategy(
         ma_w=ma_w,
         exit_w=exit_w,
         atr_mult=atr_mult,
-        balance=balance + ((float(prices[-1]) - entry_price) * shares if in_trade else 0.0),
+        balance=live_balance,
         account=account,
+        session_pnl=live_session_pnl,
         risk_pct_dec=risk_pct_dec,
         risk_limits=risk_limits,
         symbol=symbol,
@@ -1435,6 +1487,7 @@ def _trendline_live_fields(
     atr_mult: float,
     balance: float,
     account: float,
+    session_pnl: float,
     risk_pct_dec: float,
     risk_limits: RiskLimits | None,
     symbol: str,
@@ -1486,7 +1539,7 @@ def _trendline_live_fields(
         account_equity=balance,
         entry_price=last_p,
         stop_price=stop_loss,
-        session_pnl=balance - account,
+        session_pnl=session_pnl,
         limits=risk_limits,
         asset_class=asset_class,
     )

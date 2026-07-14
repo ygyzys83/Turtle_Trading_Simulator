@@ -620,6 +620,19 @@ New Trade now has a collapsed `Manual paper order - no BUY signal required` tick
 
 The manual-order checkpoint passed 308 tests. No broker order was submitted during development or testing.
 
+## Backtest Daily-Loss Reset Fix (July 13, 2026)
+
+The historical strategies previously passed cumulative profit and loss from the beginning of the entire test into the Max daily loss control. After cumulative losses crossed that limit, calculated quantity stayed at zero for every later bar. This appeared most clearly in a BTC/USD 5-minute, one-month test: trades stopped permanently at trade 82 around June 17 even though price history continued through July 13.
+
+All four backtests now reset daily profit and loss by trading date before applying the daily-loss limit:
+
+- Stocks use the America/New_York trading date.
+- Crypto uses the UTC calendar date because it trades continuously.
+- The limit is calculated from that day's starting equity, matching the live deterministic risk logic.
+- Cumulative account results still flow normally into equity, drawdown, sizing, fees, and performance statistics; only the daily-loss pause resets.
+
+A read-only replay of the exact BTC/USD history and displayed pullback settings reproduced the old result at 82 trades ending June 17. The corrected logic generated 503 trades through the end of the available data. The full checkpoint passed 310 tests. No broker order was submitted.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.
