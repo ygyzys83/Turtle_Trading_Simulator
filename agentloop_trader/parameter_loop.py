@@ -212,6 +212,16 @@ OPTIMIZER_ATR_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0)
 OPTIMIZER_TREND_WINDOWS = (50, 100, 150, 200)
 OPTIMIZER_PULLBACK_WINDOWS = (10, 20, 30, 50, 100, 150, 200)
 OPTIMIZER_MOMENTUM_WINDOWS = (3, 5, 10, 15, 20)
+OPTIMIZER_RSI_LENGTHS = (7, 9, 14, 21)
+OPTIMIZER_RSI_OVERSOLD = (25.0, 30.0, 35.0)
+OPTIMIZER_RSI_OVERBOUGHT = (65.0, 70.0, 75.0)
+OPTIMIZER_RSI_DECLINES = (30.0, 40.0, 50.0)
+OPTIMIZER_RSI_REBOUNDS = (2.0, 3.0, 5.0)
+OPTIMIZER_RSI_RECOVERIES = (30.0, 35.0, 40.0)
+OPTIMIZER_RSI_LOOKBACKS = (12, 24, 36)
+OPTIMIZER_RSI_MAX_HOLDS = (50, 100, 150)
+OPTIMIZER_RSI_STOP_MODES = ("standard_atr", "emergency_atr", "no_price_stop")
+OPTIMIZER_RSI_EMERGENCY_ATR = (4.0, 5.0, 6.0)
 
 
 def generate_bounded_candidates(current: StrategyConfig, max_candidates: int = 12) -> list[StrategyConfig]:
@@ -951,7 +961,48 @@ def generate_optimizer_settings(
         pullback_options = _nearby(base["pullback_average_length"], OPTIMIZER_PULLBACK_WINDOWS)
         momentum_options = _nearby(base["momentum_turn_length"], OPTIMIZER_MOMENTUM_WINDOWS)
 
-        if strategy_type == "pullback":
+        if strategy_type == "rsi_scalp":
+            rsi_dimensions = {
+                "rsi_length": _nearby(base["rsi_length"], OPTIMIZER_RSI_LENGTHS),
+                "rsi_oversold": _nearby(base["rsi_oversold"], OPTIMIZER_RSI_OVERSOLD),
+                "rsi_overbought": _nearby(base["rsi_overbought"], OPTIMIZER_RSI_OVERBOUGHT),
+                "rsi_decline_points": _nearby(base["rsi_decline_points"], OPTIMIZER_RSI_DECLINES),
+                "rsi_rebound_points": _nearby(base["rsi_rebound_points"], OPTIMIZER_RSI_REBOUNDS),
+                "rsi_sell_recovery_points": _nearby(base["rsi_sell_recovery_points"], OPTIMIZER_RSI_RECOVERIES),
+                "rsi_swing_lookback": _nearby(base["rsi_swing_lookback"], OPTIMIZER_RSI_LOOKBACKS),
+                "rsi_stop_mode": list(OPTIMIZER_RSI_STOP_MODES),
+                "rsi_emergency_atr_multiplier": _nearby(
+                    base["rsi_emergency_atr_multiplier"], OPTIMIZER_RSI_EMERGENCY_ATR
+                ),
+                "rsi_max_holding_bars": (
+                    _nearby(base["rsi_max_holding_bars"], OPTIMIZER_RSI_MAX_HOLDS)
+                    if base["rsi_max_holding_enabled"]
+                    else [base["rsi_max_holding_bars"]]
+                ),
+            }
+            strategy_rows.append(base | {"strategy_label": strategy_label, "strategy_type": strategy_type})
+            for key, values in rsi_dimensions.items():
+                for value in values:
+                    strategy_rows.append(base | {
+                        "strategy_label": strategy_label,
+                        "strategy_type": strategy_type,
+                        key: value,
+                    })
+            for oversold, decline, recovery, atr in product(
+                rsi_dimensions["rsi_oversold"],
+                rsi_dimensions["rsi_decline_points"],
+                rsi_dimensions["rsi_sell_recovery_points"],
+                atr_options,
+            ):
+                strategy_rows.append(base | {
+                    "strategy_label": strategy_label,
+                    "strategy_type": strategy_type,
+                    "rsi_oversold": oversold,
+                    "rsi_decline_points": decline,
+                    "rsi_sell_recovery_points": recovery,
+                    "atr_stop_multiplier": atr,
+                })
+        elif strategy_type == "pullback":
             raw = product(exit_options, atr_options, trend_options, pullback_options, momentum_options)
             for exit_w, atr, trend_w, pullback_w, momentum_w in raw:
                 row = base | {
@@ -990,9 +1041,18 @@ def generate_optimizer_settings(
                 }
                 strategy_rows.append(row)
 
-        strategy_rows.sort(key=lambda row: _settings_distance(base, row))
+        unique_rows: list[dict[str, Any]] = []
+        seen_rows: set[tuple[tuple[str, str], ...]] = set()
+        for row in strategy_rows:
+            identity = tuple(sorted((key, str(value)) for key, value in row.items()))
+            if identity not in seen_rows:
+                seen_rows.add(identity)
+                unique_rows.append(row)
+        strategy_rows = unique_rows
+        if strategy_type != "rsi_scalp":
+            strategy_rows.sort(key=lambda row: _settings_distance(base, row))
         for row in strategy_rows[:max_candidates_per_strategy]:
-            for rsi_enabled in (False, True):
+            for rsi_enabled in ((False,) if strategy_type == "rsi_scalp" else (False, True)):
                 rows.append((
                     strategy_label,
                     strategy_type,
@@ -1051,8 +1111,18 @@ def optimizer_recommendation_records(
         },
         {
             "Item": "RSI entry rule",
-            "Value": "Require RSI 50-70" if settings.get("rsi_entry_filter_enabled", False) else "Off",
-            "Plain English": "The search tested the same strategy settings with this rule both off and on.",
+            "Value": (
+                "Built into RSI mean-reversion scalp"
+                if candidate.strategy_type == "rsi_scalp"
+                else "Require RSI 50-70"
+                if settings.get("rsi_entry_filter_enabled", False)
+                else "Off"
+            ),
+            "Plain English": (
+                "The RSI arm, rebound, and recovery levels are part of this strategy and were included in the search."
+                if candidate.strategy_type == "rsi_scalp"
+                else "The search tested the same strategy settings with this rule both off and on."
+            ),
         },
         {"Item": "Strong nearby range", "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}), "Plain English": "Nearby profitable settings. A useful result should not depend on one exact number."},
         {"Item": "Validation and final-period comparison", "Value": benchmark_read, "Plain English": f"Middle validation advantage {candidate.excess_return_percent:+.2f}%; untouched final-period advantage {locked.excess_return_percent:+.2f}%" if locked else "Untouched final-period comparison is unavailable."},
@@ -1120,7 +1190,21 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Trend Filter": candidate.settings["moving_average_window"],
             "Pullback Average": candidate.settings["pullback_average_length"],
             "Momentum Turn": candidate.settings["momentum_turn_length"],
-            "RSI Entry Rule": "On" if candidate.settings.get("rsi_entry_filter_enabled", False) else "Off",
+            "RSI Entry Rule": "Built into strategy" if candidate.strategy_type == "rsi_scalp" else "On" if candidate.settings.get("rsi_entry_filter_enabled", False) else "Off",
+            "RSI Length": candidate.settings.get("rsi_length", 14) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "RSI Arm Level": candidate.settings.get("rsi_oversold", 30) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "RSI Arm Drop": candidate.settings.get("rsi_decline_points", 40) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "RSI Buy Rebound": candidate.settings.get("rsi_rebound_points", 3) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "RSI Sell Recovery": candidate.settings.get("rsi_sell_recovery_points", 35) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "RSI Sell Cap": candidate.settings.get("rsi_overbought", 70) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "RSI Lookback": candidate.settings.get("rsi_swing_lookback", 24) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "Stop Protection": candidate.settings.get("rsi_stop_mode", "standard_atr") if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "Emergency Stop ATR": candidate.settings.get("rsi_emergency_atr_multiplier", 5.0) if candidate.strategy_type == "rsi_scalp" else "Not used",
+            "Maximum Hold": (
+                candidate.settings.get("rsi_max_holding_bars", 100)
+                if candidate.strategy_type == "rsi_scalp" and candidate.settings.get("rsi_max_holding_enabled", True)
+                else "Off" if candidate.strategy_type == "rsi_scalp" else "Not used"
+            ),
             "Middle Validation Return %": candidate.test_return_percent,
             "Middle Validation Account Return %": candidate.test_account_return_percent,
             "Annualized Allocated Return %": candidate.test_annualized_return_percent,
@@ -1171,6 +1255,25 @@ def optimizer_interval_records(result: MultiIntervalRecommendation) -> list[dict
 
 def _settings_text(settings: dict[str, Any]) -> str:
     strategy_type = str(settings.get("strategy_type", ""))
+    if strategy_type == "rsi_scalp":
+        stop_mode = str(settings.get("rsi_stop_mode", "standard_atr"))
+        parts = [
+            f"RSI length {int(settings.get('rsi_length', 14))}",
+            f"arm at RSI {float(settings.get('rsi_oversold', 30)):.0f} or a {float(settings.get('rsi_decline_points', 40)):.0f}-point drop",
+            f"buy after a {float(settings.get('rsi_rebound_points', 3)):.0f}-point rebound",
+            f"sell after a {float(settings.get('rsi_sell_recovery_points', 35)):.0f}-point recovery or RSI {float(settings.get('rsi_overbought', 70)):.0f}",
+            f"stop protection {stop_mode.replace('_', ' ')}",
+            (
+                f"maximum hold {int(settings.get('rsi_max_holding_bars', 100))} bars"
+                if settings.get("rsi_max_holding_enabled", True)
+                else "maximum hold off"
+            ),
+        ]
+        if stop_mode == "standard_atr":
+            parts.append(f"stop {float(settings['atr_stop_multiplier']):.2f}x ATR")
+        elif stop_mode == "emergency_atr":
+            parts.append(f"emergency stop {float(settings.get('rsi_emergency_atr_multiplier', 5.0)):.2f}x ATR")
+        return "; ".join(parts)
     parts = []
     if strategy_type != "pullback":
         parts.append(f"buy lookback {int(settings['entry_window'])}")
@@ -1201,7 +1304,29 @@ def _parameter_range_text(strategy_type: str, ranges: dict[str, tuple[float, flo
         "moving_average_window": "trend filter",
         "pullback_average_length": "pullback average",
         "momentum_turn_length": "momentum turn",
+        "rsi_length": "RSI length",
+        "rsi_oversold": "oversold level",
+        "rsi_overbought": "overbought cap",
+        "rsi_decline_points": "arming drop",
+        "rsi_rebound_points": "buy rebound",
+        "rsi_sell_recovery_points": "sell recovery",
+        "rsi_swing_lookback": "RSI lookback",
+        "rsi_max_holding_bars": "maximum hold",
     }
+    if strategy_type == "rsi_scalp":
+        keys = [
+            "rsi_length", "rsi_oversold", "rsi_decline_points", "rsi_rebound_points",
+            "rsi_sell_recovery_points", "rsi_overbought", "rsi_swing_lookback",
+            "rsi_max_holding_bars", "atr_stop_multiplier",
+        ]
+        parts = []
+        for key in keys:
+            if key not in ranges:
+                continue
+            low, high = ranges[key]
+            number = lambda value: f"{value:.2f}" if key == "atr_stop_multiplier" else f"{value:.0f}"
+            parts.append(f"{labels[key]} {number(low)}-{number(high)}")
+        return "; ".join(parts) if parts else "Not available"
     keys = ["exit_window", "atr_stop_multiplier", "moving_average_window"]
     if strategy_type != "pullback":
         keys.insert(0, "entry_window")
@@ -1494,12 +1619,16 @@ def _parameter_plateau_range(
         and _settings_distance(best.settings, row.settings) <= 2.5
     ] or [best]
     keys = (
-        "entry_window",
-        "exit_window",
-        "atr_stop_multiplier",
-        "moving_average_window",
-        "pullback_average_length",
-        "momentum_turn_length",
+        (
+            "rsi_length", "rsi_oversold", "rsi_overbought", "rsi_decline_points",
+            "rsi_rebound_points", "rsi_sell_recovery_points", "rsi_swing_lookback",
+            "rsi_max_holding_bars", "atr_stop_multiplier",
+        )
+        if best.strategy_type == "rsi_scalp"
+        else (
+            "entry_window", "exit_window", "atr_stop_multiplier", "moving_average_window",
+            "pullback_average_length", "momentum_turn_length",
+        )
     )
     return {
         key: (
@@ -1915,6 +2044,17 @@ def _normal_settings(settings: dict[str, Any]) -> dict[str, Any]:
         "pullback_average_length": int(settings.get("pullback_average_length", 20)),
         "momentum_turn_length": int(settings.get("momentum_turn_length", 10)),
         "rsi_entry_filter_enabled": bool(settings.get("rsi_entry_filter_enabled", False)),
+        "rsi_length": int(settings.get("rsi_length", 14)),
+        "rsi_oversold": float(settings.get("rsi_oversold", 30.0)),
+        "rsi_overbought": float(settings.get("rsi_overbought", 70.0)),
+        "rsi_decline_points": float(settings.get("rsi_decline_points", 40.0)),
+        "rsi_rebound_points": float(settings.get("rsi_rebound_points", 3.0)),
+        "rsi_sell_recovery_points": float(settings.get("rsi_sell_recovery_points", 35.0)),
+        "rsi_swing_lookback": int(settings.get("rsi_swing_lookback", 24)),
+        "rsi_stop_mode": str(settings.get("rsi_stop_mode", "standard_atr")),
+        "rsi_emergency_atr_multiplier": float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
+        "rsi_max_holding_enabled": bool(settings.get("rsi_max_holding_enabled", True)),
+        "rsi_max_holding_bars": int(settings.get("rsi_max_holding_bars", 100)),
     }
 
 
@@ -1927,6 +2067,17 @@ def _settings_distance(base: dict[str, Any], row: dict[str, Any]) -> float:
         abs(row["pullback_average_length"] - base["pullback_average_length"]) / 20,
         abs(row["momentum_turn_length"] - base["momentum_turn_length"]) / 5,
         1.0 if row.get("rsi_entry_filter_enabled", False) != base.get("rsi_entry_filter_enabled", False) else 0.0,
+        abs(row.get("rsi_length", 14) - base.get("rsi_length", 14)) / 7,
+        abs(row.get("rsi_oversold", 30.0) - base.get("rsi_oversold", 30.0)) / 5,
+        abs(row.get("rsi_overbought", 70.0) - base.get("rsi_overbought", 70.0)) / 5,
+        abs(row.get("rsi_decline_points", 40.0) - base.get("rsi_decline_points", 40.0)) / 10,
+        abs(row.get("rsi_rebound_points", 3.0) - base.get("rsi_rebound_points", 3.0)) / 2,
+        abs(row.get("rsi_sell_recovery_points", 35.0) - base.get("rsi_sell_recovery_points", 35.0)) / 5,
+        abs(row.get("rsi_swing_lookback", 24) - base.get("rsi_swing_lookback", 24)) / 12,
+        1.0 if row.get("rsi_stop_mode", "standard_atr") != base.get("rsi_stop_mode", "standard_atr") else 0.0,
+        abs(row.get("rsi_emergency_atr_multiplier", 5.0) - base.get("rsi_emergency_atr_multiplier", 5.0)),
+        1.0 if row.get("rsi_max_holding_enabled", True) != base.get("rsi_max_holding_enabled", True) else 0.0,
+        abs(row.get("rsi_max_holding_bars", 100) - base.get("rsi_max_holding_bars", 100)) / 50,
     )
     return float(sum(distances))
 
@@ -1938,6 +2089,8 @@ def _warmup_bars(settings: dict[str, Any]) -> int:
         int(settings.get("moving_average_window", 50)),
         int(settings.get("pullback_average_length", 20)),
         int(settings.get("momentum_turn_length", 10)),
+        int(settings.get("rsi_length", 14)),
+        int(settings.get("rsi_swing_lookback", 24)),
         14,
     ) + 4
 

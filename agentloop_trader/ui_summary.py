@@ -148,7 +148,44 @@ def setup_scorecard_records(
     blocks = [reason for reason in (blocked_reasons or []) if reason]
     enabled = enabled_inputs or {}
 
-    if setup_type in {"trendline", "trendline_retest"}:
+    if setup_type == "rsi_scalp":
+        setup_ready = signal == "long"
+        setup_armed = bool(live.get("rsi_setup_armed")) or setup_ready
+        rebound = _as_float(live.get("rsi_rebound_points"))
+        required_rebound = _as_float(live.get("required_rsi_rebound_points")) or 3.0
+        price_turn = bool(live.get("last_p") and live.get("prior_p") and _as_float(live.get("last_p")) > _as_float(live.get("prior_p")))
+        requirements = list((live.get("buy_requirements") or {}).values())
+        if len(requirements) >= 3:
+            setup_armed, rebound_ok, price_turn = bool(requirements[0]), bool(requirements[1]), bool(requirements[2])
+        else:
+            rebound_ok = rebound >= required_rebound
+        core_rows = [
+            {
+                "Read": "RSI setup",
+                "Status": "Armed" if setup_armed else "Waiting",
+                "Plain English": (
+                    f"The setup low is RSI {float(live.get('rsi_setup_low')):.1f}."
+                    if setup_armed and live.get("rsi_setup_low") is not None
+                    else "RSI has not reached the arm level or fallen far enough from its recent high."
+                ),
+            },
+            {
+                "Read": "RSI rebound",
+                "Status": "Yes" if rebound_ok else "No",
+                "Plain English": f"RSI has rebounded {rebound:.1f} points from the setup low; {required_rebound:g} are required.",
+            },
+            {
+                "Read": "Price turn",
+                "Status": "Yes" if price_turn else "No",
+                "Plain English": "Price closed above the prior completed bar." if price_turn else "Price has not closed above the prior completed bar.",
+            },
+            {
+                "Read": "Risk approval",
+                "Status": "Passed" if risk_approved and not blocks else "Blocked",
+                "Plain English": "Risk checks allow this idea." if risk_approved and not blocks else (blocks[0] if blocks else "Risk checks do not allow this idea."),
+            },
+        ]
+    elif setup_type in {"trendline", "trendline_retest"}:
         trendline_level = _as_float(live.get("trendline_level"))
         trendline_break = bool(live.get("trendline_break"))
         retest_ready = bool(live.get("retest_ready"))
@@ -233,7 +270,11 @@ def setup_scorecard_records(
             },
         ]
 
-    grade = _setup_grade(setup_ready=setup_ready, trend_ok=trend_ok, risk_ok=risk_approved and not blocks)
+    grade = _setup_grade(
+        setup_ready=setup_ready,
+        trend_ok=True if setup_type == "rsi_scalp" else trend_ok,
+        risk_ok=risk_approved and not blocks,
+    )
     rows = [
         {
             "Read": "Overall",
@@ -436,6 +477,7 @@ def position_exit_plan_records(
             {"Field": "Current Exit Check", "Value": exit_reason or "No saved exit settings for this position."},
         ]
     strategy = str(settings.get("strategy_label") or settings.get("strategy_type") or "Unknown")
+    strategy_type = str(settings.get("strategy_type", ""))
     rows = [
         {"Field": "Exit Strategy", "Value": strategy},
         {"Field": "Auto Exit", "Value": "On" if settings.get("auto_exit_enabled", True) else "Off"},
@@ -444,16 +486,45 @@ def position_exit_plan_records(
             "Value": _money(exit_trigger_price) if exit_trigger_price else "Not available",
         },
         {"Field": "Price Interval", "Value": str(settings.get("interval", "Not saved"))},
-        {"Field": "Sell Exit Length", "Value": _bars(settings.get("exit_window"))},
         {"Field": "ATR Stop Distance", "Value": str(settings.get("atr_stop_multiplier", "Not saved"))},
-        {"Field": "Trend Filter Length", "Value": _bars(settings.get("moving_average_window"))},
-        {"Field": "Pullback Average Length", "Value": _bars(settings.get("pullback_average_length"))},
-        {"Field": "Momentum Turn Length", "Value": _bars(settings.get("momentum_turn_length"))},
+    ]
+    if strategy_type == "rsi_scalp":
+        rows.extend([
+            {"Field": "RSI Length", "Value": _bars(settings.get("rsi_length"))},
+            {"Field": "RSI Setup Low At Entry", "Value": str(settings.get("entry_rsi_setup_low", "Not recorded"))},
+            {"Field": "Sell After RSI Recovery", "Value": f"{settings.get('rsi_sell_recovery_points', 35)} points"},
+            {"Field": "RSI Sell Cap", "Value": str(settings.get("rsi_overbought", 70))},
+            {"Field": "Stop Protection", "Value": str(settings.get("rsi_stop_mode", "standard_atr")).replace("_", " ").title()},
+            {
+                "Field": "Emergency Stop Distance",
+                "Value": (
+                    f"{settings.get('rsi_emergency_atr_multiplier', 5.0)} ATR"
+                    if settings.get("rsi_stop_mode") == "emergency_atr"
+                    else "Not used"
+                ),
+            },
+            {
+                "Field": "Maximum Holding Period",
+                "Value": (
+                    _bars(settings.get("rsi_max_holding_bars", 100))
+                    if settings.get("rsi_max_holding_enabled", True)
+                    else "Off"
+                ),
+            },
+        ])
+    else:
+        rows.extend([
+            {"Field": "Sell Exit Length", "Value": _bars(settings.get("exit_window"))},
+            {"Field": "Trend Filter Length", "Value": _bars(settings.get("moving_average_window"))},
+            {"Field": "Pullback Average Length", "Value": _bars(settings.get("pullback_average_length"))},
+            {"Field": "Momentum Turn Length", "Value": _bars(settings.get("momentum_turn_length"))},
+        ])
+    rows.extend([
         {"Field": "Move Stop To Break-Even After", "Value": f"+{settings.get('breakeven_after_r', 1.0)}R"},
         {"Field": "Start ATR Trail After", "Value": f"+{settings.get('trail_after_r', 2.0)}R"},
         {"Field": "Trailing ATR Distance", "Value": str(settings.get("trailing_atr_multiplier", "Not saved"))},
         {"Field": "Current Exit Check", "Value": "Exit now" if exit_ready else (exit_reason or "Hold")},
-    ]
+    ])
     return rows
 
 
@@ -715,6 +786,8 @@ def _grade_detail(grade: str, setup_type: str, blocks: list[str]) -> str:
         strategy = "trendline retest"
     elif setup_type == "trendline":
         strategy = "trendline breakout"
+    elif setup_type == "rsi_scalp":
+        strategy = "RSI mean-reversion scalp"
     else:
         strategy = "breakout"
     return f"No clean {strategy} setup right now."

@@ -164,6 +164,32 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
         {"Area": "Strategy", "Input": "Pullback average length", "Saved Value": number("pullback_average_length", " bars")},
         {"Area": "Strategy", "Input": "Momentum turn length", "Saved Value": number("momentum_turn_length", " bars")},
         {"Area": "Strategy", "Input": "RSI 50-70 BUY rule", "Saved Value": yes_no(settings.get("rsi_entry_filter_enabled", False))},
+        {"Area": "RSI scalp", "Input": "RSI length", "Saved Value": number("rsi_length", " bars")},
+        {"Area": "RSI scalp", "Input": "Arm at or below RSI", "Saved Value": number("rsi_oversold")},
+        {"Area": "RSI scalp", "Input": "Arm after RSI decline", "Saved Value": number("rsi_decline_points", " points")},
+        {"Area": "RSI scalp", "Input": "Buy after RSI rebound", "Saved Value": number("rsi_rebound_points", " points")},
+        {"Area": "RSI scalp", "Input": "Sell after RSI recovery", "Saved Value": number("rsi_sell_recovery_points", " points")},
+        {"Area": "RSI scalp", "Input": "RSI sell cap", "Saved Value": number("rsi_overbought")},
+        {"Area": "RSI scalp", "Input": "RSI swing lookback", "Saved Value": number("rsi_swing_lookback", " bars")},
+        {"Area": "RSI scalp", "Input": "Stop protection", "Saved Value": str(settings.get("rsi_stop_mode", "standard_atr")).replace("_", " ").title()},
+        {
+            "Area": "RSI scalp",
+            "Input": "Emergency stop distance",
+            "Saved Value": (
+                number("rsi_emergency_atr_multiplier", " ATR")
+                if settings.get("rsi_stop_mode") == "emergency_atr"
+                else "Not used"
+            ),
+        },
+        {
+            "Area": "RSI scalp",
+            "Input": "Maximum holding period",
+            "Saved Value": (
+                number("rsi_max_holding_bars", " bars")
+                if settings.get("rsi_max_holding_enabled", True)
+                else "Off"
+            ),
+        },
         {"Area": "Risk", "Input": "Allowed symbols", "Saved Value": ", ".join(limits.get("allowed_symbols") or ()) or "Any"},
         {"Area": "Risk", "Input": "Max risk per trade", "Saved Value": risk_number("max_risk_per_trade_pct", "%")},
         {"Area": "Risk", "Input": "Max new order size", "Saved Value": risk_number("max_position_notional_pct", "%")},

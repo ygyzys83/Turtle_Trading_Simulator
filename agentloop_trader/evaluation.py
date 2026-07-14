@@ -102,8 +102,19 @@ def evaluate_walk_forward(
     pullback_w: int = 20,
     momentum_w: int = 10,
     rsi_entry_filter_enabled: bool = False,
+    rsi_length: int = 14,
+    rsi_oversold: float = 30.0,
+    rsi_overbought: float = 70.0,
+    rsi_decline_points: float = 40.0,
+    rsi_rebound_points: float = 3.0,
+    rsi_sell_recovery_points: float = 35.0,
+    rsi_swing_lookback: int = 24,
+    rsi_stop_mode: str = "standard_atr",
+    rsi_emergency_atr_multiplier: float = 5.0,
+    rsi_max_holding_enabled: bool = True,
+    rsi_max_holding_bars: int = 100,
 ) -> WalkForwardResult:
-    warmup_bars = max(entry_w, exit_w, ma_w, pullback_w, momentum_w, 14) + 4
+    warmup_bars = max(entry_w, exit_w, ma_w, pullback_w, momentum_w, rsi_length, rsi_swing_lookback, 14) + 4
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=seed)
     if market_data is not None:
         data.attrs["symbol"] = getattr(market_data, "attrs", {}).get("symbol", "MARKET")
@@ -128,6 +139,17 @@ def evaluate_walk_forward(
         "pullback_average_length": pullback_w,
         "momentum_turn_length": momentum_w,
         "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+        "rsi_length": rsi_length,
+        "rsi_oversold": rsi_oversold,
+        "rsi_overbought": rsi_overbought,
+        "rsi_decline_points": rsi_decline_points,
+        "rsi_rebound_points": rsi_rebound_points,
+        "rsi_sell_recovery_points": rsi_sell_recovery_points,
+        "rsi_swing_lookback": rsi_swing_lookback,
+        "rsi_stop_mode": rsi_stop_mode,
+        "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
+        "rsi_max_holding_enabled": rsi_max_holding_enabled,
+        "rsi_max_holding_bars": rsi_max_holding_bars,
     }
     train_trade_log = _run_one(strategy_type, train_data, settings, account, risk_limits)["trade_log"]
     train_stats = _closed_trade_stats(

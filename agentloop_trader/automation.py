@@ -84,6 +84,17 @@ def strategy_settings_match(current: dict | None, entry: dict | None) -> bool:
         "moving_average_window",
         "pullback_average_length",
         "momentum_turn_length",
+        "rsi_length",
+        "rsi_oversold",
+        "rsi_overbought",
+        "rsi_decline_points",
+        "rsi_rebound_points",
+        "rsi_sell_recovery_points",
+        "rsi_swing_lookback",
+        "rsi_stop_mode",
+        "rsi_emergency_atr_multiplier",
+        "rsi_max_holding_enabled",
+        "rsi_max_holding_bars",
     ]
     return all(str(current.get(key, "")).strip().lower() == str(entry.get(key, "")).strip().lower() for key in keys)
 

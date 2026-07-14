@@ -371,6 +371,7 @@ def _send_entry(
 
     order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
     settings = dict(control.strategy_settings)
+    live = result.get("live", {})
     settings.update({
         "symbol": intent.symbol_clean,
         "asset_class": intent.asset_class,
@@ -386,6 +387,18 @@ def _send_entry(
         "planned_limit_price": intent.limit_price,
         "planned_quantity": intent.quantity,
         "auto_exit_enabled": True,
+        "entry_rsi": live.get("rsi"),
+        "entry_rsi_setup_low": live.get("rsi_setup_low") if live.get("rsi_setup_low") is not None else live.get("rsi"),
+        "entry_rsi_sell_level": (
+            live.get("rsi_sell_level")
+            if live.get("rsi_sell_level") is not None
+            else min(
+                float(settings.get("rsi_overbought", 70.0)),
+                float(live.get("rsi")) + float(settings.get("rsi_sell_recovery_points", 35.0)),
+            )
+            if str(settings.get("strategy_type", "")) == "rsi_scalp" and live.get("rsi") is not None
+            else None
+        ),
     })
     tracked_orders = list(tracked_orders)
     tracked_orders.append(_track_broker_order(order, preview.preview_hash, settings))

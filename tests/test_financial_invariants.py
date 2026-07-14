@@ -3,6 +3,7 @@ import math
 from agentloop_trader.backtest import (
     _profit_protection_stop,
     _protective_stop_fill,
+    simulate_rsi_mean_reversion_strategy,
     simulate_trend_pullback_strategy,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
@@ -26,6 +27,9 @@ def test_all_strategy_trade_rows_reconcile_and_obey_risk_caps():
         simulate_trend_pullback_strategy(account, 20, 10, 2.0, 0.01, 50, 5, seed=42, risk_limits=limits),
         simulate_trendline_breakout_strategy(account, 20, 10, 2.0, 0.01, 50, seed=42, risk_limits=limits),
         simulate_trendline_retest_strategy(account, 20, 10, 2.0, 0.01, 50, 5, seed=42, risk_limits=limits),
+        simulate_rsi_mean_reversion_strategy(
+            account, 2.0, 0.01, rsi_decline_points=25, seed=42, risk_limits=limits,
+        ),
     ]
 
     for result in results:

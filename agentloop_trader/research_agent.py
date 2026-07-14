@@ -147,7 +147,7 @@ def build_research_agent_report(
         {
             "Area": "Best current fit across all strategies",
             "Read": best.strategy,
-            "Plain English": f"The app compared all four strategies using the current inputs. {best.reason}",
+            "Plain English": f"The app compared all five strategies using the current inputs. {best.reason}",
         },
         {"Area": "Trend", "Read": trend, "Plain English": trend_detail},
         {"Area": "Setup", "Read": overall, "Plain English": setup_detail},

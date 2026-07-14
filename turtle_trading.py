@@ -42,6 +42,7 @@ from agentloop_trader.automation_runtime import (
     worker_status_records,
 )
 from agentloop_trader.backtest import (
+    simulate_rsi_mean_reversion_strategy,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
     simulate_trend_pullback_strategy,
@@ -105,6 +106,7 @@ from agentloop_trader.fees import (
     estimate_alpaca_order_fees,
     estimate_alpaca_round_trip_fees,
 )
+from agentloop_trader.indicators import calc_rsi
 from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
 from agentloop_trader.market_data import (
@@ -268,6 +270,17 @@ def run_strategy_suite(
     risk_limits,
     data_identity,
     rsi_entry_filter_enabled,
+    rsi_length,
+    rsi_oversold,
+    rsi_overbought,
+    rsi_decline_points,
+    rsi_rebound_points,
+    rsi_sell_recovery_points,
+    rsi_swing_lookback,
+    rsi_stop_mode,
+    rsi_emergency_atr_multiplier,
+    rsi_max_holding_enabled,
+    rsi_max_holding_bars,
 ):
     """Cache deterministic backtests while the completed price bars are unchanged."""
     _ = data_identity
@@ -321,7 +334,87 @@ def run_strategy_suite(
         risk_limits=risk_limits,
         rsi_entry_filter_enabled=rsi_entry_filter_enabled,
     )
-    return breakout, pullback, trendline, retest
+    rsi_scalp = simulate_rsi_mean_reversion_strategy(
+        account=account,
+        atr_mult=atr_mult,
+        risk_pct_dec=risk_dec,
+        rsi_length=rsi_length,
+        rsi_oversold=rsi_oversold,
+        rsi_overbought=rsi_overbought,
+        rsi_decline_points=rsi_decline_points,
+        rsi_rebound_points=rsi_rebound_points,
+        rsi_sell_recovery_points=rsi_sell_recovery_points,
+        rsi_swing_lookback=rsi_swing_lookback,
+        rsi_stop_mode=rsi_stop_mode,
+        rsi_emergency_atr_multiplier=rsi_emergency_atr_multiplier,
+        rsi_max_holding_enabled=rsi_max_holding_enabled,
+        rsi_max_holding_bars=rsi_max_holding_bars,
+        seed=seed,
+        market_data=market_data,
+        risk_limits=risk_limits,
+    )
+    return breakout, pullback, trendline, retest, rsi_scalp
+
+
+@st.cache_data(ttl=3600, max_entries=12, show_spinner=False)
+def run_rsi_stop_mode_comparison(
+    account,
+    atr_mult,
+    emergency_atr_mult,
+    risk_dec,
+    market_data,
+    risk_limits,
+    data_identity,
+    rsi_length,
+    rsi_oversold,
+    rsi_overbought,
+    rsi_decline_points,
+    rsi_rebound_points,
+    rsi_sell_recovery_points,
+    rsi_swing_lookback,
+    rsi_max_holding_enabled,
+    rsi_max_holding_bars,
+):
+    """Compare stop modes on already-loaded bars; never fetch price data here."""
+    _ = data_identity
+    labels = {
+        "standard_atr": "Standard ATR stop",
+        "emergency_atr": "Emergency ATR stop",
+        "no_price_stop": "No price stop",
+    }
+    rows = []
+    for mode, label in labels.items():
+        result = simulate_rsi_mean_reversion_strategy(
+            account=account,
+            atr_mult=atr_mult,
+            risk_pct_dec=risk_dec,
+            rsi_length=rsi_length,
+            rsi_oversold=rsi_oversold,
+            rsi_overbought=rsi_overbought,
+            rsi_decline_points=rsi_decline_points,
+            rsi_rebound_points=rsi_rebound_points,
+            rsi_sell_recovery_points=rsi_sell_recovery_points,
+            rsi_swing_lookback=rsi_swing_lookback,
+            rsi_stop_mode=mode,
+            rsi_emergency_atr_multiplier=emergency_atr_mult,
+            rsi_max_holding_enabled=rsi_max_holding_enabled,
+            rsi_max_holding_bars=rsi_max_holding_bars,
+            market_data=market_data,
+            risk_limits=risk_limits,
+        )
+        stats = result[5]
+        rows.append({
+            "Stop Protection": label,
+            "Allocated Return": f"{stats.get('allocated_return_pct', stats.get('return_pct', 0)):.2f}%",
+            "Trades": stats.get("total_trades", 0),
+            "Win Rate": f"{stats.get('win_rate', 0):.0f}%",
+            "Allocated Worst Drop": f"{stats.get('allocated_max_drawdown_pct', stats.get('max_drawdown_pct', 0)):.2f}%",
+            "Profit Factor": f"{stats.get('profit_factor', 0):.2f}x",
+            "Time In Trade": f"{stats.get('exposure_pct', 0):.2f}%",
+            "Sizing": "Ticker allocation" if mode == "no_price_stop" else "Risk to stop",
+            "Automation": "Backtest only" if mode == "no_price_stop" else "Available",
+        })
+    return rows
 
 
 def metric_card(col, label, value, sub, color_class=""):
@@ -739,7 +832,7 @@ def plain_setting_name(key: str) -> str:
 
 def entry_snapshot_records(settings: dict | None) -> list[dict]:
     settings = settings or {}
-    return [
+    rows = [
         {"Field": "Ticker", "Value": str(settings.get("symbol", "Not recorded"))},
         {"Field": "Strategy", "Value": str(settings.get("strategy_label", settings.get("strategy_type", "Not recorded")))},
         {"Field": "Price data source", "Value": str(settings.get("price_data_source", "Not recorded"))},
@@ -770,6 +863,34 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "Planned limit price", "Value": money_or_missing(settings.get("planned_limit_price"))},
         {"Field": "Planned quantity", "Value": str(settings.get("planned_quantity", "Not recorded"))},
     ]
+    if str(settings.get("strategy_type", "")) == "rsi_scalp":
+        rows[6:6] = [
+            {"Field": "RSI length", "Value": bars_or_missing(settings.get("rsi_length"))},
+            {"Field": "Arm buy setup at or below RSI", "Value": str(settings.get("rsi_oversold", "Not recorded"))},
+            {"Field": "Arm after RSI decline", "Value": f"{settings.get('rsi_decline_points', 'Not recorded')} points"},
+            {"Field": "Buy after RSI rebound", "Value": f"{settings.get('rsi_rebound_points', 'Not recorded')} points"},
+            {"Field": "RSI at entry", "Value": str(settings.get("entry_rsi", "Not recorded"))},
+            {"Field": "RSI setup low at entry", "Value": str(settings.get("entry_rsi_setup_low", "Not recorded"))},
+            {"Field": "RSI exit level saved at entry", "Value": str(settings.get("entry_rsi_sell_level", "Not recorded"))},
+            {"Field": "Stop protection", "Value": str(settings.get("rsi_stop_mode", "standard_atr")).replace("_", " ").title()},
+            {
+                "Field": "Emergency stop distance",
+                "Value": (
+                    f"{settings.get('rsi_emergency_atr_multiplier', 5.0)} ATR"
+                    if settings.get("rsi_stop_mode") == "emergency_atr"
+                    else "Not used"
+                ),
+            },
+            {
+                "Field": "Maximum holding period",
+                "Value": (
+                    bars_or_missing(settings.get("rsi_max_holding_bars", 100))
+                    if settings.get("rsi_max_holding_enabled", True)
+                    else "Off"
+                ),
+            },
+        ]
+    return rows
 
 
 def combined_position_risk_records(position: dict, exit_trigger_price: float | None) -> list[dict]:
@@ -858,7 +979,7 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
     distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
     profit_r = optional_float(exit_details.get("profit_r"))
     highest_profit_r = optional_float(exit_details.get("highest_profit_r"))
-    return [
+    rows = [
         {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
         {"Area": "Position", "Item": "Quantity", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current position quantity held at Alpaca."},
         {"Area": "Position", "Item": "Current price", "Status / Value": money_or_missing(current_price), "Plain English": "Estimated from Alpaca market value."},
@@ -880,6 +1001,29 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
         {"Area": "Automation", "Item": "Room before exit", "Status / Value": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not available", "Plain English": "How far current price is above the active sell trigger."},
         {"Area": "Automation", "Item": "Current action", "Status / Value": "Exit now" if exit_details.get("ready") else "Hold", "Plain English": str(exit_details.get("reason", ""))},
     ]
+    if str(settings.get("strategy_type", "")) == "rsi_scalp":
+        irrelevant = {
+            "Sell exit length", "Trend filter length", "Pullback average length",
+            "Momentum turn length", "Strategy exit",
+        }
+        rows = [row for row in rows if row["Item"] not in irrelevant]
+        rsi_rows = [
+            {"Area": "RSI exit", "Item": "Current RSI", "Status / Value": str(exit_details.get("current_rsi", "Not available")), "Plain English": "Current RSI calculated from the saved price interval and RSI length."},
+            {"Area": "RSI exit", "Item": "RSI setup low at entry", "Status / Value": str(settings.get("entry_rsi_setup_low", "Not recorded")), "Plain English": "Lowest RSI reached while the saved buy setup was armed."},
+            {"Area": "RSI exit", "Item": "RSI sell level", "Status / Value": str(exit_details.get("rsi_sell_level", "Not available")), "Plain English": "Sell when current RSI reaches this level or higher."},
+            {
+                "Area": "RSI exit",
+                "Item": "Bars held",
+                "Status / Value": str(exit_details.get("bars_since_entry", "Not available")),
+                "Plain English": (
+                    f"Optional maximum: {settings.get('rsi_max_holding_bars', 100)} completed bars."
+                    if settings.get("rsi_max_holding_enabled", True)
+                    else "The optional maximum holding period is off."
+                ),
+            },
+        ]
+        rows[-3:-3] = rsi_rows
+    return rows
 
 
 def alpaca_daily_summary_records() -> list[dict]:
@@ -1134,12 +1278,14 @@ def strategy_use_case_records(selected_strategy: str) -> list[dict]:
         "Trend pullback continuation": "Best when an uptrend pauses, pulls toward a moving average, then turns back up.",
         "Trendline breakout": "Best when price breaks a descending resistance line after a controlled pullback.",
         "Trendline retest continuation": "Best when price breaks resistance, retests that line, then resumes higher.",
+        "RSI mean-reversion scalp": "Best on short intervals after RSI falls sharply and then begins a confirmed rebound.",
     }
     cautions = {
         "Breakout continuation": "Can chase extended moves if volume and volatility are poor.",
         "Trend pullback continuation": "Can enter too early if the pullback keeps falling.",
         "Trendline breakout": "Trendlines are estimated, so false breaks can happen.",
         "Trendline retest continuation": "Fewer signals; the retest may never happen.",
+        "RSI mean-reversion scalp": "Fast reversals can fail, so ATR protection remains important; the maximum holding period is optional.",
     }
     return [
         {"Strategy": name, "Best Use": descriptions[name], "Main Caution": cautions[name], "Selected": plain_yes_no(name == selected_strategy)}
@@ -1148,6 +1294,38 @@ def strategy_use_case_records(selected_strategy: str) -> list[dict]:
 
 
 def exit_model_records() -> list[dict]:
+    if strategy_type == "rsi_scalp":
+        stop_text = {
+            "standard_atr": f"Standard {atr_mult:.2f} ATR stop",
+            "emergency_atr": f"Emergency {rsi_emergency_atr_multiplier:.2f} ATR stop",
+            "no_price_stop": "No price stop - backtest only",
+        }[rsi_stop_mode]
+        return [
+            {
+                "Exit Rule": "Stop protection",
+                "Current Setting": stop_text,
+                "Plain English": "Standard and emergency modes use price protection. No price stop is research-only and sizes from ticker allocation.",
+            },
+            {
+                "Exit Rule": "RSI recovery",
+                "Current Setting": f"Setup low + {rsi_sell_recovery_points:g}, capped at RSI {rsi_overbought:g}",
+                "Plain English": "The sell level is saved from the RSI setup low that existed when the position was bought.",
+            },
+            {
+                "Exit Rule": "Maximum holding period",
+                "Current Setting": f"{rsi_max_holding_bars} bars" if rsi_max_holding_enabled else "Off",
+                "Plain English": "Optional emergency exit if neither RSI recovery nor price protection closes a stale position first.",
+            },
+            {
+                "Exit Rule": "Profit protection",
+                "Current Setting": "Off" if rsi_stop_mode == "no_price_stop" else "+1R break-even; +2R then 3.0 ATR trail",
+                "Plain English": (
+                    "No price-based stop or trailing protection is used in this research mode."
+                    if rsi_stop_mode == "no_price_stop"
+                    else "Price-based profit protection can tighten the stop before the RSI exit occurs."
+                ),
+            },
+        ]
     return [
         {
             "Exit Rule": "Initial stop",
@@ -1243,6 +1421,8 @@ def estimated_intent_risk_with_fees(trade_intent: TradeIntent | None) -> float |
 
 
 def required_setup_reads(selected_strategy_type: str, require_rsi: bool = False) -> set[str]:
+    if selected_strategy_type == "rsi_scalp":
+        return {"RSI setup", "RSI rebound", "Price turn", "Risk approval"}
     base = {"Trend", "Risk approval"}
     if require_rsi:
         base.add("RSI condition")
@@ -1444,6 +1624,9 @@ def build_chart(
     *,
     strategy_type="breakout",
     pullback_w=20,
+    rsi_length=14,
+    rsi_oversold=30.0,
+    rsi_overbought=70.0,
     market_data=None,
 ):
     x = labels
@@ -1456,11 +1639,12 @@ def build_chart(
         line=dict(color=CHART_COLORS["price"], width=1.6),
         hovertemplate="%{x}<br>Price: $%{y:.2f}<extra></extra>",
     ))
-    fig.add_trace(go.Scatter(
-        x=x, y=smas, name=f"{ma_w}-bar trend filter", mode="lines",
-        line=dict(color=CHART_COLORS["trend"], width=1.2, dash="dot"),
-        hovertemplate="%{x}<br>Trend filter: $%{y:.2f}<extra></extra>",
-    ))
+    if strategy_type != "rsi_scalp":
+        fig.add_trace(go.Scatter(
+            x=x, y=smas, name=f"{ma_w}-bar trend filter", mode="lines",
+            line=dict(color=CHART_COLORS["trend"], width=1.2, dash="dot"),
+            hovertemplate="%{x}<br>Trend filter: $%{y:.2f}<extra></extra>",
+        ))
     if strategy_type == "breakout":
         entry_line = [float(np.max(highs[i - entry_w:i])) if i >= entry_w else None for i in range(len(prices))]
         exit_line = [float(np.min(lows[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
@@ -1485,19 +1669,29 @@ def build_chart(
             x=x, y=exit_line, name=f"{exit_w}-bar exit average", mode="lines",
             line=dict(color=CHART_COLORS["exit"], width=1.1, dash="dash"),
         ))
-    else:
+    elif strategy_type != "rsi_scalp":
         exit_line = [float(np.min(lows[i - exit_w:i])) if i >= exit_w else None for i in range(len(prices))]
         fig.add_trace(go.Scatter(
             x=x, y=exit_line, name=f"{exit_w}-bar exit low", mode="lines",
             line=dict(color=CHART_COLORS["exit"], width=1.1, dash="dash"),
             hovertemplate="%{x}<br>Exit low: $%{y:.2f}<extra></extra>",
         ))
-    fig.add_trace(go.Scatter(
-        x=x, y=atrs, name="ATR (14 bars)", mode="lines",
-        line=dict(color=CHART_COLORS["atr"], width=1, dash="dot"),
-        yaxis="y2",
-        hovertemplate="%{x}<br>ATR: $%{y:.2f}<extra></extra>",
-    ))
+    if strategy_type == "rsi_scalp":
+        chart_rsis = calc_rsi(prices, rsi_length)
+        fig.add_trace(go.Scatter(
+            x=x, y=chart_rsis, name=f"RSI ({rsi_length} bars)", mode="lines",
+            line=dict(color=CHART_COLORS["atr"], width=1.2), yaxis="y2",
+            hovertemplate="%{x}<br>RSI: %{y:.1f}<extra></extra>",
+        ))
+        fig.add_shape(type="line", xref="paper", yref="y2", x0=0, x1=1, y0=rsi_oversold, y1=rsi_oversold, line=dict(color=CHART_COLORS["entry"], dash="dash"), opacity=0.7)
+        fig.add_shape(type="line", xref="paper", yref="y2", x0=0, x1=1, y0=rsi_overbought, y1=rsi_overbought, line=dict(color=CHART_COLORS["sell"], dash="dash"), opacity=0.7)
+    else:
+        fig.add_trace(go.Scatter(
+            x=x, y=atrs, name="ATR (14 bars)", mode="lines",
+            line=dict(color=CHART_COLORS["atr"], width=1, dash="dot"),
+            yaxis="y2",
+            hovertemplate="%{x}<br>ATR: $%{y:.2f}<extra></extra>",
+        ))
 
     if trade_log:
         fig.add_trace(go.Scatter(
@@ -1560,7 +1754,9 @@ def build_chart(
             tickfont=dict(color=CHART_COLORS["text"]),
         ),
         yaxis2=dict(
-            tickprefix="$", overlaying="y", side="right", showgrid=False, zeroline=False,
+            tickprefix="" if strategy_type == "rsi_scalp" else "$",
+            range=[0, 100] if strategy_type == "rsi_scalp" else None,
+            overlaying="y", side="right", showgrid=False, zeroline=False,
             tickfont=dict(color=CHART_COLORS["text"]),
         ),
         plot_bgcolor=CHART_COLORS["surface"],
@@ -1945,6 +2141,26 @@ if optimizer_apply_settings:
     st.session_state["pullback_average_length_input"] = int(optimizer_apply_settings.get("pullback_average_length", 20))
     st.session_state["momentum_turn_length_input"] = int(optimizer_apply_settings.get("momentum_turn_length", 10))
     st.session_state["rsi_entry_filter_input"] = bool(optimizer_apply_settings.get("rsi_entry_filter_enabled", False))
+    st.session_state["rsi_length_input"] = int(optimizer_apply_settings.get("rsi_length", 14))
+    st.session_state["rsi_oversold_input"] = float(optimizer_apply_settings.get("rsi_oversold", 30.0))
+    st.session_state["rsi_overbought_input"] = float(optimizer_apply_settings.get("rsi_overbought", 70.0))
+    st.session_state["rsi_decline_points_input"] = float(optimizer_apply_settings.get("rsi_decline_points", 40.0))
+    st.session_state["rsi_rebound_points_input"] = float(optimizer_apply_settings.get("rsi_rebound_points", 3.0))
+    st.session_state["rsi_sell_recovery_points_input"] = float(optimizer_apply_settings.get("rsi_sell_recovery_points", 35.0))
+    st.session_state["rsi_swing_lookback_input"] = int(optimizer_apply_settings.get("rsi_swing_lookback", 24))
+    stop_mode_labels = {
+        "standard_atr": "Standard ATR stop",
+        "emergency_atr": "Emergency ATR stop",
+        "no_price_stop": "No price stop - backtest only",
+    }
+    st.session_state["rsi_stop_mode_input"] = stop_mode_labels.get(
+        str(optimizer_apply_settings.get("rsi_stop_mode", "standard_atr")), "Standard ATR stop"
+    )
+    st.session_state["rsi_emergency_atr_multiplier_input"] = float(
+        optimizer_apply_settings.get("rsi_emergency_atr_multiplier", 5.0)
+    )
+    st.session_state["rsi_max_holding_enabled_input"] = bool(optimizer_apply_settings.get("rsi_max_holding_enabled", True))
+    st.session_state["rsi_max_holding_bars_input"] = int(optimizer_apply_settings.get("rsi_max_holding_bars", 100))
 
 st.sidebar.markdown("### :material/tune: Strategy settings")
 account = st.sidebar.number_input(
@@ -1960,6 +2176,7 @@ strategy_options = {
     "Trend pullback continuation": "pullback",
     "Trendline breakout": "trendline",
     "Trendline retest continuation": "trendline_retest",
+    "RSI mean-reversion scalp": "rsi_scalp",
 }
 strategy_label = st.sidebar.selectbox(
     "Strategy type",
@@ -1969,11 +2186,29 @@ strategy_label = st.sidebar.selectbox(
     help=(
         "Choose the rule set that creates trade ideas. Breakout continuation uses prior highs. "
         "Trend pullback continuation uses a trend filter, a pullback average, and a momentum turn. "
-        "Trendline breakout and Trendline retest continuation use descending resistance lines from swing highs."
+        "Trendline breakout and Trendline retest continuation use descending resistance lines from swing highs. "
+        "RSI mean-reversion scalp buys a confirmed rebound from a sharp RSI decline and exits on RSI recovery, price protection, or an optional maximum holding period."
     ),
 )
 strategy_type = strategy_options[strategy_label]
 st.sidebar.caption("Only inputs used by the selected strategy are enabled.")
+rsi_stop_mode_options = {
+    "Standard ATR stop": "standard_atr",
+    "Emergency ATR stop": "emergency_atr",
+    "No price stop - backtest only": "no_price_stop",
+}
+rsi_stop_mode_label = st.sidebar.selectbox(
+    "Stop protection",
+    list(rsi_stop_mode_options),
+    index=0,
+    key="rsi_stop_mode_input",
+    disabled=strategy_type != "rsi_scalp",
+    help=(
+        "Used by RSI mean-reversion scalp. Standard uses the normal ATR stop. Emergency uses a wider crash stop. "
+        "No price stop exits only through RSI recovery or the optional maximum holding period and is blocked from automated orders."
+    ),
+)
+rsi_stop_mode = rsi_stop_mode_options[rsi_stop_mode_label]
 entry_w = st.sidebar.slider(
     "Buy breakout / trendline lookback (bars)",
     10,
@@ -1981,7 +2216,7 @@ entry_w = st.sidebar.slider(
     20,
     step=5,
     key="entry_window_input",
-    disabled=strategy_type == "pullback",
+    disabled=strategy_type in {"pullback", "rsi_scalp"},
     help=(
         "Breakout continuation uses this many bars to find the prior high. "
         "Trendline breakout and Trendline retest continuation use this many bars to find descending swing-high resistance."
@@ -1994,6 +2229,7 @@ exit_w = st.sidebar.slider(
     10,
     step=5,
     key="exit_window_input",
+    disabled=strategy_type == "rsi_scalp",
     help=(
         "Controls the saved strategy exit line. Breakout continuation, Trendline breakout, and Trendline retest continuation "
         "use this many bars to find the recent low exit level. Trend pullback continuation uses this many bars to calculate "
@@ -2008,11 +2244,25 @@ atr_mult = st.sidebar.number_input(
     step=0.01,
     format="%.2f",
     key="atr_stop_multiplier_input",
+    disabled=strategy_type == "rsi_scalp" and rsi_stop_mode != "standard_atr",
     help=(
         "Sets stop distance as a multiple of ATR. Example: 1.28 means 1.28x ATR, not 1.28%. "
         "Higher means a wider stop and smaller share size. Lower means a tighter stop and larger share size."
     ),
 )
+rsi_emergency_atr_multiplier = st.sidebar.number_input(
+    "Emergency stop distance (ATR multiplier)",
+    min_value=2.0,
+    max_value=10.0,
+    value=5.0,
+    step=0.25,
+    format="%.2f",
+    key="rsi_emergency_atr_multiplier_input",
+    disabled=strategy_type != "rsi_scalp" or rsi_stop_mode != "emergency_atr",
+    help="Wide crash protection for RSI mean-reversion scalp. Normal exits still come from RSI recovery or the optional maximum holding period.",
+)
+if strategy_type == "rsi_scalp" and rsi_stop_mode == "no_price_stop":
+    st.sidebar.caption("Backtest research only. Automated and signal-based paper BUY orders remain blocked without a price stop.")
 risk_pct = st.sidebar.slider(
     "Strategy risk per trade (%)",
     0.5,
@@ -2029,6 +2279,7 @@ ma_w = st.sidebar.slider(
     50,
     step=50,
     key="moving_average_window_input",
+    disabled=strategy_type == "rsi_scalp",
     help="Calculates the trend filter. The app treats the ticker as healthier when price is above this average and the average is rising.",
 )
 pullback_w = st.sidebar.slider(
@@ -2062,12 +2313,60 @@ rsi_entry_filter_enabled = st.sidebar.checkbox(
     "Require RSI 50-70 for BUY",
     value=False,
     key="rsi_entry_filter_input",
+    disabled=strategy_type == "rsi_scalp",
     help=(
         "When on, every historical and current BUY must also have 14-bar RSI between 50 and 70. "
         "This changes simulated trades, backtest results, recommendations, and automated entries. "
         "It never creates a BUY by itself and does not control exits."
     ),
 )
+rsi_length = st.sidebar.slider(
+    "RSI length (bars)", 5, 21, 14, step=1, key="rsi_length_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. This is the number of completed price bars used to calculate RSI.",
+)
+rsi_oversold = st.sidebar.slider(
+    "Arm buy setup at or below RSI", 10.0, 45.0, 30.0, step=1.0, key="rsi_oversold_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. Reaching this RSI level arms a possible buy, but the app waits for the rebound confirmation before buying.",
+)
+rsi_decline_points = st.sidebar.slider(
+    "Or arm after RSI falls (points)", 20.0, 60.0, 40.0, step=5.0, key="rsi_decline_points_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. This also arms a buy setup when RSI falls this many points from its recent high, even if RSI never reaches the absolute arm level.",
+)
+rsi_rebound_points = st.sidebar.slider(
+    "Buy after RSI rebounds (points)", 1.0, 10.0, 3.0, step=1.0, key="rsi_rebound_points_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. After a setup is armed, RSI must rise this many points from the lowest RSI reached during that setup and price must close above the prior completed bar.",
+)
+rsi_sell_recovery_points = st.sidebar.slider(
+    "Sell after RSI recovers (points)", 15.0, 50.0, 35.0, step=5.0, key="rsi_sell_recovery_points_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. The position exits when RSI rises this many points above the saved setup low, unless the RSI sell cap is reached first.",
+)
+rsi_overbought = st.sidebar.slider(
+    "RSI sell cap", 55.0, 90.0, 70.0, step=1.0, key="rsi_overbought_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. This caps the RSI recovery target so the app never waits above this RSI level to sell.",
+)
+rsi_swing_lookback = st.sidebar.slider(
+    "RSI decline lookback (bars)", 6, 60, 24, step=3, key="rsi_swing_lookback_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Used by RSI mean-reversion scalp. The app compares current RSI with the highest RSI inside this many completed bars to measure a sharp decline.",
+)
+rsi_max_holding_enabled = st.sidebar.checkbox(
+    "Use maximum holding period",
+    value=True,
+    key="rsi_max_holding_enabled_input",
+    disabled=strategy_type != "rsi_scalp",
+    help="Optional emergency exit for RSI mean-reversion scalp. Turn this off to rely only on RSI recovery and price-based protection.",
+)
+rsi_max_holding_bars = int(st.sidebar.number_input(
+    "Maximum holding period (bars)", 1, 500, 100, step=25, key="rsi_max_holding_bars_input",
+    disabled=strategy_type != "rsi_scalp" or not rsi_max_holding_enabled,
+    help="Used only when the optional maximum is on. The app exits after this many completed bars if RSI recovery and price protection have not already closed the trade.",
+))
 
 st.sidebar.markdown("### :material/shield: Risk limits")
 max_risk_limit = st.sidebar.slider(
@@ -2133,14 +2432,15 @@ max_parameter_candidates = st.sidebar.slider(
     step=4,
     help=(
         "How many nearby strategy-setting combinations to inspect. Each combination is tested twice: "
-        "once without the RSI entry rule and once requiring RSI 50-70."
+        "once without the optional RSI 50-70 rule and once with it. RSI mean-reversion scalp uses its own RSI rules instead."
     ),
 )
 run_strategy_input_search = st.sidebar.button(
     "Run Strategy Input Search",
     help=(
-        "Runs the four-strategy input search once and saves the result. For real tickers it compares daily, 4-hour, "
-        "and 1-hour data against buy-and-hold. Ordinary page refreshes do not rerun it."
+        "Runs the five-strategy input search once and saves the result. For RSI mean-reversion scalp it compares 5-minute, "
+        "15-minute, and 1-hour data. For the other strategies it compares daily, 4-hour, and 1-hour data. "
+        "Ordinary page refreshes do not rerun it."
     ),
 )
 optimizer_sidebar_status = st.sidebar.empty()
@@ -2370,7 +2670,7 @@ if market_data is not None:
     }
 
 try:
-    breakout_result, pullback_result, trendline_result, retest_result = run_strategy_suite(
+    breakout_result, pullback_result, trendline_result, retest_result, rsi_scalp_result = run_strategy_suite(
         account,
         entry_w,
         exit_w,
@@ -2384,11 +2684,23 @@ try:
         risk_limits,
         (ticker, data_source, interval, period),
         rsi_entry_filter_enabled,
+        rsi_length,
+        rsi_oversold,
+        rsi_overbought,
+        rsi_decline_points,
+        rsi_rebound_points,
+        rsi_sell_recovery_points,
+        rsi_swing_lookback,
+        rsi_stop_mode,
+        rsi_emergency_atr_multiplier,
+        rsi_max_holding_enabled,
+        rsi_max_holding_bars,
     )
     breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = breakout_result
     pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = pullback_result
     trendline_prices, trendline_smas, trendline_atrs, trendline_trade_log, trendline_live, trendline_stats, trendline_labels = trendline_result
     retest_prices, retest_smas, retest_atrs, retest_trade_log, retest_live, retest_stats, retest_labels = retest_result
+    rsi_scalp_prices, rsi_scalp_smas, rsi_scalp_atrs, rsi_scalp_trade_log, rsi_scalp_live, rsi_scalp_stats, rsi_scalp_labels = rsi_scalp_result
 except ValueError as exc:
     st.error(str(exc))
     st.stop()
@@ -2430,6 +2742,15 @@ strategy_results = {
         "stats": retest_stats,
         "labels": retest_labels,
     },
+    "RSI mean-reversion scalp": {
+        "prices": rsi_scalp_prices,
+        "smas": rsi_scalp_smas,
+        "atrs": rsi_scalp_atrs,
+        "trade_log": rsi_scalp_trade_log,
+        "live": rsi_scalp_live,
+        "stats": rsi_scalp_stats,
+        "labels": rsi_scalp_labels,
+    },
 }
 selected_strategy_result = strategy_results[strategy_label]
 prices = selected_strategy_result["prices"]
@@ -2450,9 +2771,14 @@ comparison_rows = strategy_comparison_records({
     "Trend pullback continuation": pullback_stats,
     "Trendline breakout": trendline_stats,
     "Trendline retest continuation": retest_stats,
+    "RSI mean-reversion scalp": rsi_scalp_stats,
 })
 for row in comparison_rows:
-    row["Exit Style"] = "Strategy exit + break-even + ATR trail"
+    row["Exit Style"] = (
+        "RSI recovery + maximum hold + ATR protection"
+        if row["Strategy"] == "RSI mean-reversion scalp"
+        else "Strategy exit + break-even + ATR trail"
+    )
 benchmark = None
 if market_data is not None:
     benchmark = buy_and_hold_benchmark(
@@ -2495,6 +2821,17 @@ if run_walk_forward:
             pullback_w=pullback_w,
             momentum_w=momentum_w,
             rsi_entry_filter_enabled=rsi_entry_filter_enabled,
+            rsi_length=rsi_length,
+            rsi_oversold=rsi_oversold,
+            rsi_overbought=rsi_overbought,
+            rsi_decline_points=rsi_decline_points,
+            rsi_rebound_points=rsi_rebound_points,
+            rsi_sell_recovery_points=rsi_sell_recovery_points,
+            rsi_swing_lookback=rsi_swing_lookback,
+            rsi_stop_mode=rsi_stop_mode,
+            rsi_emergency_atr_multiplier=rsi_emergency_atr_multiplier,
+            rsi_max_holding_enabled=rsi_max_holding_enabled,
+            rsi_max_holding_bars=rsi_max_holding_bars,
         )
     except ValueError as exc:
         walk_forward_error = str(exc)
@@ -2524,6 +2861,17 @@ current_strategy_settings = {
     "pullback_average_length": pullback_w,
     "momentum_turn_length": momentum_w,
     "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+    "rsi_length": rsi_length,
+    "rsi_oversold": rsi_oversold,
+    "rsi_overbought": rsi_overbought,
+    "rsi_decline_points": rsi_decline_points,
+    "rsi_rebound_points": rsi_rebound_points,
+    "rsi_sell_recovery_points": rsi_sell_recovery_points,
+    "rsi_swing_lookback": rsi_swing_lookback,
+    "rsi_stop_mode": rsi_stop_mode,
+    "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
+    "rsi_max_holding_enabled": rsi_max_holding_enabled,
+    "rsi_max_holding_bars": rsi_max_holding_bars,
     "paper_buy_order_type": paper_buy_order_style,
     "paper_buy_limit_adjustment_pct": paper_buy_limit_adjustment_pct,
     "paper_buy_custom_limit_price": paper_buy_custom_limit_price,
@@ -2641,6 +2989,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         history = str(settings.get("history", "1y"))
         saved_interval = str(settings.get("interval", "1d"))
         saved_strategy_type = str(settings.get("strategy_type", "breakout"))
+        no_price_stop = saved_strategy_type == "rsi_scalp" and str(settings.get("rsi_stop_mode", "standard_atr")) == "no_price_stop"
         saved_account = float(settings.get("account_size") or account)
         saved_exit_w = int(settings.get("exit_window") or exit_w)
         saved_atr_mult = float(settings.get("atr_stop_multiplier") or atr_mult)
@@ -2655,7 +3004,26 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             return {"ready": False, "reason": "Saved exit settings use synthetic data; auto exit needs real ticker data.", "trigger_price": None}
         saved_price_source = str(settings.get("price_data_source", "Ticker (yfinance)"))
         data = fetch_price_data_for_source(symbol, history, saved_interval, saved_price_source)
-        if saved_strategy_type == "pullback":
+        if saved_strategy_type == "rsi_scalp":
+            _, _, _, _, saved_live, _, _ = simulate_rsi_mean_reversion_strategy(
+                account=saved_account,
+                atr_mult=saved_atr_mult,
+                risk_pct_dec=saved_risk_dec,
+                rsi_length=int(settings.get("rsi_length", 14)),
+                rsi_oversold=float(settings.get("rsi_oversold", 30.0)),
+                rsi_overbought=float(settings.get("rsi_overbought", 70.0)),
+                rsi_decline_points=float(settings.get("rsi_decline_points", 40.0)),
+                rsi_rebound_points=float(settings.get("rsi_rebound_points", 3.0)),
+                rsi_sell_recovery_points=float(settings.get("rsi_sell_recovery_points", 35.0)),
+                rsi_swing_lookback=int(settings.get("rsi_swing_lookback", 24)),
+                rsi_stop_mode=str(settings.get("rsi_stop_mode", "standard_atr")),
+                rsi_emergency_atr_multiplier=float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
+                rsi_max_holding_enabled=bool(settings.get("rsi_max_holding_enabled", True)),
+                rsi_max_holding_bars=int(settings.get("rsi_max_holding_bars", 100)),
+                seed=None,
+                market_data=data,
+            )
+        elif saved_strategy_type == "pullback":
             _, _, _, _, saved_live, _, _ = simulate_trend_pullback_strategy(
                 account=saved_account,
                 pullback_w=saved_pullback_w,
@@ -2704,7 +3072,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         current_price = first_available_number(data.attrs.get("latest_price"), saved_live.get("last_p"))
         strategy_exit_price = optional_float(saved_live.get("exit_level"))
         current_atr = optional_float(saved_live.get("last_atr"))
-        profit_protection_enabled = bool(settings.get("profit_protection_enabled", True))
+        profit_protection_enabled = bool(settings.get("profit_protection_enabled", True)) and not no_price_stop
         breakeven_after_r = float(settings.get("breakeven_after_r", 1.0))
         trail_after_r = float(settings.get("trail_after_r", 2.0))
         trailing_atr_multiplier = float(settings.get("trailing_atr_multiplier", 3.0))
@@ -2738,6 +3106,9 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             if entry_reference_price is not None and current_atr is not None
             else None,
         )
+        if no_price_stop:
+            initial_risk = None
+            original_stop_price = None
         profit_r = (
             (current_price - entry_reference_price) / initial_risk
             if current_price is not None and entry_reference_price is not None and initial_risk
@@ -2745,6 +3116,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         )
         entry_time = parse_saved_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
         high_data = data.tail(1)
+        bars_since_entry = 0
         if entry_time is not None and not data.empty:
             index = data.index
             if getattr(index, "tz", None) is None:
@@ -2754,6 +3126,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             since_entry = data.loc[index >= entry_compare]
             if not since_entry.empty:
                 high_data = since_entry
+                bars_since_entry = max(0, len(since_entry) - 1)
         current_high_since_entry = optional_float(high_data["High"].max()) if "High" in high_data.columns and not high_data.empty else None
         current_high_since_entry = max(
             [value for value in (current_high_since_entry, optional_float(data.attrs.get("latest_high"))) if value is not None],
@@ -2786,7 +3159,7 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             and current_atr is not None
             else None
         )
-        saved_trigger_price = optional_float(settings.get("last_exit_trigger_price"))
+        saved_trigger_price = None if no_price_stop else optional_float(settings.get("last_exit_trigger_price"))
         trigger_candidates = [
             ("strategy exit", strategy_exit_price),
             ("fill-adjusted initial stop", original_stop_price),
@@ -2796,13 +3169,40 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         ]
         usable_triggers = [(label, price) for label, price in trigger_candidates if price is not None]
         trigger_source, trigger_price = max(usable_triggers, key=lambda item: item[1]) if usable_triggers else ("exit rule", None)
-        ready = bool(current_price is not None and trigger_price is not None and current_price <= trigger_price)
+        current_rsi = optional_float(saved_live.get("rsi"))
+        saved_setup_low = optional_float(settings.get("entry_rsi_setup_low"))
+        rsi_sell_level = (
+            min(
+                float(settings.get("rsi_overbought", 70.0)),
+                saved_setup_low + float(settings.get("rsi_sell_recovery_points", 35.0)),
+            )
+            if saved_strategy_type == "rsi_scalp" and saved_setup_low is not None
+            else None
+        )
+        rsi_exit_ready = bool(rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level)
+        max_holding_enabled = bool(settings.get("rsi_max_holding_enabled", True))
+        max_holding_bars = int(settings.get("rsi_max_holding_bars", 100))
+        time_exit_ready = bool(
+            saved_strategy_type == "rsi_scalp" and max_holding_enabled and entry_time is not None
+            and bars_since_entry >= max_holding_bars
+        )
+        price_exit_ready = bool(current_price is not None and trigger_price is not None and current_price <= trigger_price)
+        ready = price_exit_ready or rsi_exit_ready or time_exit_ready
+        if rsi_exit_ready:
+            trigger_source = "RSI recovery exit"
+        elif time_exit_ready:
+            trigger_source = "maximum holding period"
         reason = (
+            f"Exit now because RSI is {current_rsi:.1f}, at or above the saved {rsi_sell_level:.1f} exit level."
+            if rsi_exit_ready and current_rsi is not None and rsi_sell_level is not None
+            else f"Exit now because the position reached its {max_holding_bars}-bar maximum holding period."
+            if time_exit_ready
+            else
             f"Exit now because {symbol} is at or below the {trigger_source} at ${trigger_price:,.2f}."
-            if ready and trigger_price
+            if price_exit_ready and trigger_price
             else f"Hold. Auto exit will trigger if {symbol} falls to ${trigger_price:,.2f} or lower. This uses the highest active protection level."
             if trigger_price
-            else str(saved_live.get("exit_reason", "Strategy exit rule is not triggered."))
+            else str(saved_live.get("exit_reason", "The saved RSI or time exit is not triggered."))
         )
         state_changed = False
         if highest_high_since_entry is not None and highest_high_since_entry > (saved_high_since_entry or 0):
@@ -2823,6 +3223,13 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
             "highest_profit_r": highest_profit_r,
             "initial_risk": initial_risk,
             "current_atr": current_atr,
+            "current_rsi": current_rsi,
+            "rsi_sell_level": rsi_sell_level,
+            "rsi_exit_ready": rsi_exit_ready,
+            "bars_since_entry": bars_since_entry,
+            "max_holding_enabled": max_holding_enabled if saved_strategy_type == "rsi_scalp" else None,
+            "max_holding_bars": max_holding_bars if saved_strategy_type == "rsi_scalp" and max_holding_enabled else None,
+            "time_exit_ready": time_exit_ready,
             "state_changed": state_changed,
             "trigger_source": trigger_source,
             "interval": saved_interval,
@@ -2880,6 +3287,17 @@ optimizer_setting_keys = (
     "pullback_average_length",
     "momentum_turn_length",
     "rsi_entry_filter_enabled",
+    "rsi_length",
+    "rsi_oversold",
+    "rsi_overbought",
+    "rsi_decline_points",
+    "rsi_rebound_points",
+    "rsi_sell_recovery_points",
+    "rsi_swing_lookback",
+    "rsi_stop_mode",
+    "rsi_emergency_atr_multiplier",
+    "rsi_max_holding_enabled",
+    "rsi_max_holding_bars",
 )
 optimizer_market_fingerprint = "synthetic-default"
 if market_data is not None:
@@ -2930,11 +3348,14 @@ if run_strategy_input_search:
                     max_candidates_per_strategy=max_parameter_candidates,
                 )
             else:
-                interval_histories = (
-                    {"1d": "10y", "4h": "5y", "1h": "2y"}
-                    if data_source == "Ticker (Alpaca)"
-                    else {"1d": "10y", "4h": "1y", "1h": "1y"}
-                )
+                if strategy_type == "rsi_scalp" and data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}:
+                    interval_histories = {"5m": "1mo", "15m": "3mo", "1h": "1y"}
+                else:
+                    interval_histories = (
+                        {"1d": "10y", "4h": "5y", "1h": "2y"}
+                        if data_source == "Ticker (Alpaca)"
+                        else {"1d": "10y", "4h": "1y", "1h": "1y"}
+                    )
                 interval_market_data = {}
                 for search_interval, search_history in interval_histories.items():
                     try:
@@ -3062,6 +3483,9 @@ if intent is not None:
             "entry_stop_loss": intent.stop_loss,
             "entry_rule_level": optional_float(live.get("entry_level")),
             "exit_rule_level_at_entry": optional_float(live.get("exit_level")),
+            "entry_rsi": optional_float(live.get("rsi")),
+            "entry_rsi_setup_low": optional_float(live.get("rsi_setup_low")),
+            "entry_rsi_sell_level": optional_float(live.get("rsi_sell_level")),
             "planned_order_type": intent.order_type,
             "planned_limit_price": intent.limit_price,
             "planned_quantity": intent.quantity,
@@ -3642,7 +4066,11 @@ def render_current_setup_watchlist_action() -> None:
         None,
     )
     action_cols = st.columns([1, 1, 2])
-    add_watch_disabled = data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"} or ticker.strip().upper() == "SYNTH"
+    add_watch_disabled = (
+        data_source not in {"Ticker (Alpaca)", "Crypto (Alpaca)"}
+        or ticker.strip().upper() == "SYNTH"
+        or (strategy_type == "rsi_scalp" and rsi_stop_mode == "no_price_stop")
+    )
     if action_cols[0].button(
         "Add or Update Buy Setup",
         disabled=add_watch_disabled,
@@ -3674,7 +4102,9 @@ def render_current_setup_watchlist_action() -> None:
             st.error(str(exc))
     action_cols[1].markdown(f"**Saved setups:** {len(watchlist_plans)}/{MAX_BUY_WATCHLIST_ITEMS}")
     action_cols[2].caption("After saving, open Positions & Queue to review, pause, repeat, or remove this setup.")
-    if add_watch_disabled:
+    if strategy_type == "rsi_scalp" and rsi_stop_mode == "no_price_stop":
+        st.caption("No price stop is backtest research only, so this setup cannot be added to the automated BUY queue.")
+    elif add_watch_disabled:
         st.caption("Select Alpaca stock or crypto price data before saving an automatic BUY setup.")
 
 
@@ -3909,10 +4339,16 @@ def render_open_positions_panel() -> None:
 
     with st.form(f"exit_settings_{selected_position_symbol}"):
         st.markdown("#### Edit exit settings")
-        st.caption(
-            f"Exit interval: {selected_exit_interval}. "
-            f"Sell exit length uses {selected_exit_interval} bars, so {selected_exit_window} bars means {selected_exit_window} bars on the {selected_exit_interval} chart."
-        )
+        if str(selected_exit_settings.get("strategy_type", "")) == "rsi_scalp":
+            st.caption(
+                f"Exit interval: {selected_exit_interval}. RSI uses completed {selected_exit_interval} bars. "
+                + ("The optional maximum holding period uses the same bars." if selected_exit_settings.get("rsi_max_holding_enabled", True) else "The maximum holding period is off.")
+            )
+        else:
+            st.caption(
+                f"Exit interval: {selected_exit_interval}. "
+                f"Sell exit length uses {selected_exit_interval} bars, so {selected_exit_window} bars means {selected_exit_window} bars on the {selected_exit_interval} chart."
+            )
         exit_auto_enabled = st.checkbox(
             "Auto exit this position",
             value=bool(selected_exit_settings.get("auto_exit_enabled", True)),
@@ -3923,6 +4359,7 @@ def render_open_positions_panel() -> None:
             "Trend pullback continuation": "pullback",
             "Trendline breakout": "trendline",
             "Trendline retest continuation": "trendline_retest",
+            "RSI mean-reversion scalp": "rsi_scalp",
         }
         default_exit_strategy = str(selected_exit_settings.get("strategy_type", strategy_type))
         default_exit_strategy_label = next(
@@ -4030,6 +4467,41 @@ def render_open_positions_panel() -> None:
             key=f"exit_momentum_length_{selected_position_symbol}",
             help="Used by Trend pullback continuation and Trendline retest continuation to confirm price turned back up.",
         )
+        edited_rsi_length = int(selected_exit_settings.get("rsi_length", 14))
+        edited_rsi_recovery = float(selected_exit_settings.get("rsi_sell_recovery_points", 35.0))
+        edited_rsi_sell_cap = float(selected_exit_settings.get("rsi_overbought", 70.0))
+        edited_rsi_max_hold_enabled = bool(selected_exit_settings.get("rsi_max_holding_enabled", True))
+        edited_rsi_max_hold = int(selected_exit_settings.get("rsi_max_holding_bars", 100))
+        if edited_exit_strategy_type == "rsi_scalp":
+            st.markdown("#### RSI mean-reversion exit")
+            edited_rsi_max_hold_enabled = st.checkbox(
+                "Use maximum holding period",
+                value=edited_rsi_max_hold_enabled,
+                key=f"exit_rsi_max_hold_enabled_{selected_position_symbol}",
+                help="Optional emergency exit if RSI recovery and price protection have not already closed this position.",
+            )
+            rsi_exit_cols = st.columns(4)
+            edited_rsi_length = rsi_exit_cols[0].slider(
+                "RSI length", 5, 21, edited_rsi_length, step=1,
+                key=f"exit_rsi_length_{selected_position_symbol}",
+                help="Calculates the current RSI used by RSI mean-reversion scalp exits.",
+            )
+            edited_rsi_recovery = rsi_exit_cols[1].slider(
+                "Sell after RSI recovery", 15.0, 50.0, edited_rsi_recovery, step=5.0,
+                key=f"exit_rsi_recovery_{selected_position_symbol}",
+                help="Sell when RSI rises this many points above the RSI setup low saved at entry.",
+            )
+            edited_rsi_sell_cap = rsi_exit_cols[2].slider(
+                "RSI sell cap", 55.0, 90.0, edited_rsi_sell_cap, step=1.0,
+                key=f"exit_rsi_sell_cap_{selected_position_symbol}",
+                help="The RSI recovery exit will never wait above this level.",
+            )
+            edited_rsi_max_hold = int(rsi_exit_cols[3].number_input(
+                "Maximum hold", 1, 500, edited_rsi_max_hold, step=25,
+                key=f"exit_rsi_max_hold_{selected_position_symbol}",
+                disabled=not edited_rsi_max_hold_enabled,
+                help=f"Exit after this many completed {selected_exit_interval} bars if the position is still open.",
+            ))
         save_exit_settings = st.form_submit_button("Save Exit Settings For This Position")
 
     if save_exit_settings:
@@ -4043,6 +4515,11 @@ def render_open_positions_panel() -> None:
             "moving_average_window": edited_trend_filter,
             "pullback_average_length": edited_pullback_length,
             "momentum_turn_length": edited_momentum_length,
+            "rsi_length": edited_rsi_length,
+            "rsi_sell_recovery_points": edited_rsi_recovery,
+            "rsi_overbought": edited_rsi_sell_cap,
+            "rsi_max_holding_enabled": edited_rsi_max_hold_enabled,
+            "rsi_max_holding_bars": edited_rsi_max_hold,
             "auto_exit_enabled": exit_auto_enabled,
             "profit_protection_enabled": profit_protection_enabled,
             "breakeven_after_r": edited_breakeven_after_r,
@@ -4163,8 +4640,17 @@ def render_manual_order_form() -> None:
             help="Saves the current interval, exit strategy, ATR stop, break-even rule, and trailing-stop settings for the worker.",
         )
         size_cols[2].metric("Current ATR", money_or_missing(current_atr))
+        exit_plan_text = (
+            (
+                f"RSI recovery or optional {rsi_max_holding_bars}-bar maximum hold"
+                if rsi_max_holding_enabled
+                else "RSI recovery with no maximum holding period"
+            )
+            if strategy_type == "rsi_scalp"
+            else f"sell exit length {exit_w}"
+        )
         st.caption(
-            f"Exit plan: {strategy_label} on {interval} bars, sell exit length {exit_w}. "
+            f"Exit plan: {strategy_label} on {interval} bars, {exit_plan_text}. "
             f"Automatic exit is {'on' if manual_auto_exit else 'off'}."
         )
 
@@ -4277,6 +4763,12 @@ def render_manual_order_form() -> None:
                 broker_order_id = str(getattr(submitted_order, "id", ""))
                 manual_exit_settings = {
                     **current_exit_settings,
+                    "rsi_stop_mode": (
+                        "standard_atr"
+                        if strategy_type == "rsi_scalp" and rsi_stop_mode == "no_price_stop"
+                        else rsi_stop_mode
+                    ),
+                    "atr_stop_multiplier": manual_stop_multiplier,
                     "entry_source": "manual order",
                     "entry_reference_price": manual_intent.entry_price,
                     "entry_atr": current_atr,
@@ -4286,6 +4778,17 @@ def render_manual_order_form() -> None:
                     "entry_stop_loss": manual_intent.stop_loss,
                     "entry_rule_level": None,
                     "exit_rule_level_at_entry": optional_float(live.get("exit_level")),
+                    "entry_rsi": optional_float(live.get("rsi")),
+                    "entry_rsi_setup_low": first_available_number(
+                        live.get("rsi_setup_low"),
+                        live.get("rsi") if strategy_type == "rsi_scalp" else None,
+                    ),
+                    "entry_rsi_sell_level": first_available_number(
+                        live.get("rsi_sell_level"),
+                        min(rsi_overbought, float(live.get("rsi")) + rsi_sell_recovery_points)
+                        if strategy_type == "rsi_scalp" and live.get("rsi") is not None
+                        else None,
+                    ),
                     "planned_order_type": manual_intent.order_type,
                     "planned_limit_price": manual_intent.limit_price,
                     "planned_quantity": manual_intent.quantity,
@@ -4386,7 +4889,6 @@ elif command_center_view == "Ideas":
         scanner_store.save(candidates, scan_errors)
         st.session_state["selected_scan_symbol"] = candidates[0].symbol if candidates else ""
         st.rerun()
-
     saved_candidates, saved_scan_errors = scanner_store.read()
     if saved_candidates:
         st.markdown("#### Current ideas")
@@ -4445,14 +4947,14 @@ elif command_center_view == "New Trade":
         help=(
             "Summarizes the selected ticker's current setup. Selected strategy is the exact strategy chosen in the sidebar and used for "
             "the TRADE or WAIT decision. Best current fit across all strategies separately compares Breakout continuation, "
-            "Trend pullback continuation, Trendline breakout, and Trendline retest continuation using today's BUY-rule progress, "
+            "Trend pullback continuation, Trendline breakout, Trendline retest continuation, and RSI mean-reversion scalp using today's BUY-rule progress, "
             "the backtest from the current sidebar settings, trade count, return, win rate, profit factor, and worst drop. "
-            "It answers which of those four exact strategies fits the ticker now; it does not search for better settings."
+            "It answers which of those five exact strategies fits the ticker now; it does not search for better settings."
         ),
     )
     st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
     render_current_setup_watchlist_action()
-    with st.expander("Compare all four current strategy fits", expanded=False):
+    with st.expander("Compare all five current strategy fits", expanded=False):
         st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
         with st.expander("Detailed research records *", expanded=False):
@@ -4656,6 +5158,9 @@ if command_center_view == "New Trade":
             selected_trade,
             strategy_type=strategy_type,
             pullback_w=pullback_w,
+            rsi_length=rsi_length,
+            rsi_oversold=rsi_oversold,
+            rsi_overbought=rsi_overbought,
             market_data=market_data,
         ),
         width="stretch",
@@ -4758,17 +5263,62 @@ if command_center_view == "New Trade":
         st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
     
     with st.expander("Optional strategy tests" + (" *" if show_portfolio_evidence else ""), expanded=False):
+        if strategy_type == "rsi_scalp":
+            st.markdown(
+                "#### Compare RSI stop protection",
+                help=(
+                    "Runs the current RSI rules three times on the price bars already loaded: standard ATR stop, "
+                    "wide emergency ATR stop, and no price stop. It does not download Alpaca history again."
+                ),
+            )
+            stop_comparison_key = (
+                ticker, data_source, interval, period, atr_mult, rsi_emergency_atr_multiplier,
+                risk_pct, rsi_length, rsi_oversold, rsi_overbought, rsi_decline_points,
+                rsi_rebound_points, rsi_sell_recovery_points, rsi_swing_lookback,
+                rsi_max_holding_enabled, rsi_max_holding_bars,
+            )
+            if st.button("Compare Stop Protection Modes", key="compare_rsi_stop_modes"):
+                with st.spinner("Comparing the three stop modes on the loaded bars..."):
+                    st.session_state["rsi_stop_mode_comparison"] = {
+                        "key": stop_comparison_key,
+                        "rows": run_rsi_stop_mode_comparison(
+                            account,
+                            atr_mult,
+                            rsi_emergency_atr_multiplier,
+                            risk_dec,
+                            strategy_market_data,
+                            risk_limits,
+                            (ticker, data_source, interval, period),
+                            rsi_length,
+                            rsi_oversold,
+                            rsi_overbought,
+                            rsi_decline_points,
+                            rsi_rebound_points,
+                            rsi_sell_recovery_points,
+                            rsi_swing_lookback,
+                            rsi_max_holding_enabled,
+                            rsi_max_holding_bars,
+                        ),
+                    }
+            saved_stop_comparison = st.session_state.get("rsi_stop_mode_comparison")
+            if saved_stop_comparison and saved_stop_comparison.get("key") == stop_comparison_key:
+                st.dataframe(pd.DataFrame(saved_stop_comparison["rows"]), width="stretch", hide_index=True)
+                st.caption(
+                    "No price stop uses fixed ticker allocation, so its loss is not bounded by Max risk per trade. "
+                    "It remains unavailable for automated orders."
+                )
+
         st.markdown(
             "#### Strategy comparison",
             help=(
-                "Runs all four strategies on the same ticker, interval, history, account size, risk limits, and current sidebar settings. "
+                "Runs all five strategies on the same ticker, interval, history, account size, risk limits, and current sidebar settings. "
                 "Compare return, completed trades, win rate, worst drop, and profit factor. This table does not search for better settings "
                 "and does not change the selected strategy."
             ),
         )
         st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
         st.caption(
-            "This compares all four strategies and buy-and-hold using the same ticker allocation set by Max symbol concentration. "
+            "This compares all five strategies and buy-and-hold using the same ticker allocation set by Max symbol concentration. "
             "Account return remains visible separately. Buy and hold uses adjusted closing prices; taxes, idle-cash interest, "
             "spread, slippage, and market impact are not included. Strategy results are net of estimated Alpaca trading fees; "
             "buy and hold includes one estimated buy and one estimated sell."
@@ -4809,7 +5359,7 @@ if command_center_view == "New Trade":
         st.markdown(
             "#### Strategy input search result",
             help=(
-                "Searches nearby input combinations for all four strategies, then favors settings that also hold up on newer data, "
+                "Searches nearby input combinations for all five strategies, then favors settings that also hold up on newer data, "
                 "nearby settings, separate time periods, an untouched final period, and simulated trading friction. "
                 "Every setting combination is tested with the RSI 50-70 BUY rule off and on. "
                 "Use this as the strongest candidate for paper testing, not as a promise of future profit."
@@ -4859,6 +5409,9 @@ if command_center_view == "New Trade":
                 st.warning(verdict_message)
             recommendation_rows = optimizer_recommendation_records(strategy_optimizer_result, verdict_interval)
             if strategy_optimizer_interval_result is not None:
+                compared_interval_names = ", ".join(
+                    row.interval for row in strategy_optimizer_interval_result.interval_results
+                )
                 best_interval_evidence = next(
                     row for row in strategy_optimizer_interval_result.interval_results
                     if row.interval == strategy_optimizer_interval_result.best_interval
@@ -4867,7 +5420,7 @@ if command_center_view == "New Trade":
                     "Item": "Recommended interval",
                     "Value": strategy_optimizer_interval_result.best_interval,
                     "Plain English": (
-                        "Best result when daily, 4-hour, and 1-hour data were compared over the same "
+                        f"Best result when {compared_interval_names} data were compared over the same "
                         f"{strategy_optimizer_interval_result.interval_results[0].comparison_history.lower()}. "
                         f"The winning settings were then checked without changes on "
                         f"{strategy_optimizer_interval_result.best_history} of available history."
@@ -4909,7 +5462,7 @@ if command_center_view == "New Trade":
                     st.session_state["optimizer_apply_history"] = strategy_optimizer_interval_result.best_history
                 st.rerun()
             if strategy_optimizer_interval_result is not None:
-                with st.expander("Compare daily, 4-hour, and 1-hour results", expanded=False):
+                with st.expander(f"Compare {compared_interval_names} results", expanded=False):
                     st.dataframe(
                         pd.DataFrame(optimizer_interval_records(strategy_optimizer_interval_result)),
                         width="stretch",

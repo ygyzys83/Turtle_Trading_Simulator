@@ -633,6 +633,23 @@ All four backtests now reset daily profit and loss by trading date before applyi
 
 A read-only replay of the exact BTC/USD history and displayed pullback settings reproduced the old result at 82 trades ending June 17. The corrected logic generated 503 trades through the end of the available data. The full checkpoint passed 310 tests. No broker order was submitted.
 
+## RSI Mean-Reversion Scalp Strategy (July 13, 2026)
+
+A fifth deterministic strategy, `RSI mean-reversion scalp`, was added for short-interval trading, especially 5-minute and 15-minute bars.
+
+- Long-only v1 uses completed bars.
+- A possible buy is armed when RSI reaches the selected low level (default 30) or falls the selected number of points from its recent RSI high (default 40 points over 24 bars).
+- The app buys only after RSI rebounds from the lowest RSI reached while the setup was armed (default 3 points) and price closes above the prior completed bar.
+- The RSI exit is the lower of the saved setup low plus the selected recovery (default 35 points) or the selected RSI sell cap (default 70).
+- Standard and emergency modes retain ATR initial-stop, break-even, and trailing-stop protection. The optional maximum holding period defaults to 100 bars and can be turned off.
+- RSI mean-reversion scalp now offers Standard ATR stop, Emergency ATR stop, and No price stop backtest modes. The normal screen runs only the selected mode. A separate comparison button runs all three against cached bars. No price stop is research-only, sizes from ticker allocation, and cannot be queued for automated execution.
+- The RSI setup low, RSI at entry, calculated RSI exit, and all strategy inputs are saved with queued and submitted entries so the background worker can manage each position without relying on current sidebar settings.
+- The strategy is included in Strategy comparison, walk-forward evaluation, the bounded input optimizer, research reads, saved queue details, charts, and per-position exit management.
+- When this strategy is selected, Run Strategy Input Search compares 5-minute, 15-minute, and 1-hour data. The other strategies continue to use daily, 4-hour, and 1-hour comparisons.
+- The separate `Require RSI 50-70 for BUY` option remains available only to the four trend strategies; it is not layered onto the RSI scalp.
+
+No broker order was submitted during development or testing.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

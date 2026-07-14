@@ -1,6 +1,6 @@
 # AgentLoop Trader
 
-A governed trading simulator, paper-trading console, and research lab for testing simple technical strategies before any real-money use. The app supports synthetic data, Alpaca stock and crypto data, and Yahoo Finance stock data; compares four deterministic strategies; generates structured trade intents; and passes every proposed order through explicit risk controls before execution can act on it.
+A governed trading simulator, paper-trading console, and research lab for testing simple technical strategies before any real-money use. The app supports synthetic data, Alpaca stock and crypto data, and Yahoo Finance stock data; compares five deterministic strategies; generates structured trade intents; and passes every proposed order through explicit risk controls before execution can act on it.
 
 ## Features
 
@@ -56,6 +56,7 @@ The daily workflow should stay simple enough for an expert operator to use quick
 
 - Indicators and entry signals use completed bars.
 - Breakout continuation compares the completed-bar close with prior bar highs for entry and prior bar lows for exit.
+- RSI mean-reversion scalp arms after RSI reaches the selected low level or falls the selected number of points from a recent RSI high. It buys only after RSI rebounds from the setup low and price closes above the prior completed bar. It supports a standard ATR stop, a wider emergency ATR stop, or a no-price-stop research backtest. No-price-stop mode uses fixed ticker allocation and cannot be queued for automated orders. RSI recovery and the optional 100-bar maximum remain available in every mode.
 - Historical entries use the signal-bar close.
 - Protective stops fill at the stop price, or at the next bar open after a gap below the stop.
 - Break-even and ATR trailing protection turn on when the highest price since entry reaches the saved R threshold; once active, protection does not loosen.
@@ -63,7 +64,7 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Newer-data and optimizer comparisons use completed trades on both sides of the split so open-position P&L cannot skew one side.
 - Backtest results deduct estimated Alpaca trading fees. Stock tests use the current U.S. equity regulatory-fee model; crypto tests conservatively use Alpaca's Tier 1 taker fee on each side. Spread, market impact, taxes, and idle-cash interest are not included. The strategy-input recommendation separately shows 5, 10, and 20 basis-point-per-side stress results; paper and live fills remain the final execution test.
 - For real tickers, the strategy-input search ranks daily, 4-hour, and 1-hour results over the same latest two-year calendar window (or the shorter common window available from every interval). It then tests each interval's winning settings without changes on its longer available history: daily up to 10 years, 4-hour up to 5 years, and 1-hour up to 2 years with Alpaca. A result is labeled ready for paper testing only when it beats equal-capital buy-and-hold in both the newer-data and untouched locked periods and passes the minimum trade, rolling-period, and slippage checks.
-- `Require RSI 50-70 for BUY` is the only optional setup-quality read that currently becomes a hard entry rule. When enabled, all four strategies require 14-bar RSI between 50 and 70 in historical and current BUY decisions. The optimizer tests every bounded setting combination with this rule off and on; RSI does not control exits.
+- `Require RSI 50-70 for BUY` is an optional hard entry rule for the four trend strategies. The RSI mean-reversion scalp uses its own adjustable RSI entry and exit rules instead. The optimizer tests the optional 50-70 rule off and on for the trend strategies and searches a bounded set of RSI scalp inputs separately.
 - Strategy quality is measured against a stable per-ticker capital allocation set by `Max symbol concentration`. The UI keeps whole-account return for portfolio impact, while allocated return, allocated worst drop, and equal-capital buy-and-hold are used for strategy comparison and optimizer evidence. Strategy and buy-and-hold worst drops both divide the largest peak-to-trough dollar decline by the original ticker allocation, making the displayed percentages directly comparable. Annualized allocated and buy-and-hold returns use actual timestamps and appear only when the measured period exceeds one year. Return on average capital deployed is intentionally not used.
 - Alpaca and Yahoo price data are validated, sorted, deduplicated, and checked for impossible OHLC values before use.
 - Crypto bars are completed on elapsed UTC time rather than stock-session boundaries, so the worker can evaluate crypto entries and exits on weekends and outside stock market hours.
@@ -72,7 +73,7 @@ The daily workflow should stay simple enough for an expert operator to use quick
 
 ```text
 agentloop_trader/
-  backtest.py     # deterministic turtle-strategy simulation and metrics
+  backtest.py     # deterministic strategy simulations and metrics
   automation_runtime.py # background worker control and heartbeat files
   brokers.py      # broker adapter contract, paper adapter, and Alpaca integration
   data.py         # synthetic data generation

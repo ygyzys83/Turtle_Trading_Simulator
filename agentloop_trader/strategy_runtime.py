@@ -7,6 +7,7 @@ from typing import Any, Callable
 import pandas as pd
 
 from agentloop_trader.backtest import (
+    simulate_rsi_mean_reversion_strategy,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
     simulate_trend_pullback_strategy,
@@ -20,6 +21,7 @@ STRATEGY_TYPES = {
     "Trend pullback continuation": "pullback",
     "Trendline breakout": "trendline",
     "Trendline retest continuation": "trendline_retest",
+    "RSI mean-reversion scalp": "rsi_scalp",
 }
 
 
@@ -56,7 +58,26 @@ def _run_one(
         "risk_limits": risk_limits,
         "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
     }
-    if strategy_type == "pullback":
+    if strategy_type == "rsi_scalp":
+        result = simulate_rsi_mean_reversion_strategy(
+            account=account_equity,
+            atr_mult=atr_mult,
+            risk_pct_dec=risk_dec,
+            rsi_length=int(settings.get("rsi_length", 14)),
+            rsi_oversold=float(settings.get("rsi_oversold", 30.0)),
+            rsi_overbought=float(settings.get("rsi_overbought", 70.0)),
+            rsi_decline_points=float(settings.get("rsi_decline_points", 40.0)),
+            rsi_rebound_points=float(settings.get("rsi_rebound_points", 3.0)),
+            rsi_sell_recovery_points=float(settings.get("rsi_sell_recovery_points", 35.0)),
+            rsi_swing_lookback=int(settings.get("rsi_swing_lookback", 24)),
+            rsi_stop_mode=str(settings.get("rsi_stop_mode", "standard_atr")),
+            rsi_emergency_atr_multiplier=float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
+            rsi_max_holding_enabled=bool(settings.get("rsi_max_holding_enabled", True)),
+            rsi_max_holding_bars=int(settings.get("rsi_max_holding_bars", 100)),
+            market_data=market_data,
+            risk_limits=risk_limits,
+        )
+    elif strategy_type == "pullback":
         result = simulate_trend_pullback_strategy(pullback_w=pullback_w, trend_w=ma_w, momentum_w=momentum_w, **common)
     elif strategy_type == "trendline":
         result = simulate_trendline_breakout_strategy(trendline_w=entry_w, ma_w=ma_w, **common)
@@ -245,7 +266,10 @@ def evaluate_exit_settings(
         current_price = _number(data.attrs.get("latest_price"), _number(live.get("last_p")))
         strategy_exit = _number(live.get("exit_level"))
         current_atr = _number(live.get("last_atr"))
+        current_rsi = _number(live.get("rsi"))
         entry = _number(position.get("Average Entry"), _number(settings.get("entry_reference_price"), current_price))
+        rsi_strategy = str(settings.get("strategy_type", "")) == "rsi_scalp"
+        no_price_stop = rsi_strategy and str(settings.get("rsi_stop_mode", "standard_atr")) == "no_price_stop"
         atr_mult = float(settings.get("atr_stop_multiplier", 2.0))
         initial_risk = _number(settings.get("entry_stop_distance"))
         saved_entry = _number(settings.get("planned_entry_price"), _number(settings.get("entry_reference_price")))
@@ -257,15 +281,20 @@ def evaluate_exit_settings(
         original_stop = entry - initial_risk if entry is not None and initial_risk is not None else saved_stop
         if original_stop is None and entry is not None and current_atr is not None:
             original_stop = entry - atr_mult * current_atr
+        if no_price_stop:
+            initial_risk = None
+            original_stop = None
         profit_r = (current_price - entry) / initial_risk if current_price is not None and entry is not None and initial_risk else None
 
         high_data = data.tail(1)
         entry_time = _parse_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
+        bars_since_entry = 0
         if entry_time is not None and not data.empty:
             compare = entry_time.tz_convert(data.index.tz) if getattr(data.index, "tz", None) else entry_time.tz_localize(None)
             recent = data.loc[data.index >= compare]
             if not recent.empty:
                 high_data = recent
+                bars_since_entry = max(0, len(recent) - 1)
         current_high = _number(high_data["High"].max()) if "High" in high_data.columns else None
         current_high = max(
             [value for value in (current_high, _number(data.attrs.get("latest_high"))) if value is not None],
@@ -274,23 +303,51 @@ def evaluate_exit_settings(
         saved_high = _number(settings.get("highest_high_since_entry"))
         high = max([value for value in (current_high, saved_high, entry) if value is not None], default=None)
         highest_profit_r = (high - entry) / initial_risk if high is not None and entry is not None and initial_risk else None
-        protect = bool(settings.get("profit_protection_enabled", True))
+        protect = bool(settings.get("profit_protection_enabled", True)) and not no_price_stop
         breakeven_after = float(settings.get("breakeven_after_r", 1.0))
         trail_after = float(settings.get("trail_after_r", 2.0))
         trail_mult = float(settings.get("trailing_atr_multiplier", 3.0))
         breakeven = entry if protect and highest_profit_r is not None and highest_profit_r >= breakeven_after else None
         atr_trail = high - trail_mult * current_atr if protect and highest_profit_r is not None and highest_profit_r >= trail_after and high is not None and current_atr is not None else None
-        saved_trigger = _number(settings.get("last_exit_trigger_price"))
+        saved_trigger = None if no_price_stop else _number(settings.get("last_exit_trigger_price"))
         candidates = [("strategy exit", strategy_exit), ("fill-adjusted initial stop", original_stop), ("break-even stop", breakeven), ("ATR trail", atr_trail), ("saved trigger", saved_trigger)]
         usable = [(name, value) for name, value in candidates if value is not None]
         source_name, trigger = max(usable, key=lambda item: item[1]) if usable else ("exit rule", None)
-        ready = bool(current_price is not None and trigger is not None and current_price <= trigger)
+        saved_setup_low = _number(settings.get("entry_rsi_setup_low"))
+        rsi_sell_level = (
+            min(
+                float(settings.get("rsi_overbought", 70.0)),
+                saved_setup_low + float(settings.get("rsi_sell_recovery_points", 35.0)),
+            )
+            if rsi_strategy and saved_setup_low is not None
+            else None
+        )
+        rsi_exit_ready = bool(rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level)
+        max_holding_enabled = bool(settings.get("rsi_max_holding_enabled", True))
+        max_holding_bars = int(settings.get("rsi_max_holding_bars", 100))
+        time_exit_ready = bool(
+            rsi_strategy and max_holding_enabled and entry_time is not None
+            and bars_since_entry >= max_holding_bars
+        )
+        price_exit_ready = bool(current_price is not None and trigger is not None and current_price <= trigger)
+        ready = price_exit_ready or rsi_exit_ready or time_exit_ready
+        if rsi_exit_ready:
+            source_name = "RSI recovery exit"
+        elif time_exit_ready:
+            source_name = "maximum holding period"
         reason = (
+            f"Exit now because RSI is {current_rsi:.1f}, at or above the saved {rsi_sell_level:.1f} exit level."
+            if rsi_exit_ready and current_rsi is not None and rsi_sell_level is not None
+            else f"Exit now because the position reached its {max_holding_bars}-bar maximum holding period."
+            if time_exit_ready
+            else
             f"Exit now because {symbol} is at or below the {source_name} at ${trigger:,.2f}."
-            if ready and trigger is not None
+            if price_exit_ready and trigger is not None
             else f"Hold. Automatic exit triggers at ${trigger:,.2f} or lower using the highest active protection level."
             if trigger is not None
-            else "No exit trigger is available."
+            else "Hold. The saved RSI recovery and maximum holding-period exits are not triggered."
+            if max_holding_enabled
+            else "Hold. The saved RSI recovery exit and price protection are not triggered."
         )
         return {
             "ready": ready,
@@ -306,6 +363,13 @@ def evaluate_exit_settings(
             "profit_r": profit_r,
             "highest_profit_r": highest_profit_r,
             "current_atr": current_atr,
+            "current_rsi": current_rsi,
+            "rsi_sell_level": rsi_sell_level,
+            "rsi_exit_ready": rsi_exit_ready,
+            "bars_since_entry": bars_since_entry,
+            "max_holding_enabled": max_holding_enabled if rsi_strategy else None,
+            "max_holding_bars": max_holding_bars if rsi_strategy and max_holding_enabled else None,
+            "time_exit_ready": time_exit_ready,
             "interval": interval,
             "checked_at": datetime.now().astimezone().isoformat(),
             "state_changed": bool((high or 0) > (saved_high or 0) or (trigger or 0) > (saved_trigger or 0)),

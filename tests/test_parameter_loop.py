@@ -125,6 +125,7 @@ def test_optimizer_searches_all_strategies_and_returns_display_records():
         "Trend pullback continuation",
         "Trendline breakout",
         "Trendline retest continuation",
+        "RSI mean-reversion scalp",
     }
 
     result = optimize_strategy_inputs(
@@ -171,8 +172,9 @@ def test_optimizer_tests_each_setting_with_rsi_entry_rule_off_and_on():
 
     for strategy_type in {row[1] for row in rows}:
         strategy_rows = [settings for _, row_type, settings in rows if row_type == strategy_type]
-        assert {settings["rsi_entry_filter_enabled"] for settings in strategy_rows} == {False, True}
-        assert len(strategy_rows) == 4
+        expected = {False} if strategy_type == "rsi_scalp" else {False, True}
+        assert {settings["rsi_entry_filter_enabled"] for settings in strategy_rows} == expected
+        assert len(strategy_rows) == (2 if strategy_type == "rsi_scalp" else 4)
 
 
 def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():

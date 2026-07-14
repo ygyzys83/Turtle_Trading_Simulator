@@ -199,6 +199,41 @@ def _backtest_limited_quantity(
     return max(0, min(max_quantities))
 
 
+def _backtest_fixed_notional_quantity(
+    *,
+    account_equity: float,
+    entry_price: float,
+    session_pnl: float,
+    limits: RiskLimits | None,
+    asset_class: str = "equity",
+) -> float:
+    """Size a no-stop research trade from capital allocation, not invented stop risk."""
+    if account_equity <= 0 or entry_price <= 0:
+        return 0
+    if limits is None:
+        allocation_pct = 5.0
+        max_quantity = 100_000
+    else:
+        if limits.kill_switch_enabled:
+            return 0
+        session_start_equity = max(0.0, account_equity - session_pnl)
+        max_session_loss = session_start_equity * limits.max_session_loss_pct / 100
+        if session_pnl < -max_session_loss:
+            return 0
+        allocation_pct = min(
+            limits.max_position_notional_pct,
+            limits.max_portfolio_exposure_pct,
+            limits.max_symbol_concentration_pct,
+        )
+        max_quantity = limits.max_quantity
+    allocation_dollars = account_equity * allocation_pct / 100
+    return max(0, min(
+        floor_quantity(allocation_dollars / entry_price, asset_class),
+        max_quantity,
+        floor_quantity(account_equity / entry_price, asset_class),
+    ))
+
+
 def _trade_record(
     *,
     trade_number: int,
@@ -546,6 +581,57 @@ def _base_live_fields(
         "relative_strength": "Unknown",
         "event_risk": "Unknown",
     }
+
+
+def _rsi_scalp_live_setup(
+    prices,
+    rsis,
+    index: int,
+    *,
+    oversold: float,
+    decline_points: float,
+    rebound_points: float,
+    swing_lookback: int,
+) -> tuple[bool, bool, float | None, float | None, float | None, float | None]:
+    """Rebuild the current RSI setup from completed bars without carrying hidden state."""
+    start = max(1, index - max(2, swing_lookback) + 1)
+    armed = False
+    setup_low: float | None = None
+    recent_high: float | None = None
+    decline: float | None = None
+    rebound: float | None = None
+    ready = False
+    for i in range(start, index + 1):
+        value = rsis[i]
+        if value is None:
+            continue
+        value = float(value)
+        lookback_values = [
+            float(item)
+            for item in rsis[max(0, i - swing_lookback + 1):i + 1]
+            if item is not None
+        ]
+        recent_high = max(lookback_values) if lookback_values else value
+        decline = recent_high - value
+        if value <= oversold or decline >= decline_points:
+            if not armed:
+                armed = True
+                setup_low = value
+            else:
+                setup_low = min(float(setup_low), value) if setup_low is not None else value
+        if not armed or setup_low is None:
+            continue
+        setup_low = min(setup_low, value)
+        rebound = value - setup_low
+        confirmation = rebound >= rebound_points and float(prices[i]) > float(prices[i - 1])
+        if confirmation:
+            if i == index:
+                ready = True
+            else:
+                armed = False
+                setup_low = None
+                rebound = None
+    return ready, armed, setup_low, recent_high, decline, rebound
 
 
 def simulate_turtle_strategy(
@@ -1629,6 +1715,337 @@ def _trendline_live_fields(
         f"Price at or below {exit_w}-bar exit level": live["exit_ready"],
     }
     return live
+
+
+def simulate_rsi_mean_reversion_strategy(
+    account: float,
+    atr_mult: float,
+    risk_pct_dec: float,
+    rsi_length: int = 14,
+    rsi_oversold: float = 30.0,
+    rsi_overbought: float = 70.0,
+    rsi_decline_points: float = 40.0,
+    rsi_rebound_points: float = 3.0,
+    rsi_sell_recovery_points: float = 35.0,
+    rsi_swing_lookback: int = 24,
+    rsi_stop_mode: str = "standard_atr",
+    rsi_emergency_atr_multiplier: float = 5.0,
+    rsi_max_holding_enabled: bool = True,
+    rsi_max_holding_bars: int = 100,
+    seed: int | None = None,
+    market_data=None,
+    risk_limits: RiskLimits | None = None,
+):
+    """Long-only RSI mean-reversion scalp with selectable price protection."""
+    if rsi_stop_mode not in {"standard_atr", "emergency_atr", "no_price_stop"}:
+        raise ValueError(f"Unknown RSI stop mode: {rsi_stop_mode}")
+    active_stop_multiplier = (
+        atr_mult if rsi_stop_mode == "standard_atr"
+        else rsi_emergency_atr_multiplier if rsi_stop_mode == "emergency_atr"
+        else None
+    )
+    prices, highs, lows, volumes, n_bars, labels, symbol = _market_arrays(seed, market_data)
+    asset_class = normalize_asset_class(getattr(market_data, "attrs", {}).get("asset_class"), symbol)
+    session_risk = _BacktestSessionRisk(_backtest_session_keys(market_data, labels, asset_class))
+    opens = _bar_open_prices(prices, market_data)
+    min_bars = max(14, rsi_length, rsi_swing_lookback) + 3
+    if n_bars < min_bars:
+        raise ValueError(f"Need at least {min_bars} bars for these settings; got {n_bars}.")
+
+    atrs = calc_atr(prices, 14, highs, lows)
+    rsis = calc_rsi(prices, rsi_length)
+    display_smas = calc_sma(prices, max(2, rsi_length))
+    trade_log: list[dict] = []
+    equity_curve = [float(account)]
+    exposure_bars = 0
+    balance = float(account)
+    open_entry_fee = 0.0
+    in_trade = False
+    armed = False
+    armed_bar = -1
+    setup_low: float | None = None
+    entry_setup_low: float | None = None
+    entry_rsi: float | None = None
+    entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
+    high_since_entry = low_since_entry = 0.0
+    exit_rule = "Exit rule"
+    start = max(14, rsi_length, rsi_swing_lookback)
+    live_bar = n_bars - 1
+
+    for i in range(start, live_bar):
+        price = float(prices[i])
+        current_equity = balance + ((price - entry_price) * shares if in_trade else 0.0)
+        session_pnl = session_risk.update(i, current_equity)
+        atr = atrs[i]
+        rsi = rsis[i]
+        if atr is None or rsi is None:
+            equity_curve.append(balance)
+            continue
+        rsi = float(rsi)
+        recent_values = [
+            float(value)
+            for value in rsis[max(0, i - rsi_swing_lookback + 1):i + 1]
+            if value is not None
+        ]
+        recent_high = max(recent_values) if recent_values else rsi
+        decline = recent_high - rsi
+
+        if not in_trade:
+            if armed and i - armed_bar > rsi_swing_lookback:
+                armed = False
+                setup_low = None
+            if rsi <= rsi_oversold or decline >= rsi_decline_points:
+                if not armed:
+                    armed = True
+                    armed_bar = i
+                    setup_low = rsi
+                else:
+                    setup_low = min(float(setup_low), rsi) if setup_low is not None else rsi
+            if armed and setup_low is not None:
+                setup_low = min(setup_low, rsi)
+                rebound = rsi - setup_low
+                price_turned_up = price > float(prices[i - 1])
+                if rebound >= rsi_rebound_points and price_turned_up:
+                    stop = (
+                        round(price - active_stop_multiplier * float(atr), 2)
+                        if active_stop_multiplier is not None
+                        else None
+                    )
+                    if stop is None:
+                        size = _backtest_fixed_notional_quantity(
+                            account_equity=balance,
+                            entry_price=price,
+                            session_pnl=session_pnl,
+                            limits=risk_limits,
+                            asset_class=asset_class,
+                        )
+                    else:
+                        risk = price - stop
+                        raw_size = floor_quantity((balance * risk_pct_dec) / risk, asset_class) if risk > 0 else 0
+                        size = _backtest_limited_quantity(
+                            raw_quantity=raw_size,
+                            account_equity=balance,
+                            entry_price=price,
+                            stop_price=stop,
+                            session_pnl=session_pnl,
+                            limits=risk_limits,
+                            asset_class=asset_class,
+                        )
+                    if size > 0:
+                        in_trade = True
+                        entry_price = round(price, 2)
+                        open_entry_fee = _entry_fee(entry_price, size, asset_class)
+                        balance -= open_entry_fee
+                        stop_price = initial_stop_price = stop
+                        shares = size
+                        entry_bar = i
+                        high_since_entry = low_since_entry = price
+                        entry_setup_low = setup_low
+                        entry_rsi = rsi
+                        armed = False
+                        setup_low = None
+        else:
+            exposure_bars += 1
+            low_value = float(lows[i]) if lows is not None else price
+            protective_fill = (
+                _protective_stop_fill(float(opens[i]), low_value, float(stop_price))
+                if stop_price is not None
+                else None
+            )
+            if protective_fill is not None:
+                low_since_entry = min(low_since_entry, protective_fill)
+                equity_curve.append(balance + (low_since_entry - entry_price) * shares)
+                balance += _exit_balance_change(entry_price, protective_fill, shares, asset_class)
+                record = _trade_record(
+                    trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
+                    entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
+                    exit_price=protective_fill, shares=shares, stop_price=float(initial_stop_price),
+                    account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
+                )
+                record.update({"entry_rsi": entry_rsi, "entry_rsi_setup_low": entry_setup_low, "exit_rsi": rsi})
+                trade_log.append(record)
+                in_trade = False
+                open_entry_fee = 0.0
+                equity_curve.append(balance)
+                continue
+
+            low_since_entry = min(low_since_entry, low_value)
+            equity_curve.append(balance + (low_since_entry - entry_price) * shares)
+            high_value = float(highs[i]) if highs is not None else price
+            high_since_entry = max(high_since_entry, high_value)
+            if stop_price is not None and initial_stop_price is not None:
+                exit_rule, stop_price = _profit_protection_stop(
+                    entry_price=float(entry_price),
+                    initial_stop_price=float(initial_stop_price),
+                    current_stop_price=float(stop_price),
+                    current_price=price,
+                    current_atr=float(atr),
+                    high_since_entry=float(high_since_entry),
+                    strategy_exit_price=None,
+                )
+            rsi_sell_level = min(rsi_overbought, float(entry_setup_low or rsi_oversold) + rsi_sell_recovery_points)
+            rsi_exit = rsi >= rsi_sell_level
+            time_exit = bool(rsi_max_holding_enabled and i - entry_bar >= rsi_max_holding_bars)
+            price_exit = bool(stop_price is not None and price <= stop_price)
+            if rsi_exit or time_exit or price_exit:
+                if rsi_exit:
+                    exit_rule = f"RSI recovered to {rsi_sell_level:.1f}"
+                elif time_exit:
+                    exit_rule = f"Maximum hold of {rsi_max_holding_bars} bars"
+                balance += _exit_balance_change(entry_price, price, shares, asset_class)
+                record = _trade_record(
+                    trade_number=len(trade_log) + 1, symbol=symbol, labels=labels,
+                    entry_bar=entry_bar, exit_bar=i, entry_price=float(entry_price),
+                    exit_price=price, shares=shares,
+                    stop_price=float(initial_stop_price) if initial_stop_price is not None else 0.0,
+                    account=float(account), exit_rule=exit_rule, lowest_price_since_entry=low_since_entry,
+                    asset_class=asset_class,
+                )
+                record.update({"entry_rsi": entry_rsi, "entry_rsi_setup_low": entry_setup_low, "exit_rsi": rsi})
+                trade_log.append(record)
+                in_trade = False
+                open_entry_fee = 0.0
+                equity_curve.append(balance)
+                continue
+            equity_curve.append(balance + (price - entry_price) * shares)
+            continue
+        equity_curve.append(balance)
+
+    last_price = float(prices[live_bar])
+    last_atr = atrs[live_bar]
+    last_rsi = float(rsis[live_bar]) if rsis[live_bar] is not None else None
+    setup_ready, setup_armed, live_setup_low, recent_high, decline, rebound = _rsi_scalp_live_setup(
+        prices, rsis, live_bar,
+        oversold=rsi_oversold,
+        decline_points=rsi_decline_points,
+        rebound_points=rsi_rebound_points,
+        swing_lookback=rsi_swing_lookback,
+    )
+    open_value = (last_price - entry_price) * shares if in_trade else 0.0
+    live_balance = balance + open_value
+    live_session_pnl = session_risk.update(live_bar, live_balance)
+    live_stop = (
+        last_price - active_stop_multiplier * float(last_atr)
+        if last_atr is not None and active_stop_multiplier is not None
+        else None
+    )
+    stop_distance = max(0.0, last_price - live_stop) if live_stop is not None else 0.0
+    if live_stop is None:
+        pos_size = _backtest_fixed_notional_quantity(
+            account_equity=live_balance,
+            entry_price=last_price,
+            session_pnl=live_session_pnl,
+            limits=risk_limits,
+            asset_class=asset_class,
+        )
+    else:
+        raw_size = floor_quantity((balance * risk_pct_dec) / stop_distance, asset_class) if stop_distance else 0
+        pos_size = _backtest_limited_quantity(
+            raw_quantity=raw_size,
+            account_equity=live_balance,
+            entry_price=last_price,
+            stop_price=live_stop,
+            session_pnl=live_session_pnl,
+            limits=risk_limits,
+            asset_class=asset_class,
+        )
+    proposed_trade_intent = None
+    if setup_ready and pos_size > 0:
+        proposed_trade_intent = TradeIntent(
+            symbol=symbol,
+            side="buy",
+            quantity=pos_size,
+            asset_class=asset_class,
+            time_in_force="gtc" if asset_class == "crypto" else "day",
+            entry_price=last_price,
+            stop_loss=round(live_stop, 2) if live_stop is not None else None,
+            max_holding_bars=rsi_max_holding_bars if rsi_max_holding_enabled else None,
+            rationale=(
+                f"RSI mean-reversion scalp: RSI rebounded {float(rebound or 0):.1f} points "
+                f"from a setup low of {float(live_setup_low or 0):.1f}, with price turning up."
+            ),
+            source_signals=[
+                f"rsi_{rsi_length}_setup_armed",
+                f"rsi_rebound_{rsi_rebound_points:g}_points",
+                "close_above_prior_bar",
+                "fixed_notional_sizing" if live_stop is None else "atr_position_sizing",
+            ],
+        )
+
+    saved_sell_level = min(rsi_overbought, float(entry_setup_low or rsi_oversold) + rsi_sell_recovery_points)
+    simulated_rsi_exit = bool(in_trade and last_rsi is not None and last_rsi >= saved_sell_level)
+    simulated_time_exit = bool(
+        rsi_max_holding_enabled and in_trade and live_bar - entry_bar >= rsi_max_holding_bars
+    )
+    signal = "long" if proposed_trade_intent is not None else "exit" if simulated_rsi_exit or simulated_time_exit else "flat"
+    live = _base_live_fields(
+        prices=prices,
+        smas=display_smas,
+        atrs=atrs,
+        rsis=rsis,
+        volumes=volumes,
+        index=live_bar,
+        entry_level=last_price,
+        exit_level=last_price,
+        stop_distance=stop_distance,
+        balance=live_balance,
+        pos_size=pos_size,
+        signal=signal,
+        trade_intent=proposed_trade_intent,
+        strategy_name="RSI mean-reversion scalp",
+        setup_type="rsi_scalp",
+        momentum_turn=setup_ready,
+    )
+    live.update({
+        "entry_level": None,
+        "exit_level": None,
+        "rsi_setup_armed": setup_armed,
+        "rsi_setup_low": live_setup_low,
+        "rsi_recent_high": recent_high,
+        "rsi_decline_points": decline,
+        "rsi_rebound_points": rebound,
+        "required_rsi_rebound_points": rsi_rebound_points,
+        "prior_p": float(prices[live_bar - 1]),
+        "rsi_sell_level": min(rsi_overbought, float(live_setup_low or rsi_oversold) + rsi_sell_recovery_points),
+        "rsi_length": rsi_length,
+        "rsi_stop_mode": rsi_stop_mode,
+        "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
+        "buy_requirements": {
+            f"RSI({rsi_length}) reached {rsi_oversold:g} or fell {rsi_decline_points:g} points": setup_armed or setup_ready,
+            f"RSI rebounded {rsi_rebound_points:g} points from the setup low": bool(rebound is not None and rebound >= rsi_rebound_points),
+            "Price closed above the prior completed bar": last_price > float(prices[live_bar - 1]),
+            "Position size above zero": pos_size > 0,
+        },
+        "sell_requirements": {
+            f"RSI reached setup low + {rsi_sell_recovery_points:g} points, capped at {rsi_overbought:g}": simulated_rsi_exit,
+            f"Position reached maximum hold of {rsi_max_holding_bars} bars": simulated_time_exit,
+            "Price protection reached": False,
+        },
+        "in_simulated_trade": in_trade,
+        "exit_ready": simulated_rsi_exit or simulated_time_exit,
+        "exit_reason": (
+            f"Exit now because RSI reached {saved_sell_level:.1f}."
+            if simulated_rsi_exit
+            else f"Exit now because the {rsi_max_holding_bars}-bar maximum hold was reached."
+            if simulated_time_exit
+            else f"Hold until RSI reaches the saved recovery level, price protection is hit, or {rsi_max_holding_bars} bars pass."
+            if rsi_max_holding_enabled
+            else "Hold until RSI reaches the saved recovery level or price protection is hit."
+        ),
+        "no_trade_reason": (
+            "BUY intent is present."
+            if proposed_trade_intent is not None
+            else f"No BUY because RSI has not rebounded {rsi_rebound_points:g} points from an armed setup low with price turning up."
+        ),
+    })
+    if not equity_curve or equity_curve[-1] != live_balance:
+        equity_curve.append(live_balance)
+    stats = _build_stats(
+        account, live_balance, trade_log, equity_curve, exposure_bars, n_bars,
+        risk_limits, market_data, open_entry_fee,
+    )
+    return prices, display_smas, atrs, trade_log, live, stats, labels
 
 
 def strategy_comparison_records(results: dict[str, dict]) -> list[dict]:
