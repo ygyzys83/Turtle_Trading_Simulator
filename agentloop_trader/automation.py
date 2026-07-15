@@ -566,22 +566,27 @@ def automation_supervisor_dry_run_records(
 
 def evidence_dashboard_records(audit_records: list[dict], tracked_orders: list[dict]) -> list[dict]:
     event_types = [record.get("event_type", "") for record in audit_records]
-    tracked_statuses = [_enum_value(order.get("status", "")) for order in tracked_orders]
-    lifecycle_statuses = [str(order.get("lifecycle_status", "")) for order in tracked_orders]
+    broker_orders = [
+        order for order in tracked_orders
+        if str(order.get("source") or "").strip().lower()
+        not in {"position_plan", "position_observation"}
+    ]
+    tracked_statuses = [_enum_value(order.get("status", "")) for order in broker_orders]
+    lifecycle_statuses = [str(order.get("lifecycle_status", "")) for order in broker_orders]
     filled_quantity = sum(
         _as_float(order.get("filled_quantity") or order.get("quantity"))
-        for order in tracked_orders
+        for order in broker_orders
         if _enum_value(order.get("status", "")) == "filled"
     )
     return [
         {"Metric": "Activity records loaded", "Value": len(audit_records)},
-        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")},
+        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted") + event_types.count("worker_paper_buy_sent")},
         {"Metric": "Paper buys blocked", "Value": event_types.count("alpaca_paper_order_blocked") + event_types.count("auto_paper_entry_blocked")},
-        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
+        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted") + event_types.count("worker_limit_buy_cancelled") + event_types.count("worker_rsi_late_buy_cancelled")},
         {"Metric": "Paper cancels blocked", "Value": event_types.count("alpaca_paper_cancel_blocked")},
-        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")},
+        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted") + event_types.count("worker_paper_exit_sent")},
         {"Metric": "Paper exits blocked", "Value": event_types.count("alpaca_paper_exit_blocked") + event_types.count("auto_paper_exit_blocked")},
-        {"Metric": "Saved Alpaca orders", "Value": len(tracked_orders)},
+        {"Metric": "Saved Alpaca orders", "Value": len(broker_orders)},
         {"Metric": "Open Alpaca orders", "Value": lifecycle_statuses.count("open_at_alpaca")},
         {"Metric": "Filled Alpaca orders", "Value": tracked_statuses.count("filled")},
         {"Metric": "Filled Alpaca shares", "Value": _format_number(filled_quantity)},

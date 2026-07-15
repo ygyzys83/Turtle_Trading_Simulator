@@ -88,6 +88,187 @@ def test_worker_recognizes_auto_exits_only_mode(monkeypatch, tmp_path):
     assert message == "No auto exits were ready."
 
 
+def test_worker_does_not_sell_adopted_manual_position_without_saved_exit_plan(monkeypatch, tmp_path):
+    control = AutomationControl(
+        enabled=True,
+        paper_orders_enabled=True,
+        mode="Auto entries and exits",
+        audit_log_path=str(tmp_path / "audit.jsonl"),
+    )
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(paper=True),
+        submit_order=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("A manual position without saved exit settings must not be sold")
+        ),
+    )
+    tracked = [
+        {
+            "symbol": "CRWV",
+            "side": "buy",
+            "status": "filled",
+            "exit_settings": {"auto_exit_enabled": True, "interval": "4h"},
+        },
+        {
+            "symbol": "CRWV",
+            "side": "buy",
+            "status": "filled",
+            "source": "adopted_alpaca_position",
+            "adopted": True,
+        },
+    ]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+
+    sent, updated, message = _send_exits(
+        control,
+        adapter,
+        positions=[{"Symbol": "CRWV", "Quantity": "64", "Average Entry": "77.08"}],
+        orders=[],
+        tracked_orders=tracked,
+        fetch_bars=lambda *args: (_ for _ in ()).throw(AssertionError("No bars should be loaded")),
+        audit_store=SimpleNamespace(append=lambda event: None),
+    )
+
+    assert sent == 0
+    assert updated == tracked
+    assert message == "No auto exits were ready."
+
+
+def test_worker_exit_uses_current_reentry_order_not_prior_symbol_cycle(monkeypatch, tmp_path):
+    captured = {}
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(config=SimpleNamespace(paper=True))
+    orders = [
+        {"Alpaca Order ID": "old-buy", "Symbol": "NVDA", "Side": "buy", "Status": "filled", "Filled Qty": 24, "Avg Fill": 202.48, "Filled": "2026-07-09T16:33:04+00:00"},
+        {"Alpaca Order ID": "old-sell", "Symbol": "NVDA", "Side": "sell", "Status": "filled", "Filled Qty": 24, "Avg Fill": 210.15, "Filled": "2026-07-10T19:00:59+00:00"},
+        {"Alpaca Order ID": "new-buy", "Symbol": "NVDA", "Side": "buy", "Status": "filled", "Filled Qty": 23, "Avg Fill": 210.758696, "Filled": "2026-07-15T19:20:40+00:00"},
+    ]
+    tracked = [
+        {"broker_order_id": "old-buy", "symbol": "NVDA", "side": "buy", "status": "filled", "exit_settings": {"entry_stop_distance": 2.0, "highest_high_since_entry": 213.775}},
+        {"broker_order_id": "new-buy", "symbol": "NVDA", "side": "buy", "status": "new", "exit_settings": {"entry_stop_distance": 6.78, "auto_exit_enabled": True}},
+    ]
+
+    def evaluate(settings, position, fetch_bars):
+        captured.update(settings)
+        return {"ready": False, "state_changed": False}
+
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+    monkeypatch.setattr("agentloop_trader.worker.evaluate_exit_settings", evaluate)
+
+    sent, _, _ = _send_exits(
+        control,
+        adapter,
+        [{"Symbol": "NVDA", "Quantity": 23, "Average Entry": 210.758696}],
+        orders,
+        tracked,
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+    )
+
+    assert sent == 0
+    assert captured["entry_broker_order_id"] == "new-buy"
+    assert captured["entry_reference_price"] == 210.758696
+    assert captured["entry_stop_distance"] == 6.78
+    assert captured["highest_high_since_entry"] == 210.758696
+
+
+def test_worker_does_not_attach_old_settings_to_new_manual_reentry(monkeypatch):
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(paper=True),
+        submit_order=lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Manual reentry must remain unmanaged")),
+    )
+    orders = [
+        {"Alpaca Order ID": "old-buy", "Symbol": "IBM", "Side": "buy", "Status": "filled", "Filled Qty": 10, "Filled": "2026-07-01T15:00:00+00:00"},
+        {"Alpaca Order ID": "old-sell", "Symbol": "IBM", "Side": "sell", "Status": "filled", "Filled Qty": 10, "Filled": "2026-07-02T15:00:00+00:00"},
+        {"Alpaca Order ID": "manual-buy", "Symbol": "IBM", "Side": "buy", "Status": "filled", "Filled Qty": 5, "Filled": "2026-07-15T15:00:00+00:00"},
+    ]
+    tracked = [{
+        "broker_order_id": "old-buy",
+        "symbol": "IBM",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {"entry_stop_distance": 4.0, "auto_exit_enabled": True},
+    }]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+
+    sent, _, _ = _send_exits(
+        control,
+        adapter,
+        [{"Symbol": "IBM", "Quantity": 5, "Average Entry": 220.0}],
+        orders,
+        tracked,
+        lambda *_: (_ for _ in ()).throw(AssertionError("Unmanaged position must not fetch bars")),
+        SimpleNamespace(append=lambda event: None),
+    )
+
+    assert sent == 0
+
+
+def test_worker_exit_audit_identifies_exact_position_cycle(monkeypatch):
+    events = []
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(paper=True),
+        submit_order=lambda *args, **kwargs: SimpleNamespace(id="sell-1"),
+    )
+    orders = [{
+        "Alpaca Order ID": "buy-1",
+        "Symbol": "NVDA",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 23,
+        "Avg Fill": 210.758696,
+        "Filled": "2026-07-15T19:20:40+00:00",
+    }]
+    tracked = [{
+        "broker_order_id": "buy-1",
+        "symbol": "NVDA",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {"entry_stop_distance": 6.78, "auto_exit_enabled": True},
+    }]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+    monkeypatch.setattr(
+        "agentloop_trader.worker.evaluate_exit_settings",
+        lambda *args: {
+            "ready": True,
+            "state_changed": False,
+            "reason": "Exit trigger reached.",
+            "current_price": 203.90,
+            "trigger_price": 203.98,
+            "trigger_source": "fill-adjusted initial stop",
+            "profit_r": -1.01,
+            "highest_profit_r": 0.09,
+        },
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker.build_alpaca_order_preview",
+        lambda *args: SimpleNamespace(valid=True, preview_hash="exit-preview"),
+    )
+    monkeypatch.setattr("agentloop_trader.worker.open_exit_order_reasons", lambda *args: [])
+    monkeypatch.setattr(
+        "agentloop_trader.worker._track_broker_order",
+        lambda *args: {"broker_order_id": "sell-1", "symbol": "NVDA", "side": "sell"},
+    )
+
+    sent, updated, _ = _send_exits(
+        control,
+        adapter,
+        [{"Symbol": "NVDA", "Quantity": 23, "Average Entry": 210.758696}],
+        orders,
+        tracked,
+        lambda *_: None,
+        SimpleNamespace(append=events.append),
+    )
+
+    assert sent == 1
+    assert updated[-1]["parent_position_cycle_id"] == "buy-1"
+    assert events[0].payload["position_cycle_id"] == "buy-1"
+    assert events[0].payload["position_average_entry"] == 210.758696
+    assert events[0].payload["entry_stop_distance"] == 6.78
+    assert events[0].payload["exit_details"]["highest_profit_r"] == 0.09
+
+
 def test_worker_stop_wait_checks_control_each_second(monkeypatch):
     checks = []
 

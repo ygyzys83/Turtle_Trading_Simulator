@@ -349,6 +349,12 @@ class AlpacaBrokerAdapterStub:
     def refreshed_tracked_order_records(self, tracked_orders: list[dict]) -> list[dict]:
         rows = []
         for order in tracked_orders:
+            if str(order.get("source") or "").strip().lower() in {
+                "position_plan",
+                "position_observation",
+                "adopted_alpaca_position",
+            }:
+                continue
             broker_order_id = str(order.get("broker_order_id") or order.get("Broker Order ID") or "").strip()
             if not broker_order_id:
                 continue

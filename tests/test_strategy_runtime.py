@@ -6,13 +6,43 @@ from agentloop_trader.strategy_runtime import (
     adjust_initial_stop_settings,
     apply_buy_order_style,
     evaluate_exit_settings,
+    exit_plan_history_for_interval,
     exit_mode_for_settings,
+    latest_atr_snapshot,
     reprice_trade_intent,
-    saved_exit_settings_for_symbol,
     trade_intent_from_record,
     trade_intent_to_record,
-    update_exit_settings_for_symbol,
 )
+
+
+def test_exit_plan_history_matches_selected_position_interval():
+    assert exit_plan_history_for_interval("5m") == "1mo"
+    assert exit_plan_history_for_interval("4h") == "2y"
+    assert exit_plan_history_for_interval("1d") == "5y"
+
+
+def test_latest_atr_snapshot_uses_latest_completed_bar():
+    index = pd.date_range("2026-07-15 16:00", periods=4, freq="h", tz="UTC")
+    data = pd.DataFrame(
+        {
+            "Close": [10.0, 11.0, 12.0, 13.0],
+            "High": [11.0, 12.0, 13.0, 14.0],
+            "Low": [9.0, 10.0, 11.0, 12.0],
+        },
+        index=index,
+    )
+
+    atr, measured_at = latest_atr_snapshot(data, length=3)
+
+    assert atr == pytest.approx(2.0)
+    assert measured_at == index[-1].isoformat()
+
+
+def test_latest_atr_snapshot_rejects_incomplete_history():
+    data = pd.DataFrame({"Close": [10.0], "High": [11.0], "Low": [9.0]})
+
+    with pytest.raises(ValueError, match="Not enough completed bars"):
+        latest_atr_snapshot(data, length=14)
 
 
 def _intent():
@@ -72,27 +102,6 @@ def test_trade_intent_record_roundtrip():
     assert loaded.quantity == 10
 
 
-def test_exit_settings_update_and_read_latest_for_symbol():
-    tracked = [{"symbol": "AAPL", "side": "buy", "strategy_settings": {"interval": "1h"}}]
-    updated = update_exit_settings_for_symbol("AAPL", tracked, {"interval": "15m", "auto_exit_enabled": True})
-
-    settings = saved_exit_settings_for_symbol("AAPL", updated)
-
-    assert settings["interval"] == "15m"
-    assert settings["auto_exit_enabled"] is True
-
-
-def test_waiting_add_on_order_does_not_replace_filled_position_exit_plan():
-    tracked = [
-        {"symbol": "AAPL", "side": "buy", "status": "filled", "exit_settings": {"interval": "1h"}},
-        {"symbol": "AAPL", "side": "buy", "status": "accepted", "exit_settings": {"interval": "5m"}},
-    ]
-
-    settings = saved_exit_settings_for_symbol("AAPL", tracked)
-
-    assert settings["interval"] == "1h"
-
-
 def test_combined_position_rebases_original_stop_using_saved_risk_distance(monkeypatch):
     index = pd.date_range("2026-07-09 15:00", periods=4, freq="h", tz="UTC")
     data = pd.DataFrame(
@@ -132,6 +141,7 @@ def test_exit_settings_high_water_mark_starts_at_entry_time(monkeypatch):
         lambda market_data, settings, account: {"live": {"last_p": 110.0, "last_atr": 1.0, "exit_level": 90.0}},
     )
     settings = {
+        "auto_exit_enabled": True,
         "symbol": "AAPL",
         "history": "1y",
         "interval": "1h",
@@ -165,6 +175,7 @@ def test_profit_protection_stays_active_after_price_pulls_back(monkeypatch):
         lambda market_data, settings, account: {"live": {"last_p": 101.0, "last_atr": 1.0, "exit_level": 90.0}},
     )
     settings = {
+        "auto_exit_enabled": True,
         "entry_submitted_at": "2026-07-09T15:00:00+00:00",
         "entry_stop_distance": 2.0,
         "breakeven_after_r": 1.0,

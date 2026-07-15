@@ -161,7 +161,12 @@ def refresh_tracked_alpaca_orders(tracked_orders: list[dict], alpaca_orders: lis
         record = dict(tracked)
         broker_order_id = str(record.get("broker_order_id") or record.get("Alpaca Order ID") or record.get("Broker Order ID") or "").strip()
         alpaca_order = alpaca_by_id.get(broker_order_id)
-        if record.get("adopted") and record.get("source") == "adopted_alpaca_position":
+        source = str(record.get("source") or "").strip().lower()
+        if source in {"position_plan", "position_observation"}:
+            record["lifecycle_status"] = source
+            refreshed.append(record)
+            continue
+        elif record.get("adopted") and source == "adopted_alpaca_position":
             record["lifecycle_status"] = "adopted_alpaca_position"
         elif not broker_order_id:
             record["lifecycle_status"] = "missing_broker_order_id"
@@ -190,7 +195,10 @@ def refresh_tracked_alpaca_orders(tracked_orders: list[dict], alpaca_orders: lis
 
 
 def alpaca_order_lifecycle_records(tracked_orders: list[dict], alpaca_orders: list[dict]) -> list[dict]:
-    refreshed = refresh_tracked_alpaca_orders(tracked_orders, alpaca_orders)
+    refreshed = [
+        order for order in refresh_tracked_alpaca_orders(tracked_orders, alpaca_orders)
+        if str(order.get("source") or "").strip().lower() not in {"position_plan", "position_observation"}
+    ]
     return [
         {
             "Order ID": str(order.get("broker_order_id", ""))[:8],
@@ -209,10 +217,14 @@ def alpaca_order_lifecycle_records(tracked_orders: list[dict], alpaca_orders: li
 
 
 def alpaca_order_lifecycle_summary_records(tracked_orders: list[dict]) -> list[dict]:
-    statuses = [_enum_value(order.get("status", "")) for order in tracked_orders]
-    lifecycle_statuses = [str(order.get("lifecycle_status", "")) for order in tracked_orders]
+    broker_orders = [
+        order for order in tracked_orders
+        if str(order.get("source") or "").strip().lower() not in {"position_plan", "position_observation"}
+    ]
+    statuses = [_enum_value(order.get("status", "")) for order in broker_orders]
+    lifecycle_statuses = [str(order.get("lifecycle_status", "")) for order in broker_orders]
     return [
-        {"Metric": "Saved Alpaca orders", "Value": len(tracked_orders)},
+        {"Metric": "Saved Alpaca orders", "Value": len(broker_orders)},
         {"Metric": "Open orders at Alpaca", "Value": lifecycle_statuses.count("open_at_alpaca")},
         {"Metric": "Filled orders at Alpaca", "Value": statuses.count("filled")},
         {"Metric": "Positions manually added to app", "Value": lifecycle_statuses.count("adopted_alpaca_position")},
@@ -223,65 +235,33 @@ def alpaca_order_lifecycle_summary_records(tracked_orders: list[dict]) -> list[d
 
 
 def alpaca_position_lifecycle_records(position_records: list[dict], tracked_orders: list[dict]) -> list[dict]:
-    filled_buy_orders = [
+    current_records = [
         order for order in tracked_orders
-        if _enum_value(order.get("status", "")) == "filled" and _enum_value(order.get("side", "")) == "buy"
+        if str(order.get("source") or "").strip().lower() in {"position_observation", "position_plan"}
+        and not str(order.get("status") or "").strip().lower().startswith("closed_")
     ]
-    filled_by_symbol: dict[str, list[dict]] = {}
-    for order in filled_buy_orders:
-        symbol = str(order.get("symbol", "")).strip().upper()
-        if symbol:
-            filled_by_symbol.setdefault(symbol, []).append(order)
-
     rows = []
-    position_symbols = set()
     for position in position_records:
         symbol = str(position.get("Symbol", "")).strip().upper()
         if not symbol:
             continue
-        position_symbols.add(symbol)
-        matched_orders = filled_by_symbol.get(symbol, [])
-        filled_qty = sum(_as_float(order.get("filled_quantity") or order.get("quantity")) for order in matched_orders)
-        latest_order = matched_orders[-1] if matched_orders else {}
-        position_qty = _as_float(position.get("Quantity"))
-        adopted_match = bool(matched_orders) and all(_is_adopted_position_order(order) for order in matched_orders)
-        tracking_status = (
-            "adopted_alpaca_position"
-            if adopted_match
-            else "position_matched_to_filled_order"
-            if matched_orders
-            else "untracked_alpaca_position"
-        )
+        matching = [row for row in current_records if str(row.get("symbol") or "").strip().upper() == symbol]
+        plan = next((row for row in matching if str(row.get("source") or "").strip().lower() == "position_plan"), None)
+        observation = next((row for row in matching if str(row.get("source") or "").strip().lower() == "position_observation"), None)
+        current = plan or observation or {}
+        exit_settings = plan.get("exit_settings") if plan else {}
+        tracking_status = "managed_current_cycle" if plan else "position_cycle_observed" if observation else "untracked_alpaca_position"
         rows.append(
             {
                 "Symbol": symbol,
                 "Position Qty": position.get("Quantity", ""),
                 "Position Value": position.get("Market Value", ""),
                 "Avg Entry": position.get("Average Entry", ""),
-                "Tracked Order Qty": _format_number(filled_qty) if matched_orders else "",
-                "Tracked Avg Fill": latest_order.get("average_fill_price", ""),
-                "Matched Saved Orders": len(matched_orders),
-                "Exit Ready": position_qty > 0,
+                "Current Cycle": current.get("position_cycle_id", ""),
+                "Basis BUY": current.get("position_basis_order_id", ""),
+                "Exit Plan Saved": plan is not None,
+                "Auto Exit On": bool(exit_settings.get("auto_exit_enabled", False)),
                 "Tracking Status": _display_position_status(tracking_status),
-            }
-        )
-
-    for symbol, orders in sorted(filled_by_symbol.items()):
-        if symbol in position_symbols:
-            continue
-        filled_qty = sum(_as_float(order.get("filled_quantity") or order.get("quantity")) for order in orders)
-        latest_order = orders[-1]
-        rows.append(
-            {
-                "Symbol": symbol,
-                "Position Qty": "",
-                "Position Value": "",
-                "Avg Entry": "",
-                "Tracked Order Qty": _format_number(filled_qty),
-                "Tracked Avg Fill": latest_order.get("average_fill_price", ""),
-                "Matched Saved Orders": len(orders),
-                "Exit Ready": False,
-                "Tracking Status": _display_position_status("filled_order_without_open_position"),
             }
         )
     return rows
@@ -291,11 +271,10 @@ def alpaca_position_lifecycle_summary_records(position_lifecycle_rows: list[dict
     statuses = [str(row.get("Tracking Status", "")) for row in position_lifecycle_rows]
     return [
         {"Metric": "Open Alpaca positions", "Value": sum(bool(row.get("Position Qty")) for row in position_lifecycle_rows)},
-        {"Metric": "Positions matched to app orders", "Value": statuses.count("Matched to app order")},
-        {"Metric": "Positions manually added to app", "Value": statuses.count("Tracked manually")},
-        {"Metric": "Positions needing app tracking", "Value": statuses.count("Needs app tracking")},
-        {"Metric": "Filled app orders without a position", "Value": statuses.count("No open Alpaca position")},
-        {"Metric": "Exit orders ready to review", "Value": sum(bool(row.get("Exit Ready")) for row in position_lifecycle_rows)},
+        {"Metric": "Positions with saved exit plans", "Value": statuses.count("Managed current position")},
+        {"Metric": "Positions found without an exit plan", "Value": statuses.count("Position found; exit plan not saved")},
+        {"Metric": "Unmanaged positions", "Value": statuses.count("Unmanaged position")},
+        {"Metric": "Positions with auto exit on", "Value": sum(bool(row.get("Auto Exit On")) for row in position_lifecycle_rows)},
     ]
 
 
@@ -325,15 +304,13 @@ def _display_order_status(status: str) -> str:
 
 def _display_position_status(status: str) -> str:
     return {
+        "managed_current_cycle": "Managed current position",
         "position_matched_to_filled_order": "Matched to app order",
+        "position_cycle_observed": "Position found; exit plan not saved",
         "adopted_alpaca_position": "Tracked manually",
-        "untracked_alpaca_position": "Needs app tracking",
+        "untracked_alpaca_position": "Unmanaged position",
         "filled_order_without_open_position": "No open Alpaca position",
     }.get(status, status or "")
-
-
-def _is_adopted_position_order(order: dict) -> bool:
-    return bool(order.get("adopted")) and str(order.get("source", "")) == "adopted_alpaca_position"
 
 
 def _format_number(value: float) -> str:
@@ -343,68 +320,32 @@ def _format_number(value: float) -> str:
 
 
 def reconcile_alpaca_positions(position_records: list[dict], tracked_orders: list[dict]) -> list[dict]:
-    tracked_symbols = {str(order.get("symbol", "")).strip().upper() for order in tracked_orders}
+    current_records = [
+        order for order in tracked_orders
+        if str(order.get("source") or "").strip().lower() in {"position_plan", "position_observation"}
+        and not str(order.get("status") or "").strip().lower().startswith("closed_")
+    ]
+    by_symbol: dict[str, list[dict]] = {}
+    for record in current_records:
+        symbol = str(record.get("symbol") or "").strip().upper()
+        if symbol:
+            by_symbol.setdefault(symbol, []).append(record)
     rows = []
     for position in position_records:
         symbol = str(position.get("Symbol", "")).strip().upper()
-        rows.append(
-            {
-                "Symbol": symbol,
-                "Alpaca Qty": position.get("Quantity", ""),
-                "Market Value": position.get("Market Value", ""),
-                "Tracked By App": symbol in tracked_symbols,
-                "Status": "matched" if symbol in tracked_symbols else "unmatched_alpaca_position",
-            }
-        )
-    for symbol in sorted(s for s in tracked_symbols if s not in _as_symbol_set(position_records)):
-        rows.append(
-            {
-                "Symbol": symbol,
-                "Alpaca Qty": "",
-                "Market Value": "",
-                "Tracked By App": True,
-                "Status": "tracked_order_without_position",
-            }
-        )
+        matching = by_symbol.get(symbol, [])
+        plan = next((row for row in matching if str(row.get("source") or "").strip().lower() == "position_plan"), None)
+        observation = next((row for row in matching if str(row.get("source") or "").strip().lower() == "position_observation"), None)
+        current = plan or observation
+        rows.append({
+            "Symbol": symbol,
+            "Alpaca Qty": position.get("Quantity", ""),
+            "Market Value": position.get("Market Value", ""),
+            "Current Cycle": current.get("position_cycle_id", "") if current else "",
+            "Exit Plan Saved": plan is not None,
+            "Status": "Managed current position" if plan else "Position found; exit plan not saved" if observation else "Unmanaged position",
+        })
     return rows
-
-
-def adopt_alpaca_position(position: dict, adopted_at: datetime | None = None) -> dict:
-    asset_class = normalize_asset_class(position.get("Asset Type"), position.get("Symbol", ""))
-    symbol = normalize_symbol(position.get("Symbol", ""), asset_class)
-    quantity = _as_float(position.get("Quantity"))
-    average_entry = _as_float(position.get("Average Entry"))
-    if not symbol:
-        raise ValueError("Cannot adopt an Alpaca position without a symbol.")
-    if quantity <= 0:
-        raise ValueError("Cannot adopt an Alpaca position without positive quantity.")
-    if adopted_at is None:
-        now_dt = datetime.now(PACIFIC_TIME)
-    elif adopted_at.tzinfo:
-        now_dt = adopted_at.astimezone(PACIFIC_TIME)
-    else:
-        now_dt = adopted_at.replace(tzinfo=PACIFIC_TIME)
-    now = now_dt.isoformat()
-    compact_time = now_dt.strftime("%Y%m%d%H%M%S")
-    return {
-        "broker_order_id": f"adopted-{symbol}-{compact_time}",
-        "preview_hash": "",
-        "symbol": symbol,
-        "asset_class": asset_class,
-        "side": "buy",
-        "quantity": _format_number(quantity),
-        "status": "filled",
-        "alpaca_status_raw": "adopted_position",
-        "submitted_at": "",
-        "filled_at": now,
-        "filled_quantity": _format_number(quantity),
-        "average_fill_price": _format_number(average_entry),
-        "lifecycle_status": "adopted_alpaca_position",
-        "last_synced_at": now,
-        "source": "adopted_alpaca_position",
-        "adopted": True,
-        "broker_writes_submitted": 0,
-    }
 
 
 def build_exit_intent_from_position(position: dict) -> TradeIntent | None:
@@ -440,65 +381,6 @@ def build_exit_order_previews(position_records: list[dict], config: AlpacaConfig
         if intent is not None:
             previews.append(build_alpaca_order_preview(intent, approved_decision, config))
     return previews
-
-
-def simulated_alpaca_fill_order(
-    tracked_order: dict | None,
-    fill_price: float | None = None,
-    filled_at: datetime | None = None,
-) -> dict:
-    record = dict(tracked_order or {})
-    quantity = _as_float(record.get("filled_quantity") or record.get("quantity"))
-    price = fill_price if fill_price is not None else _as_float(record.get("average_fill_price") or record.get("entry_price"))
-    now_dt = None
-    if filled_at is not None:
-        now_dt = filled_at.astimezone(PACIFIC_TIME) if filled_at.tzinfo else filled_at.replace(tzinfo=PACIFIC_TIME)
-    now = (now_dt or datetime.now(PACIFIC_TIME)).isoformat()
-    record.update(
-        {
-            "status": "filled",
-            "alpaca_status_raw": "simulated_fill",
-            "filled_at": now,
-            "filled_quantity": _format_number(quantity),
-            "average_fill_price": _format_number(price),
-            "lifecycle_status": "filled_at_alpaca",
-            "last_synced_at": now,
-            "simulated": True,
-        }
-    )
-    return record
-
-
-def simulated_position_from_filled_order(filled_order: dict) -> dict:
-    quantity = _as_float(filled_order.get("filled_quantity") or filled_order.get("quantity"))
-    price = _as_float(filled_order.get("average_fill_price"))
-    return {
-        "Symbol": str(filled_order.get("symbol", "")).strip().upper(),
-        "Quantity": _format_number(quantity),
-        "Market Value": round(quantity * price, 2),
-        "Average Entry": _format_number(price),
-        "Source": "simulated_fill",
-    }
-
-
-def simulated_exit_preview_readiness_records(
-    tracked_order: dict | None,
-    config: AlpacaConfig,
-) -> list[dict]:
-    if not tracked_order:
-        return [{"Check": "Filled order selected", "Passed": False, "Detail": "Select a saved order before practicing the exit check."}]
-    filled_order = simulated_alpaca_fill_order(tracked_order)
-    position = simulated_position_from_filled_order(filled_order)
-    previews = build_exit_order_previews([position], config)
-    preview = previews[0] if previews else None
-    blockers = exit_position_reasons(preview, [position]) if preview else ["No simulated exit preview was generated."]
-    return [
-        {"Check": "Filled order selected", "Passed": True, "Detail": filled_order.get("broker_order_id", "")},
-        {"Check": "Practice position created", "Passed": bool(position.get("Symbol")), "Detail": position.get("Symbol", "")},
-        {"Check": "Exit order ready", "Passed": bool(preview and preview.valid), "Detail": "" if preview and preview.valid else "; ".join(preview.blocked_reasons if preview else blockers)},
-        {"Check": "Position can be exited", "Passed": not blockers, "Detail": "Practice position can be exited." if not blockers else "; ".join(blockers)},
-        {"Check": "Orders sent", "Passed": True, "Detail": "0"},
-    ]
 
 
 def exit_preview_records(previews: list[AlpacaOrderPreview]) -> list[dict]:
@@ -552,10 +434,14 @@ class BrokerStateStore:
         with self._exclusive_lock():
             records = self._read_unlocked()
             key = record.get("broker_order_id")
+            prior = next((item for item in records if item.get("broker_order_id") == key), {})
             records = [item for item in records if item.get("broker_order_id") != key]
-            record = dict(record)
-            record.setdefault("created_at", datetime.now(PACIFIC_TIME).isoformat())
-            records.append(record)
+            merged = self._merge_record(prior, dict(record))
+            for settings_key in ("strategy_settings", "exit_settings"):
+                if not merged.get(settings_key) and prior.get(settings_key):
+                    merged[settings_key] = prior[settings_key]
+            merged.setdefault("created_at", prior.get("created_at") or datetime.now(PACIFIC_TIME).isoformat())
+            records.append(merged)
             self._replace_all_unlocked(records)
 
     def replace_all(self, records: list[dict]) -> None:
@@ -573,7 +459,7 @@ class BrokerStateStore:
                 unkeyed.append(record)
                 continue
             prior = merged.get(key, {})
-            merged_record = {**prior, **record}
+            merged_record = self._merge_record(prior, record)
             for settings_key in ("strategy_settings", "exit_settings"):
                 if not record.get(settings_key) and prior.get(settings_key):
                     merged_record[settings_key] = prior[settings_key]
@@ -589,6 +475,33 @@ class BrokerStateStore:
                     temporary.unlink()
                 except OSError:
                     pass
+
+    @staticmethod
+    def _merge_record(prior: dict, incoming: dict) -> dict:
+        """Merge one record without allowing a stale process to undo a newer user plan edit."""
+        if not prior:
+            return dict(incoming)
+        prior_source = str(prior.get("source") or "").strip().lower()
+        incoming_source = str(incoming.get("source") or "").strip().lower()
+        if prior_source == incoming_source == "position_plan":
+            prior_updated = BrokerStateStore._plan_user_updated_at(prior)
+            incoming_updated = BrokerStateStore._plan_user_updated_at(incoming)
+            if prior_updated is not None and (incoming_updated is None or prior_updated > incoming_updated):
+                return dict(prior)
+        return {**prior, **incoming}
+
+    @staticmethod
+    def _plan_user_updated_at(record: dict) -> datetime | None:
+        value = (record.get("exit_settings") or {}).get("plan_user_updated_at")
+        if value in (None, "", "None"):
+            return None
+        try:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        return parsed.astimezone(UTC)
 
     @contextmanager
     def _exclusive_lock(self):

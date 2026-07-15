@@ -31,7 +31,8 @@ def new_session_id() -> str:
 def session_summary_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     event_types = [record.get("event_type", "") for record in snapshot.audit_records]
     local_filled = [order for order in snapshot.local_orders if _enum_value(order.get("Status")) == "filled"]
-    alpaca_statuses = [_enum_value(order.get("status", "")) for order in snapshot.tracked_alpaca_orders]
+    broker_orders = _broker_order_records(snapshot.tracked_alpaca_orders)
+    alpaca_statuses = [_enum_value(order.get("status", "")) for order in broker_orders]
     return [
         {"Metric": "Session ID", "Value": snapshot.session_id},
         {"Metric": "Started", "Value": snapshot.started_at},
@@ -40,12 +41,12 @@ def session_summary_records(snapshot: PaperSessionSnapshot) -> list[dict]:
         {"Metric": "App paper orders", "Value": len(snapshot.local_orders)},
         {"Metric": "Filled app paper orders", "Value": len(local_filled)},
         {"Metric": "Open app paper positions", "Value": len(snapshot.local_positions)},
-        {"Metric": "Saved Alpaca orders", "Value": len(snapshot.tracked_alpaca_orders)},
+        {"Metric": "Saved Alpaca orders", "Value": len(broker_orders)},
         {"Metric": "Filled Alpaca orders", "Value": alpaca_statuses.count("filled")},
         {"Metric": "Canceled Alpaca orders", "Value": alpaca_statuses.count("canceled") + alpaca_statuses.count("cancelled")},
-        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")},
-        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted")},
-        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")},
+        {"Metric": "Paper buys sent", "Value": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted") + event_types.count("worker_paper_buy_sent")},
+        {"Metric": "Paper cancels sent", "Value": event_types.count("alpaca_paper_cancel_submitted") + event_types.count("worker_limit_buy_cancelled") + event_types.count("worker_rsi_late_buy_cancelled")},
+        {"Metric": "Paper exits sent", "Value": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted") + event_types.count("worker_paper_exit_sent")},
     ]
 
 
@@ -96,6 +97,10 @@ def automatic_exit_records(
                 "Decision Price": _optional_money(details.get("current_price")),
                 "Sell Trigger": _optional_money(details.get("trigger_price")),
                 "Trigger Rule": details.get("trigger_source") or "Not recorded by older in-page exit",
+                "Position Cycle": payload.get("position_cycle_id", "Not recorded"),
+                "Average Entry": _optional_money(payload.get("position_average_entry")),
+                "Current Profit in R": _optional_r(details.get("profit_r")),
+                "Highest Profit in R": _optional_r(details.get("highest_profit_r")),
                 "Alpaca Fill": _optional_money(tracked.get("average_fill_price")),
                 "Reason": payload.get("reason") or record.get("message", ""),
                 "Alpaca Order ID": broker_order_id,
@@ -122,14 +127,15 @@ def paper_performance_records(snapshot: PaperSessionSnapshot) -> list[dict]:
 
 
 def alpaca_paper_activity_records(snapshot: PaperSessionSnapshot) -> list[dict]:
-    alpaca_filled = [order for order in snapshot.tracked_alpaca_orders if _enum_value(order.get("status")) == "filled"]
+    broker_orders = _broker_order_records(snapshot.tracked_alpaca_orders)
+    alpaca_filled = [order for order in broker_orders if _enum_value(order.get("status")) == "filled"]
     alpaca_filled_qty = sum(_as_float(order.get("filled_quantity") or order.get("quantity")) for order in alpaca_filled)
     alpaca_canceled = [
-        order for order in snapshot.tracked_alpaca_orders
+        order for order in broker_orders
         if _enum_value(order.get("status")) in {"canceled", "cancelled"}
     ]
     alpaca_waiting = [
-        order for order in snapshot.tracked_alpaca_orders
+        order for order in broker_orders
         if _enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"}
     ]
     estimated_fees, fee_orders, missing_fee_orders = _filled_order_fee_summary(alpaca_filled)
@@ -137,7 +143,7 @@ def alpaca_paper_activity_records(snapshot: PaperSessionSnapshot) -> list[dict]:
     if fee_orders and missing_fee_orders:
         fee_value += f" ({missing_fee_orders} older fill(s) missing details)"
     return [
-        {"Metric": "Saved Alpaca orders", "Value": len(snapshot.tracked_alpaca_orders)},
+        {"Metric": "Saved Alpaca orders", "Value": len(broker_orders)},
         {"Metric": "Filled Alpaca shares", "Value": _format_number(alpaca_filled_qty)},
         {"Metric": "Filled Alpaca orders", "Value": len(alpaca_filled)},
         {"Metric": "Canceled Alpaca orders", "Value": len(alpaca_canceled)},
@@ -152,16 +158,29 @@ def paper_trading_review_records(
     alpaca_account_value: float | None = None,
 ) -> list[dict]:
     event_types = [record.get("event_type", "") for record in snapshot.audit_records]
-    buy_count = event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")
-    exit_count = event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")
-    cancel_count = event_types.count("alpaca_paper_cancel_submitted")
+    buy_count = (
+        event_types.count("alpaca_paper_order_submitted")
+        + event_types.count("auto_paper_entry_submitted")
+        + event_types.count("worker_paper_buy_sent")
+    )
+    exit_count = (
+        event_types.count("alpaca_paper_exit_submitted")
+        + event_types.count("auto_paper_exit_submitted")
+        + event_types.count("worker_paper_exit_sent")
+    )
+    cancel_count = (
+        event_types.count("alpaca_paper_cancel_submitted")
+        + event_types.count("worker_limit_buy_cancelled")
+        + event_types.count("worker_rsi_late_buy_cancelled")
+    )
     blocked_count = sum(1 for event_type in event_types if "blocked" in event_type or "rejected" in event_type)
+    broker_orders = _broker_order_records(snapshot.tracked_alpaca_orders)
     waiting_orders = [
-        order for order in snapshot.tracked_alpaca_orders
+        order for order in broker_orders
         if _enum_value(order.get("status")) in {"accepted", "new", "pending_new", "partially_filled"}
     ]
     account_value = _money(alpaca_account_value) if alpaca_account_value is not None else "Not connected"
-    alpaca_filled = [order for order in snapshot.tracked_alpaca_orders if _enum_value(order.get("status")) == "filled"]
+    alpaca_filled = [order for order in broker_orders if _enum_value(order.get("status")) == "filled"]
     estimated_fees, fee_orders, _ = _filled_order_fee_summary(alpaca_filled)
     fee_read = _money(estimated_fees) if fee_orders else "Not available"
     if blocked_count:
@@ -218,9 +237,13 @@ def paper_testing_progress_records(
     paper_event_types = {
         "alpaca_paper_order_submitted",
         "auto_paper_entry_submitted",
+        "worker_paper_buy_sent",
         "alpaca_paper_exit_submitted",
         "auto_paper_exit_submitted",
+        "worker_paper_exit_sent",
         "alpaca_paper_cancel_submitted",
+        "worker_limit_buy_cancelled",
+        "worker_rsi_late_buy_cancelled",
     }
     paper_records = [record for record in audit_records if record.get("event_type") in paper_event_types]
     active_dates = sorted(
@@ -231,11 +254,11 @@ def paper_testing_progress_records(
         }
     )
     event_types = [record.get("event_type", "") for record in audit_records]
-    buy_count = event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted")
-    exit_count = event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted")
+    buy_count = event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted") + event_types.count("worker_paper_buy_sent")
+    exit_count = event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted") + event_types.count("worker_paper_exit_sent")
     blocked_count = sum(1 for event_type in event_types if "blocked" in event_type or "rejected" in event_type)
     filled_orders = [
-        order for order in tracked_alpaca_orders
+        order for order in _broker_order_records(tracked_alpaca_orders)
         if _enum_value(order.get("status")) == "filled"
     ]
     ready_for_review = len(active_dates) >= target_days and buy_count > 0 and exit_count > 0 and blocked_count == 0
@@ -260,6 +283,14 @@ def _enum_value(value: Any) -> str:
     return text.strip().lower()
 
 
+def _broker_order_records(records: list[dict]) -> list[dict]:
+    return [
+        order for order in records
+        if str(order.get("source") or "").strip().lower()
+        not in {"position_plan", "position_observation"}
+    ]
+
+
 def _as_float(value: Any) -> float:
     try:
         return float(value)
@@ -282,5 +313,14 @@ def _optional_money(value: Any) -> str:
         return "Not recorded"
     try:
         return _money(float(value))
+    except (TypeError, ValueError):
+        return "Not recorded"
+
+
+def _optional_r(value: Any) -> str:
+    if value in (None, ""):
+        return "Not recorded"
+    try:
+        return f"{float(value):.2f}R"
     except (TypeError, ValueError):
         return "Not recorded"

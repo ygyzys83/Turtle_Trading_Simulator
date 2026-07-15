@@ -34,16 +34,14 @@ Use these checks before any live-trading work. The labels below match the Stream
 3. Click `Arm Alpaca Paper Exit`.
 4. Do not click `Submit Alpaca Paper Exit` until the preview has been manually inspected.
 
-## Local Simulator Check
+## Position Lifecycle Check
 
-1. Open `Local paper lifecycle simulators`.
-2. Select a tracked order.
-3. Enter a `Simulated fill price`.
-4. Click `Simulate Alpaca Paper Fill`.
-5. Confirm `Simulated Alpaca paper position lifecycle` appears.
-6. Confirm `Exit-path simulator` shows `Broker Writes Submitted` as `0`.
-7. Click `Record Simulated Exit Readiness`.
-8. Confirm `Pre-live readiness report` still keeps real fill/exit checks blocked until actual Alpaca paper evidence exists.
+1. Fill a real Alpaca paper BUY and refresh the app.
+2. Confirm the position's cycle ID and basis BUY match the current Alpaca fill.
+3. Confirm the average entry and initial stop are based on Alpaca's actual average fill.
+4. Fully exit the position and then re-enter the same ticker.
+5. Confirm the re-entry starts a new cycle and does not inherit the prior cycle's high-water mark or profit protection.
+6. Confirm a position opened directly in Alpaca remains unmanaged until exit settings are explicitly saved.
 
 ## Automation Evidence Check
 

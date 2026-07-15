@@ -21,7 +21,6 @@ from agentloop_trader.automation_runtime import (
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
     OPEN_ORDER_STATUSES,
-    adopt_alpaca_position,
     build_exit_intent_from_position,
     market_session_advisory,
     open_exit_order_reasons,
@@ -42,14 +41,17 @@ from agentloop_trader.market_data import (
     fetch_price_bars,
 )
 from agentloop_trader.models import AuditEvent, ExecutionDecision, PACIFIC_TIME, RiskCheckResult, RiskLimits
+from agentloop_trader.position_lifecycle import (
+    resolve_position_plan,
+    synchronize_position_plans,
+    upsert_position_plan,
+)
 from agentloop_trader.risk import check_trade_intent, constrain_trade_intent_to_limits
 from agentloop_trader.strategy_runtime import (
     apply_buy_order_style,
     evaluate_exit_settings,
     reprice_trade_intent,
     selected_strategy_result,
-    saved_exit_settings_for_symbol,
-    update_exit_settings_for_symbol,
 )
 from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
@@ -238,8 +240,12 @@ def _strict_broker_records(adapter: AlpacaBrokerAdapterStub, method_name: str) -
 def _track_broker_order(order: Any, preview_hash: str, strategy_settings: dict[str, Any] | None = None) -> dict:
     record = asdict(alpaca_tracked_order_from_broker_order(order, preview_hash=preview_hash))
     if strategy_settings:
-        record["strategy_settings"] = dict(strategy_settings)
-        record["exit_settings"] = dict(strategy_settings)
+        owned_settings = dict(strategy_settings)
+        broker_order_id = str(record.get("broker_order_id") or "").strip()
+        if broker_order_id:
+            owned_settings["entry_broker_order_id"] = broker_order_id
+        record["strategy_settings"] = dict(owned_settings)
+        record["exit_settings"] = dict(owned_settings)
     record["broker_writes_submitted"] = 1
     return record
 
@@ -261,17 +267,6 @@ def _fetcher(control: AutomationControl, config: AlpacaConfig) -> Callable[[str,
         return data.copy() if hasattr(data, "copy") else data
 
     return fetch
-
-
-def _reconcile_positions(positions: list[dict], tracked_orders: list[dict]) -> list[dict]:
-    tracked_symbols = {str(row.get("symbol", "")).strip().upper() for row in tracked_orders if row.get("symbol")}
-    updated = list(tracked_orders)
-    for position in positions:
-        symbol = str(position.get("Symbol", "")).strip().upper()
-        if symbol and symbol not in tracked_symbols and _number(position.get("Quantity")) > 0:
-            updated.append(adopt_alpaca_position(position))
-            tracked_symbols.add(symbol)
-    return updated
 
 
 def _cancel_stale_limit_buys(
@@ -401,7 +396,10 @@ def _send_exits(
             continue
         if asset_class != "crypto" and not _market_is_open(adapter):
             continue
-        settings = saved_exit_settings_for_symbol(symbol, updated)
+        resolution = resolve_position_plan(position, orders, updated)
+        settings = resolution.exit_settings
+        if not resolution.cycle or not resolution.cycle.reliable:
+            continue
         details = evaluate_exit_settings(settings, position, fetch_bars)
         if settings and details.get("state_changed"):
             refreshed_settings = dict(settings)
@@ -409,7 +407,14 @@ def _send_exits(
                 refreshed_settings["highest_high_since_entry"] = details.get("highest_high_since_entry")
             if details.get("trigger_price") is not None:
                 refreshed_settings["last_exit_trigger_price"] = details.get("trigger_price")
-            updated = update_exit_settings_for_symbol(symbol, updated, refreshed_settings)
+            refreshed_settings["last_exit_checked_at"] = datetime.now(PACIFIC_TIME).isoformat()
+            updated = upsert_position_plan(
+                position,
+                orders,
+                updated,
+                refreshed_settings,
+                resolution.entry_settings,
+            )
         if not details.get("ready"):
             continue
         intent = build_exit_intent_from_position(position)
@@ -423,6 +428,12 @@ def _send_exits(
             continue
         order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
         tracked_exit = _track_broker_order(order, preview.preview_hash, settings)
+        tracked_exit.update({
+            "parent_position_cycle_id": resolution.cycle.cycle_id,
+            "parent_position_basis_order_id": resolution.cycle.basis_order_id,
+            "decision_trigger_price": details.get("trigger_price"),
+            "decision_trigger_source": details.get("trigger_source"),
+        })
         updated.append(tracked_exit)
         sent += 1
         audit_store.append(AuditEvent(
@@ -434,6 +445,13 @@ def _send_exits(
                 "review_id": preview.preview_hash,
                 "broker_order_id": tracked_exit.get("broker_order_id", ""),
                 "reason": details.get("reason"),
+                "position_cycle_id": resolution.cycle.cycle_id,
+                "position_basis_order_id": resolution.cycle.basis_order_id,
+                "position_buy_order_ids": list(resolution.cycle.buy_order_ids),
+                "position_average_entry": resolution.cycle.average_entry,
+                "position_cycle_started_at": resolution.cycle.started_at,
+                "entry_filled_at": settings.get("entry_filled_at") if settings else None,
+                "entry_stop_distance": settings.get("entry_stop_distance") if settings else None,
                 "exit_details": {
                     "current_price": details.get("current_price"),
                     "trigger_price": details.get("trigger_price"),
@@ -444,6 +462,7 @@ def _send_exits(
                     "trailing_stop_price": details.get("trailing_stop_price"),
                     "highest_high_since_entry": details.get("highest_high_since_entry"),
                     "profit_r": details.get("profit_r"),
+                    "highest_profit_r": details.get("highest_profit_r"),
                     "current_atr": details.get("current_atr"),
                     "interval": details.get("interval"),
                 },
@@ -536,6 +555,10 @@ def _send_entry(
         "interval": control.interval,
         "price_data_source": control.price_data_source,
         "account_size": account_equity,
+        "sizing_account_source": "Alpaca paper account",
+        "sizing_account_equity": account_equity,
+        "sizing_available_cash": available_cash,
+        "risk_limits_at_entry": dict(control.risk_limits),
         "entry_reference_price": intent.entry_price,
         "entry_stop_atr_multiplier": settings.get("atr_stop_multiplier"),
         "entry_stop_loss": intent.stop_loss,
@@ -543,6 +566,7 @@ def _send_entry(
         "planned_order_type": intent.order_type,
         "planned_limit_price": intent.limit_price,
         "planned_quantity": intent.quantity,
+        "planned_entry_price": intent.entry_price,
         "auto_exit_enabled": True,
         "exit_mode": "strategy_and_atr",
         "entry_rsi": live.get("rsi"),
@@ -559,7 +583,10 @@ def _send_entry(
         ),
     })
     tracked_orders = list(tracked_orders)
-    tracked_orders.append(_track_broker_order(order, preview.preview_hash, settings))
+    tracked_entry = _track_broker_order(order, preview.preview_hash, settings)
+    tracked_entry["source"] = "buy_watchlist"
+    tracked_entry["buy_watch_plan_id"] = settings.get("buy_watch_plan_id")
+    tracked_orders.append(tracked_entry)
     audit_store.append(AuditEvent(
         event_type="worker_paper_buy_sent",
         message="Background worker sent an Alpaca paper buy.",
@@ -967,7 +994,7 @@ def run_once(
         positions = _strict_broker_records(adapter, "position_records")
         orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(broker_store.read(), orders)
-        tracked = _reconcile_positions(positions, tracked)
+        tracked, _, _ = synchronize_position_plans(positions, orders, tracked)
 
         fetch_bars = _fetcher(control, adapter.config)
         rsi_cancel_count, rsi_cancel_action = _cancel_late_rsi_limit_buys(
@@ -981,11 +1008,16 @@ def run_once(
         cancel_action = "; ".join(text for text in (rsi_cancel_action, stale_cancel_action) if text)
         orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
+        tracked, _, _ = synchronize_position_plans(positions, orders, tracked)
         exit_count, tracked, exit_action = _send_exits(control, adapter, positions, orders, tracked, fetch_bars, audit_store)
-        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
+        latest_orders = _strict_broker_records(adapter, "order_records")
+        tracked = refresh_tracked_alpaca_orders(tracked, latest_orders)
+        tracked, _, _ = synchronize_position_plans(positions, latest_orders, tracked)
+        broker_store.replace_all(tracked)
         positions = _strict_broker_records(adapter, "position_records")
         orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
+        tracked, _, _ = synchronize_position_plans(positions, orders, tracked)
         watchlist_store = BuyWatchlistStore(control.buy_watchlist_path)
         watchlist_plans = watchlist_store.read()
         if watchlist_plans:
@@ -1028,7 +1060,11 @@ def run_once(
         else:
             buy_count = 0
             buy_action = "Buy watchlist is empty; no automatic buys are monitored."
-        broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
+        latest_orders = _strict_broker_records(adapter, "order_records")
+        tracked = refresh_tracked_alpaca_orders(tracked, latest_orders)
+        latest_positions = _strict_broker_records(adapter, "position_records")
+        tracked, _, _ = synchronize_position_plans(latest_positions, latest_orders, tracked)
+        broker_store.replace_all(tracked)
 
         actions = [text for text in (cancel_action, exit_action, buy_action) if text]
         state = "Ready" if buy_count or exit_count or cancel_count else "Watching"

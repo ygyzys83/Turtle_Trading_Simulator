@@ -33,6 +33,11 @@ def _snapshot():
             },
             {"status": "canceled", "quantity": "10"},
             {"status": "accepted", "quantity": "5"},
+            {
+                "status": "managed_exit_settings",
+                "source": "position_plan",
+                "quantity": "999",
+            },
         ],
         audit_records=[
             {
@@ -103,11 +108,15 @@ def test_automatic_exit_records_explain_worker_trigger_and_fill():
             "symbol": "WYFI",
             "quantity": 142,
             "broker_order_id": "exit-123",
+            "position_cycle_id": "buy-456",
+            "position_average_entry": 32.09,
             "reason": "Exit now because WYFI is at or below the break-even stop at $32.09.",
             "exit_details": {
                 "current_price": 32.01,
                 "trigger_price": 32.09,
                 "trigger_source": "break-even stop",
+                "profit_r": -0.02,
+                "highest_profit_r": 1.08,
             },
         },
     }]
@@ -122,6 +131,10 @@ def test_automatic_exit_records_explain_worker_trigger_and_fill():
         "Decision Price": "$32.01",
         "Sell Trigger": "$32.09",
         "Trigger Rule": "break-even stop",
+        "Position Cycle": "buy-456",
+        "Average Entry": "$32.09",
+        "Current Profit in R": "-0.02R",
+        "Highest Profit in R": "1.08R",
         "Alpaca Fill": "$32.00",
         "Reason": "Exit now because WYFI is at or below the break-even stop at $32.09.",
         "Alpaca Order ID": "exit-123",

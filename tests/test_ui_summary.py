@@ -376,3 +376,16 @@ def test_saved_records_overview_records_summarize_evidence_without_raw_log():
     assert records["Automation checks"]["Count"] == 2
     assert records["Paper buys sent"]["Count"] == 2
     assert records["Paper exits sent"]["Count"] == 1
+
+
+def test_saved_records_overview_does_not_count_internal_position_plans_as_orders():
+    rows = saved_records_overview_records(
+        tracked_orders=[
+            {"broker_order_id": "real", "source": "buy_watchlist"},
+            {"broker_order_id": "plan", "source": "position_plan"},
+            {"broker_order_id": "observation", "source": "position_observation"},
+        ]
+    )
+
+    records = {row["Record Set"]: row["Count"] for row in rows}
+    assert records["Alpaca paper orders"] == 1

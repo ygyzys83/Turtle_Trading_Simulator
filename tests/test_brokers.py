@@ -295,6 +295,22 @@ def test_alpaca_adapter_refreshes_tracked_order_records_by_id():
     assert records[0]["Status"] == "canceled"
 
 
+def test_alpaca_adapter_does_not_query_local_position_plan_ids():
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        trading_client=FakeAlpacaClient(),
+    )
+
+    records = adapter.refreshed_tracked_order_records([
+        {"broker_order_id": "position-plan-cycle-1", "source": "position_plan"},
+        {"broker_order_id": "position-observation-cycle-1", "source": "position_observation"},
+        {"broker_order_id": "order-123456", "preview_hash": "hash123"},
+    ])
+
+    assert len(records) == 1
+    assert records[0]["Alpaca Order ID"] == "order-123456"
+
+
 def test_alpaca_order_records_request_all_statuses_when_supported():
     class FilterClient(FakeAlpacaClient):
         def __init__(self):

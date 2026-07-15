@@ -75,7 +75,6 @@ from agentloop_trader.buy_watchlist import (
 from agentloop_trader.display import dataframe_for_streamlit
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
-    adopt_alpaca_position,
     alpaca_order_lifecycle_records,
     alpaca_order_lifecycle_summary_records,
     alpaca_position_lifecycle_records,
@@ -92,9 +91,6 @@ from agentloop_trader.broker_governance import (
     reconcile_alpaca_positions,
     exit_position_reasons,
     refresh_tracked_alpaca_orders,
-    simulated_alpaca_fill_order,
-    simulated_exit_preview_readiness_records,
-    simulated_position_from_filled_order,
 )
 from agentloop_trader.evaluation import evaluate_walk_forward, walk_forward_records
 from agentloop_trader.evidence import (
@@ -111,7 +107,7 @@ from agentloop_trader.fees import (
     estimate_alpaca_round_trip_fees,
     fee_adjusted_break_even_price,
 )
-from agentloop_trader.indicators import calc_rsi
+from agentloop_trader.indicators import calc_atr, calc_rsi
 from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
 from agentloop_trader.market_data import (
@@ -122,10 +118,19 @@ from agentloop_trader.market_data import (
 )
 from agentloop_trader.manual_order import build_manual_buy_intent
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
+from agentloop_trader.position_lifecycle import (
+    initialize_exit_settings_for_position,
+    replace_exit_rules,
+    resolve_position_plan,
+    synchronize_position_plans,
+    upsert_position_plan,
+)
 from agentloop_trader.strategy_runtime import (
     adjust_initial_stop_settings,
     evaluate_exit_settings as evaluate_saved_exit_settings,
+    exit_plan_history_for_interval,
     exit_mode_for_settings,
+    latest_atr_snapshot,
     reprice_trade_intent,
 )
 from agentloop_trader.monitoring import (
@@ -868,8 +873,17 @@ def plain_setting_name(key: str) -> str:
 
 def entry_snapshot_records(settings: dict | None) -> list[dict]:
     settings = settings or {}
+    plan_started_after_entry = str(settings.get("entry_source") or "").strip().lower() == "existing alpaca position"
+    reference_label = "Position average entry when plan started" if plan_started_after_entry else "Reference price at entry"
+    atr_label = "ATR when exit plan started" if plan_started_after_entry else "ATR at entry"
+    atr_pct_label = "ATR percent when exit plan started" if plan_started_after_entry else "ATR percent at entry"
+    distance_label = "Initial stop distance when plan started" if plan_started_after_entry else "Stop distance at entry"
+    stop_label = "Initial stop when plan started" if plan_started_after_entry else "Planned stop before fill"
     rows = [
         {"Field": "Ticker", "Value": str(settings.get("symbol", "Not recorded"))},
+        {"Field": "Current position cycle", "Value": str(settings.get("position_cycle_id", "Not recorded"))},
+        {"Field": "Fill that currently anchors the plan", "Value": str(settings.get("position_basis_order_id", settings.get("entry_broker_order_id", "Not recorded")))},
+        {"Field": "Current plan fill time", "Value": time_or_missing(settings.get("entry_filled_at"))},
         {"Field": "Strategy", "Value": str(settings.get("strategy_label", settings.get("strategy_type", "Not recorded")))},
         {"Field": "Price data source", "Value": str(settings.get("price_data_source", "Not recorded"))},
         {"Field": "Price interval", "Value": str(settings.get("interval", "Not recorded"))},
@@ -883,12 +897,12 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
         {"Field": "Sizing account", "Value": str(settings.get("sizing_account_source", "Not recorded"))},
         {"Field": "Sizing account value", "Value": money_or_missing(settings.get("sizing_account_equity"))},
         {"Field": "Sizing cash available", "Value": money_or_missing(settings.get("sizing_available_cash"))},
-        {"Field": "Reference price at entry", "Value": money_or_missing(settings.get("entry_reference_price"))},
-        {"Field": "ATR at entry", "Value": money_or_missing(settings.get("entry_atr"))},
-        {"Field": "ATR percent at entry", "Value": pct_or_missing(settings.get("entry_atr_pct"))},
+        {"Field": reference_label, "Value": money_or_missing(settings.get("entry_reference_price"))},
+        {"Field": atr_label, "Value": money_or_missing(settings.get("entry_atr"))},
+        {"Field": atr_pct_label, "Value": pct_or_missing(settings.get("entry_atr_pct"))},
         {"Field": "Stop distance ATR multiplier", "Value": str(settings.get("entry_stop_atr_multiplier", settings.get("atr_stop_multiplier", "Not recorded")))},
-        {"Field": "Stop distance at entry", "Value": money_or_missing(settings.get("entry_stop_distance"))},
-        {"Field": "Planned stop before fill", "Value": money_or_missing(settings.get("entry_stop_loss"))},
+        {"Field": distance_label, "Value": money_or_missing(settings.get("entry_stop_distance"))},
+        {"Field": stop_label, "Value": money_or_missing(settings.get("entry_stop_loss"))},
         {"Field": "Entry rule level", "Value": money_or_missing(settings.get("entry_rule_level"))},
         {"Field": "Exit rule level at entry", "Value": money_or_missing(settings.get("exit_rule_level_at_entry"))},
         {"Field": "Profit protection", "Value": "On" if settings.get("profit_protection_enabled", True) else "Off"},
@@ -987,7 +1001,7 @@ def position_next_action(position: dict, settings: dict, exit_details: dict) -> 
     symbol = str(position.get("Symbol", "")).strip().upper()
     if not settings:
         return f"Save exit settings for {symbol}."
-    if not bool(settings.get("auto_exit_enabled", True)):
+    if not bool(settings.get("auto_exit_enabled", False)):
         return f"Auto exit is off for {symbol}."
     if bool(exit_details.get("ready")):
         return f"Exit is triggered for {symbol}."
@@ -1025,17 +1039,28 @@ def daily_position_rows(positions: list[dict], settings_by_symbol: dict[str, dic
 
 def position_management_summary_records(position: dict, settings: dict, exit_details: dict) -> list[dict]:
     current_price = position_current_price(position)
+    position_rows = [
+        {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
+        {"Area": "Position", "Item": "Quantity", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current position quantity held at Alpaca."},
+        {"Area": "Position", "Item": "Current price", "Status / Value": money_or_missing(current_price), "Plain English": "Estimated from Alpaca market value."},
+        {"Area": "Position", "Item": "Average entry", "Status / Value": money_or_missing(position.get("Average Entry")), "Plain English": "Average entry price reported by Alpaca."},
+    ]
+    if not settings:
+        return position_rows + [
+            {"Area": "Exit plan", "Item": "Saved exit plan", "Status / Value": "Not saved", "Plain English": "This position has no saved strategy or exit settings."},
+            {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "Off", "Plain English": "The app will not sell this position automatically unless you save an exit plan and turn Auto exit on."},
+            {"Area": "Automation", "Item": "Current action", "Status / Value": "Not managed", "Plain English": "Choose exit settings below and save them only if you want the app to manage this position."},
+        ]
     trigger = optional_float(exit_details.get("trigger_price"))
     distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
     profit_r = optional_float(exit_details.get("profit_r"))
     highest_profit_r = optional_float(exit_details.get("highest_profit_r"))
     exit_mode = exit_mode_for_settings(settings)
-    rows = [
-        {"Area": "Position", "Item": "Ticker", "Status / Value": str(position.get("Symbol", "")).strip().upper(), "Plain English": "Open Alpaca paper position."},
-        {"Area": "Position", "Item": "Quantity", "Status / Value": str(position.get("Quantity", "")), "Plain English": "Current position quantity held at Alpaca."},
-        {"Area": "Position", "Item": "Current price", "Status / Value": money_or_missing(current_price), "Plain English": "Estimated from Alpaca market value."},
-        {"Area": "Position", "Item": "Average entry", "Status / Value": money_or_missing(position.get("Average Entry")), "Plain English": "Average entry price reported by Alpaca."},
-        {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "On" if settings.get("auto_exit_enabled", True) else "Off", "Plain English": "Whether the app may sell this position automatically."},
+    rows = position_rows + [
+        {"Area": "Exit plan", "Item": "Current position cycle", "Status / Value": str(settings.get("position_cycle_id", "Not recorded")), "Plain English": "The Alpaca fill cycle this plan belongs to. A full exit ends this cycle; a later re-entry gets a new one."},
+        {"Area": "Exit plan", "Item": "Plan anchored to fill", "Status / Value": str(settings.get("position_basis_order_id", settings.get("entry_broker_order_id", "Not recorded"))), "Plain English": "The latest filled BUY that currently establishes this plan's average entry and profit-protection starting point."},
+        {"Area": "Exit plan", "Item": "Plan fill time", "Status / Value": time_or_missing(settings.get("entry_filled_at")), "Plain English": "Only prices at or after this fill can update the high-water mark."},
+        {"Area": "Exit plan", "Item": "Auto exit", "Status / Value": "On" if settings.get("auto_exit_enabled", False) else "Off", "Plain English": "Whether the app may sell this position automatically."},
         {"Area": "Exit plan", "Item": "Exit method", "Status / Value": "ATR protection only" if exit_mode == "atr_only" else "Strategy exit + ATR protection", "Plain English": "ATR-only ignores strategy sell lines. Strategy + ATR uses both and follows whichever active protection level is highest."},
         {"Area": "Exit plan", "Item": "Price interval", "Status / Value": str(settings.get("interval", "Not saved")), "Plain English": "Bars used to calculate ATR and exit levels."},
         {"Area": "Exit plan", "Item": "Sell exit length", "Status / Value": bars_or_missing(settings.get("exit_window")), "Plain English": "Number of saved price bars used to calculate the strategy exit line."},
@@ -1122,15 +1147,15 @@ def alpaca_daily_summary_records() -> list[dict]:
 def automation_status_text() -> tuple[str, str, str]:
     if active_automation_level == "Manual review only":
         return "Manual", "You click paper orders manually.", "info"
+    if not sidebar_worker_active:
+        return "Worker stopped", "Start the Background Worker before any automatic exit, queued buy, or automatic cancel can run.", "warn"
     if auto_exit_status.ready:
-        return "Auto exit ready", f"The app can sell {auto_exit_status.quantity} {auto_exit_status.symbol}.", "warn"
+        return "Auto exit ready", f"The worker can sell {auto_exit_status.quantity} {auto_exit_status.symbol}.", "warn"
     if active_automation_level == "Auto entries and exits":
         queued_plans = buy_watchlist_store.read() if "buy_watchlist_store" in globals() else []
         enabled_count = sum(1 for plan in queued_plans if plan.enabled)
         if not full_automation_enabled:
             return "Queued buys paused", "Check Allow queued buys to let the worker monitor saved setups.", "warn"
-        if not sidebar_worker_active:
-            return "Worker stopped", "Start the worker to monitor queued buys. Auto exits can still run while this page is open.", "warn"
         return "Watching queue", f"The worker is monitoring {enabled_count} enabled queued setup(s).", "ok"
     detail = "; ".join(auto_exit_status.reasons) if auto_exit_status.reasons else "No automatic exit is ready."
     return auto_exit_status.status, detail, "warn"
@@ -1158,7 +1183,7 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
             detail = "Save a setup in the Buy watchlist before the worker can buy it automatically."
         elif not sidebar_worker_active:
             read = "Worker stopped"
-            detail = "Click Start Worker. The Streamlit page timer does not monitor queued setups."
+            detail = "Click Start Worker. All automatic orders require the Background Worker."
         elif not enabled_plans:
             read = "No enabled setups"
             detail = "Resume a saved setup or add a new one."
@@ -1179,9 +1204,12 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
     if effective_kill_switch:
         read = "Blocked"
         detail = "Kill Switch is on. No paper orders can be sent."
+    elif active_automation_level != "Manual review only" and not sidebar_worker_active:
+        read = "Worker stopped"
+        detail = "Start the Background Worker. Automatic exits are paused until it is running."
     elif auto_exit_status.ready:
         read = "Ready to sell"
-        detail = f"The app can sell {auto_exit_status.quantity} {auto_exit_status.symbol} if automation is enabled."
+        detail = f"The worker can sell {auto_exit_status.quantity} {auto_exit_status.symbol} because its saved exit is triggered."
     elif active_automation_level == "Manual review only":
         read = "Watching only"
         detail = "Automation is off. The app will show ideas, but you click orders manually."
@@ -1193,8 +1221,8 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
     return [
         {"Area": context, "Read": read, "Plain English": detail},
         {"Area": "Automation mode", "Read": automation_level_label, "Plain English": f"Currently watching: {watched}."},
-        {"Area": "Last automation check", "Read": st.session_state.get("last_automation_checked_at", "Not checked yet"), "Plain English": f"Checks every {automation_refresh_seconds} seconds while automation is on."},
-        {"Area": "Last automation action", "Read": st.session_state.get("last_automation_action", "None"), "Plain English": st.session_state.get("last_automation_blocked_reason", "") or "No recent action."},
+        {"Area": "Last worker check", "Read": automation_worker_status.last_checked_at or "Not checked yet", "Plain English": "The Background Worker checks all saved position plans and queued setups."},
+        {"Area": "Last worker action", "Read": automation_worker_status.last_action or "None", "Plain English": automation_worker_status.last_error or "No recent worker error."},
     ]
 
 
@@ -1332,25 +1360,6 @@ def paper_buy_price_records(
         },
         {"Field": "Plain English", "Value": limit_rule},
     ]
-
-
-def add_automation_history(action: str, detail: str = "", checked_at: str | None = None) -> None:
-    timestamp = checked_at or pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-    record = {
-        "Time": timestamp,
-        "Action": str(action or "None"),
-        "Detail": str(detail or ""),
-    }
-    history = list(st.session_state.get("automation_event_history", []))
-    if not history or (history[-1].get("Action"), history[-1].get("Detail")) != (record["Action"], record["Detail"]):
-        history.append(record)
-    st.session_state["automation_event_history"] = history[-5:]
-
-
-def set_automation_action(action: str, detail: str = "", checked_at: str | None = None) -> None:
-    st.session_state["last_automation_action"] = action
-    st.session_state["last_automation_blocked_reason"] = detail
-    add_automation_history(action, detail, checked_at)
 
 
 def strategy_use_case_records(selected_strategy: str) -> list[dict]:
@@ -1580,81 +1589,9 @@ def automation_watch_records() -> list[dict]:
         {"Item": "Automation session started", "Value": st.session_state.get("automation_session_started_at", "Not started")},
         {"Item": "Watching", "Value": ", ".join(watched) if watched else "Nothing automatic right now"},
         {"Item": "Check interval", "Value": f"{automation_refresh_seconds} seconds"},
-        {"Item": "Last check", "Value": st.session_state.get("last_automation_checked_at", "Not checked yet")},
-        {"Item": "Last action", "Value": st.session_state.get("last_automation_action", "None")},
+        {"Item": "Last worker check", "Value": automation_worker_status.last_checked_at or "Not checked yet"},
+        {"Item": "Last worker action", "Value": automation_worker_status.last_action or "None"},
     ]
-
-
-def saved_buy_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
-    clean_symbol = str(symbol).strip().upper()
-    matching_buys = [
-        order
-        for order in tracked_orders
-        if str(order.get("symbol", "")).strip().upper() == clean_symbol
-        and str(order.get("side", "")).strip().lower() == "buy"
-        and order.get("strategy_settings")
-    ]
-    if not matching_buys:
-        return None
-    latest = matching_buys[-1]
-    settings = dict(latest.get("strategy_settings", {}))
-    settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
-    settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
-    return settings
-
-
-def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict | None:
-    clean_symbol = str(symbol).strip().upper()
-    matching_buys = [
-        order
-        for order in tracked_orders
-        if str(order.get("symbol", "")).strip().upper() == clean_symbol
-        and str(order.get("side", "")).strip().lower() == "buy"
-        and (order.get("exit_settings") or order.get("strategy_settings"))
-    ]
-    if not matching_buys:
-        return None
-    def priority(order: dict) -> int:
-        status = normalized_order_status(order.get("status", order.get("Status", "")))
-        source = str(order.get("source", "")).strip().lower()
-        if source == "position_exit_settings" or status == "managed_exit_settings":
-            return 3
-        if status in {"filled", "partially_filled"}:
-            return 2
-        if source == "adopted_alpaca_position":
-            return 1
-        return 0
-
-    latest = max(enumerate(matching_buys), key=lambda item: (priority(item[1]), item[0]))[1]
-    settings = dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
-    settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
-    settings.setdefault("entry_filled_at", latest.get("filled_at", ""))
-    settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
-    return settings
-
-
-def update_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict], exit_settings: dict) -> list[dict]:
-    clean_symbol = str(symbol).strip().upper()
-    updated = []
-    matched = False
-    for order in tracked_orders:
-        record = dict(order)
-        if str(record.get("symbol", "")).strip().upper() == clean_symbol and str(record.get("side", "")).strip().lower() == "buy":
-            record["exit_settings"] = dict(exit_settings)
-            matched = True
-        updated.append(record)
-    if not matched:
-        placeholder = {
-            "broker_order_id": f"managed-exit-{clean_symbol}",
-            "symbol": clean_symbol,
-            "side": "buy",
-            "quantity": "",
-            "status": "managed_exit_settings",
-            "source": "position_exit_settings",
-            "exit_settings": dict(exit_settings),
-        }
-        updated.append(placeholder)
-    return updated
 
 
 def alpaca_order_row_id(row: dict) -> str:
@@ -1921,8 +1858,9 @@ automation_level_label = st.sidebar.selectbox(
     index=list(automation_level_options.keys()).index(saved_automation_label),
     key="automation_mode_selection",
     help=(
-        "Manual means the app never sends an automatic order. Auto exits lets the open Streamlit page or the Background Worker sell paper positions from their saved exit plans. "
-        "Auto exits and queued buys also lets the Background Worker buy only setups you explicitly save in the Buy watchlist. The ticker currently open for research is never bought automatically."
+        "Manual means the app never sends an automatic order. Auto exits lets the Background Worker sell paper positions from their saved exit plans. "
+        "Auto exits and queued buys also lets the Background Worker buy only setups you explicitly save in the Buy watchlist. "
+        "All automatic orders require the Background Worker to be running. The ticker currently open for research is never bought automatically."
     ),
 )
 automation_level = automation_level_options[automation_level_label]
@@ -1956,6 +1894,10 @@ active_automation_level = resolve_active_automation_level(
 
 if "background_worker_enabled" not in st.session_state:
     st.session_state["background_worker_enabled"] = sidebar_worker_present
+elif not sidebar_worker_present:
+    st.session_state["background_worker_enabled"] = False
+elif sidebar_worker_active:
+    st.session_state["background_worker_enabled"] = True
 if "worker_stop_pending" not in st.session_state:
     st.session_state["worker_stop_pending"] = False
 if not sidebar_worker_active:
@@ -1985,7 +1927,7 @@ elif sidebar_worker_present:
         "Automation actions are not trusted until the heartbeat resumes or the worker is stopped."
     )
 else:
-    st.sidebar.caption("Worker process: Stopped. The Buy watchlist is paused; the open page can still check saved exits.")
+    st.sidebar.caption("Worker process: Stopped. Automatic exits, queued buys, and automatic cancels are paused.")
 worker_control_cols = st.sidebar.columns(2)
 if worker_control_cols[0].button(
     "Start Worker",
@@ -1999,7 +1941,7 @@ if worker_control_cols[0].button(
 if worker_control_cols[1].button(
     "Stop Worker",
     disabled=not sidebar_worker_present,
-    help="Stop background monitoring. The open Streamlit page can still check saved exits, but queued buys require the worker.",
+    help="Stop all automatic exits, queued buys, and automatic limit-order cancels. Manual UI actions remain available.",
 ):
     st.session_state["background_worker_enabled"] = False
     st.session_state["worker_stop_pending"] = True
@@ -2790,14 +2732,8 @@ if "paper_broker" not in st.session_state or st.session_state.get("paper_startin
     st.session_state["session_audit_events"] = []
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
-    st.session_state["auto_exit_sent_hashes"] = []
-    st.session_state["last_auto_exit_decision_key"] = None
-    st.session_state["last_automation_action"] = "None"
-    st.session_state["last_automation_blocked_reason"] = ""
-    st.session_state["automation_event_history"] = []
     st.session_state["automation_session_started_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["tracked_alpaca_orders"] = []
-    st.session_state["simulated_alpaca_positions"] = []
 if reset_paper_broker:
     st.session_state["paper_broker"] = PaperBroker(cash=float(account))
     st.session_state["paper_starting_cash"] = account
@@ -2806,32 +2742,20 @@ if reset_paper_broker:
     st.session_state["session_audit_events"] = []
     st.session_state["shadow_decisions"] = []
     st.session_state["last_audit_key"] = None
-    st.session_state["auto_exit_sent_hashes"] = []
-    st.session_state["last_auto_exit_decision_key"] = None
-    st.session_state["last_automation_action"] = "None"
-    st.session_state["last_automation_blocked_reason"] = ""
-    st.session_state["automation_event_history"] = []
     st.session_state["automation_session_started_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
     st.session_state["tracked_alpaca_orders"] = []
-    st.session_state["simulated_alpaca_positions"] = []
 st.session_state.setdefault("shadow_decisions", [])
 st.session_state.setdefault("paper_session_id", new_session_id())
 st.session_state.setdefault("paper_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
-st.session_state.setdefault("auto_exit_sent_hashes", [])
-st.session_state.setdefault("last_auto_exit_decision_key", None)
-st.session_state.setdefault("last_automation_action", "None")
-st.session_state.setdefault("last_automation_blocked_reason", "")
-st.session_state.setdefault("automation_event_history", [])
 st.session_state.setdefault("automation_session_started_at", pd.Timestamp.now(tz="America/Los_Angeles").isoformat())
 st.session_state.setdefault("tracked_alpaca_orders", [])
-st.session_state.setdefault("simulated_alpaca_positions", [])
 audit_store = JsonlAuditStore(audit_log_path)
 automation_store = AutomationDryRunStore(automation_dry_run_path)
 research_snapshot_store = ResearchSnapshotStore(research_snapshot_path)
 manifest_store = RunManifestStore(run_manifest_path)
 broker_state_store = BrokerStateStore(broker_state_path)
-if not st.session_state["tracked_alpaca_orders"]:
-    st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
+persisted_broker_state = broker_state_store.read()
+st.session_state["tracked_alpaca_orders"] = persisted_broker_state
 paper_broker: PaperBroker = st.session_state["paper_broker"]
 paper_adapter = PaperBrokerAdapter(paper_broker)
 alpaca_adapter = AlpacaBrokerAdapterStub(
@@ -2861,6 +2785,24 @@ alpaca_orders_enabled_for_mode = (
 )
 alpaca_positions = alpaca_adapter.position_records() if alpaca_status.connected else []
 alpaca_orders = alpaca_adapter.order_records() if alpaca_status.connected else []
+if alpaca_status.connected:
+    tracked_before_refresh = st.session_state["tracked_alpaca_orders"]
+    tracked_before_signature = tracked_order_state_signature(tracked_before_refresh)
+    refreshed_tracked_orders = refresh_tracked_alpaca_orders(
+        tracked_before_refresh,
+        alpaca_orders,
+    )
+    refreshed_tracked_orders, position_plan_resolutions, position_plans_changed = synchronize_position_plans(
+        alpaca_positions,
+        alpaca_orders,
+        refreshed_tracked_orders,
+    )
+    broker_status_changed = tracked_order_state_signature(refreshed_tracked_orders) != tracked_before_signature
+    if position_plans_changed or broker_status_changed:
+        broker_state_store.replace_all(refreshed_tracked_orders)
+    st.session_state["tracked_alpaca_orders"] = refreshed_tracked_orders
+else:
+    position_plan_resolutions = {}
 alpaca_account_records = alpaca_adapter.account_records() if alpaca_status.connected else []
 alpaca_read_errors = getattr(alpaca_adapter, "read_errors", {})
 alpaca_state_health = broker_state_health(
@@ -3270,323 +3212,6 @@ elif stop_worker_requested:
 automation_worker_status = automation_worker_status_store.read()
 
 
-def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
-    if not settings:
-        return {
-            "ready": False,
-            "reason": "No saved exit settings for this position; auto exit is paused.",
-            "trigger_price": None,
-        }
-    if not bool(settings.get("auto_exit_enabled", True)):
-        return {
-            "ready": False,
-            "reason": "Auto exit is off for this position.",
-            "trigger_price": None,
-        }
-    try:
-        symbol = str(settings.get("symbol", "")).strip().upper()
-        history = str(settings.get("history", "1y"))
-        saved_interval = str(settings.get("interval", "1d"))
-        saved_strategy_type = str(settings.get("strategy_type", "breakout"))
-        no_price_stop = saved_strategy_type == "rsi_scalp" and str(settings.get("rsi_stop_mode", "standard_atr")) == "no_price_stop"
-        saved_account = float(settings.get("account_size") or account)
-        saved_exit_w = int(settings.get("exit_window") or exit_w)
-        saved_atr_mult = float(settings.get("atr_stop_multiplier") or atr_mult)
-        saved_risk_dec = float(settings.get("risk_per_trade_pct") or risk_pct) / 100
-        saved_ma_w = int(settings.get("moving_average_window") or ma_w)
-        saved_pullback_w = int(settings.get("pullback_average_length") or pullback_w)
-        saved_momentum_w = int(settings.get("momentum_turn_length") or momentum_w)
-        saved_entry_w = int(settings.get("entry_window") or entry_w)
-        if not symbol:
-            return {"ready": False, "reason": "Saved exit settings do not include a ticker.", "trigger_price": None}
-        if history == "synthetic":
-            return {"ready": False, "reason": "Saved exit settings use synthetic data; auto exit needs real ticker data.", "trigger_price": None}
-        saved_price_source = str(settings.get("price_data_source", "Ticker (yfinance)"))
-        data = fetch_price_data_for_source(symbol, history, saved_interval, saved_price_source)
-        if saved_strategy_type == "rsi_scalp":
-            _, _, _, _, saved_live, _, _ = simulate_rsi_mean_reversion_strategy(
-                account=saved_account,
-                atr_mult=saved_atr_mult,
-                risk_pct_dec=saved_risk_dec,
-                rsi_length=int(settings.get("rsi_length", 14)),
-                rsi_oversold=float(settings.get("rsi_oversold", 30.0)),
-                rsi_overbought=float(settings.get("rsi_overbought", 70.0)),
-                rsi_decline_points=float(settings.get("rsi_decline_points", 40.0)),
-                rsi_rebound_points=float(settings.get("rsi_rebound_points", 3.0)),
-                rsi_max_rebound_points=float(settings.get("rsi_max_rebound_points", 12.0)),
-                rsi_sell_recovery_points=float(settings.get("rsi_sell_recovery_points", 35.0)),
-                rsi_swing_lookback=int(settings.get("rsi_swing_lookback", 24)),
-                rsi_stop_mode=str(settings.get("rsi_stop_mode", "standard_atr")),
-                rsi_emergency_atr_multiplier=float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
-                rsi_max_holding_enabled=bool(settings.get("rsi_max_holding_enabled", True)),
-                rsi_max_holding_bars=int(settings.get("rsi_max_holding_bars", 100)),
-                rsi_profit_only_exit=bool(settings.get("rsi_profit_only_exit", False)),
-                seed=None,
-                market_data=data,
-            )
-        elif saved_strategy_type == "pullback":
-            _, _, _, _, saved_live, _, _ = simulate_trend_pullback_strategy(
-                account=saved_account,
-                pullback_w=saved_pullback_w,
-                exit_w=saved_exit_w,
-                atr_mult=saved_atr_mult,
-                risk_pct_dec=saved_risk_dec,
-                trend_w=saved_ma_w,
-                momentum_w=saved_momentum_w,
-                seed=None,
-                market_data=data,
-            )
-        elif saved_strategy_type == "trendline":
-            _, _, _, _, saved_live, _, _ = simulate_trendline_breakout_strategy(
-                account=saved_account,
-                trendline_w=saved_entry_w,
-                exit_w=saved_exit_w,
-                atr_mult=saved_atr_mult,
-                risk_pct_dec=saved_risk_dec,
-                ma_w=saved_ma_w,
-                seed=None,
-                market_data=data,
-            )
-        elif saved_strategy_type == "trendline_retest":
-            _, _, _, _, saved_live, _, _ = simulate_trendline_retest_strategy(
-                account=saved_account,
-                trendline_w=saved_entry_w,
-                exit_w=saved_exit_w,
-                atr_mult=saved_atr_mult,
-                risk_pct_dec=saved_risk_dec,
-                ma_w=saved_ma_w,
-                momentum_w=saved_momentum_w,
-                seed=None,
-                market_data=data,
-            )
-        else:
-            _, _, _, _, saved_live, _, _ = simulate_turtle_strategy(
-                account=saved_account,
-                entry_w=saved_entry_w,
-                exit_w=saved_exit_w,
-                atr_mult=saved_atr_mult,
-                risk_pct_dec=saved_risk_dec,
-                ma_w=saved_ma_w,
-                seed=None,
-                market_data=data,
-            )
-        current_price = first_available_number(data.attrs.get("latest_price"), saved_live.get("last_p"))
-        strategy_exit_price = optional_float(saved_live.get("exit_level"))
-        current_atr = optional_float(saved_live.get("last_atr"))
-        profit_protection_enabled = bool(settings.get("profit_protection_enabled", True)) and not no_price_stop
-        breakeven_after_r = float(settings.get("breakeven_after_r", 1.0))
-        trail_after_r = float(settings.get("trail_after_r", 2.0))
-        trailing_atr_multiplier = float(settings.get("trailing_atr_multiplier", 3.0))
-        matching_position = next(
-            (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == symbol),
-            {},
-        )
-        position_avg_entry = optional_float(matching_position.get("Average Entry"))
-        entry_reference_price = first_available_number(
-            position_avg_entry,
-            settings.get("planned_entry_price"),
-            settings.get("entry_reference_price"),
-            current_price,
-        )
-        saved_entry_reference = first_available_number(settings.get("planned_entry_price"), settings.get("entry_reference_price"))
-        saved_entry_stop = optional_float(settings.get("entry_stop_loss"))
-        initial_risk = first_available_number(
-            settings.get("entry_stop_distance"),
-            saved_entry_reference - saved_entry_stop
-            if saved_entry_reference is not None and saved_entry_stop is not None
-            else None,
-        )
-        if initial_risk is not None and initial_risk <= 0:
-            initial_risk = None
-        original_stop_price = first_available_number(
-            entry_reference_price - initial_risk
-            if entry_reference_price is not None and initial_risk is not None
-            else None,
-            saved_entry_stop,
-            entry_reference_price - saved_atr_mult * current_atr
-            if entry_reference_price is not None and current_atr is not None
-            else None,
-        )
-        if no_price_stop:
-            initial_risk = None
-            original_stop_price = None
-        profit_r = (
-            (current_price - entry_reference_price) / initial_risk
-            if current_price is not None and entry_reference_price is not None and initial_risk
-            else None
-        )
-        entry_time = parse_saved_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
-        high_data = data.tail(1)
-        bars_since_entry = 0
-        if entry_time is not None and not data.empty:
-            index = data.index
-            if getattr(index, "tz", None) is None:
-                entry_compare = entry_time.tz_convert("America/Los_Angeles").tz_localize(None)
-            else:
-                entry_compare = entry_time.tz_convert(index.tz)
-            since_entry = data.loc[index >= entry_compare]
-            if not since_entry.empty:
-                high_data = since_entry
-                bars_since_entry = max(0, len(since_entry) - 1)
-        current_high_since_entry = optional_float(high_data["High"].max()) if "High" in high_data.columns and not high_data.empty else None
-        current_high_since_entry = max(
-            [value for value in (current_high_since_entry, optional_float(data.attrs.get("latest_high"))) if value is not None],
-            default=None,
-        )
-        saved_high_since_entry = optional_float(settings.get("highest_high_since_entry"))
-        highest_high_since_entry = max(
-            [value for value in [current_high_since_entry, saved_high_since_entry, entry_reference_price] if value is not None],
-            default=None,
-        )
-        highest_profit_r = (
-            (highest_high_since_entry - entry_reference_price) / initial_risk
-            if highest_high_since_entry is not None and entry_reference_price is not None and initial_risk
-            else None
-        )
-        breakeven_stop_price = (
-            entry_reference_price
-            if profit_protection_enabled
-            and highest_profit_r is not None
-            and highest_profit_r >= breakeven_after_r
-            and entry_reference_price is not None
-            else None
-        )
-        trailing_stop_price = (
-            highest_high_since_entry - trailing_atr_multiplier * current_atr
-            if profit_protection_enabled
-            and highest_profit_r is not None
-            and highest_profit_r >= trail_after_r
-            and highest_high_since_entry is not None
-            and current_atr is not None
-            else None
-        )
-        saved_trigger_price = None if no_price_stop else optional_float(settings.get("last_exit_trigger_price"))
-        trigger_candidates = [
-            ("strategy exit", strategy_exit_price),
-            ("fill-adjusted initial stop", original_stop_price),
-            ("break-even stop", breakeven_stop_price),
-            ("ATR trail", trailing_stop_price),
-            ("saved trigger", saved_trigger_price),
-        ]
-        usable_triggers = [(label, price) for label, price in trigger_candidates if price is not None]
-        trigger_source, trigger_price = max(usable_triggers, key=lambda item: item[1]) if usable_triggers else ("exit rule", None)
-        current_rsi = optional_float(saved_live.get("rsi"))
-        saved_setup_low = optional_float(settings.get("entry_rsi_setup_low"))
-        rsi_sell_level = (
-            min(
-                float(settings.get("rsi_overbought", 70.0)),
-                saved_setup_low + float(settings.get("rsi_sell_recovery_points", 35.0)),
-            )
-            if saved_strategy_type == "rsi_scalp" and saved_setup_low is not None
-            else None
-        )
-        rsi_exit_signal_ready = bool(
-            rsi_sell_level is not None and current_rsi is not None and current_rsi >= rsi_sell_level
-        )
-        rsi_profit_only_exit = bool(settings.get("rsi_profit_only_exit", False))
-        rsi_completed_bar_price = optional_float(saved_live.get("last_p")) or current_price
-        position_quantity = optional_float(matching_position.get("Quantity")) or 0.0
-        rsi_fee_adjusted_break_even = (
-            fee_adjusted_break_even_price(
-                asset_class=normalize_asset_class(
-                    str(matching_position.get("Asset Type") or settings.get("asset_class") or ""),
-                    symbol,
-                ),
-                quantity=position_quantity,
-                entry_price=entry_reference_price,
-            )
-            if saved_strategy_type == "rsi_scalp" and entry_reference_price is not None and position_quantity > 0
-            else entry_reference_price
-        )
-        rsi_profit_condition_ready = bool(
-            not rsi_profit_only_exit
-            or (
-                rsi_completed_bar_price is not None
-                and rsi_fee_adjusted_break_even is not None
-                and rsi_completed_bar_price > rsi_fee_adjusted_break_even
-            )
-        )
-        rsi_exit_ready = rsi_exit_signal_ready and rsi_profit_condition_ready
-        max_holding_enabled = bool(settings.get("rsi_max_holding_enabled", True))
-        max_holding_bars = int(settings.get("rsi_max_holding_bars", 100))
-        time_exit_ready = bool(
-            saved_strategy_type == "rsi_scalp" and max_holding_enabled and entry_time is not None
-            and bars_since_entry >= max_holding_bars
-        )
-        price_exit_ready = bool(current_price is not None and trigger_price is not None and current_price <= trigger_price)
-        ready = price_exit_ready or rsi_exit_ready or time_exit_ready
-        if rsi_exit_ready:
-            trigger_source = "RSI recovery exit"
-        elif time_exit_ready:
-            trigger_source = "maximum holding period"
-        reason = (
-            f"Exit now because RSI is {current_rsi:.1f}, at or above the saved {rsi_sell_level:.1f} exit level."
-            if rsi_exit_ready and current_rsi is not None and rsi_sell_level is not None
-            else f"Exit now because the position reached its {max_holding_bars}-bar maximum holding period."
-            if time_exit_ready
-            else
-            f"Exit now because {symbol} is at or below the {trigger_source} at ${trigger_price:,.2f}."
-            if price_exit_ready and trigger_price
-            else (
-                f"Hold. RSI reached {rsi_sell_level:.1f}, but the completed-bar close of ${rsi_completed_bar_price:,.2f} is not above the estimated "
-                f"fee-adjusted break-even price of ${rsi_fee_adjusted_break_even:,.2f}. The app will check again "
-                f"after each completed {saved_interval} bar."
-            )
-            if (
-                rsi_exit_signal_ready
-                and not rsi_profit_condition_ready
-                and rsi_completed_bar_price is not None
-                and rsi_sell_level is not None
-                and rsi_fee_adjusted_break_even is not None
-            )
-            else f"Hold. Auto exit will trigger if {symbol} falls to ${trigger_price:,.2f} or lower. This uses the highest active protection level."
-            if trigger_price
-            else str(saved_live.get("exit_reason", "The saved RSI or time exit is not triggered."))
-        )
-        state_changed = False
-        if highest_high_since_entry is not None and highest_high_since_entry > (saved_high_since_entry or 0):
-            state_changed = True
-        if trigger_price is not None and trigger_price > (saved_trigger_price or 0):
-            state_changed = True
-        return {
-            "ready": ready,
-            "reason": reason,
-            "trigger_price": trigger_price,
-            "strategy_exit_price": strategy_exit_price,
-            "atr_stop_price": original_stop_price,
-            "original_stop_price": original_stop_price,
-            "breakeven_stop_price": breakeven_stop_price,
-            "trailing_stop_price": trailing_stop_price,
-            "highest_high_since_entry": highest_high_since_entry,
-            "profit_r": profit_r,
-            "highest_profit_r": highest_profit_r,
-            "initial_risk": initial_risk,
-            "current_atr": current_atr,
-            "current_rsi": current_rsi,
-            "rsi_sell_level": rsi_sell_level,
-            "rsi_exit_signal_ready": rsi_exit_signal_ready,
-            "rsi_profit_only_exit": rsi_profit_only_exit if saved_strategy_type == "rsi_scalp" else None,
-            "rsi_fee_adjusted_break_even": rsi_fee_adjusted_break_even if saved_strategy_type == "rsi_scalp" else None,
-            "rsi_completed_bar_price": rsi_completed_bar_price if saved_strategy_type == "rsi_scalp" else None,
-            "rsi_profit_condition_ready": rsi_profit_condition_ready if saved_strategy_type == "rsi_scalp" else None,
-            "rsi_exit_ready": rsi_exit_ready,
-            "bars_since_entry": bars_since_entry,
-            "max_holding_enabled": max_holding_enabled if saved_strategy_type == "rsi_scalp" else None,
-            "max_holding_bars": max_holding_bars if saved_strategy_type == "rsi_scalp" and max_holding_enabled else None,
-            "time_exit_ready": time_exit_ready,
-            "state_changed": state_changed,
-            "trigger_source": trigger_source,
-            "interval": saved_interval,
-            "exit_window": saved_exit_w,
-            "atr_multiplier": saved_atr_mult,
-            "trailing_atr_multiplier": trailing_atr_multiplier,
-            "breakeven_after_r": breakeven_after_r,
-            "trail_after_r": trail_after_r,
-        }
-    except Exception as exc:
-        return {"ready": False, "reason": f"Could not check saved exit rule: {exc}", "trigger_price": None}
-
-
 def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
     if not settings:
         return {"ready": False, "reason": "No saved exit settings for this position; auto exit is paused.", "trigger_price": None}
@@ -3605,32 +3230,36 @@ def evaluate_exit_rule_from_settings(settings: dict | None) -> tuple[bool, str]:
     return bool(details["ready"]), str(details["reason"])
 
 
-def refresh_trailing_state_for_open_positions() -> bool:
-    updated_orders = st.session_state.get("tracked_alpaca_orders", [])
-    changed = False
-    for position in alpaca_positions:
-        symbol = str(position.get("Symbol", "")).strip().upper()
-        settings = saved_exit_settings_for_symbol(symbol, updated_orders)
-        if not settings:
-            continue
-        details = evaluate_exit_rule_details_from_settings(settings)
-        if not details.get("state_changed"):
-            continue
-        refreshed_settings = dict(settings)
-        high = optional_float(details.get("highest_high_since_entry"))
-        trigger = optional_float(details.get("trigger_price"))
-        if high is not None:
-            refreshed_settings["highest_high_since_entry"] = high
-        if trigger is not None:
-            refreshed_settings["last_exit_trigger_price"] = trigger
-            refreshed_settings["last_exit_trigger_source"] = details.get("trigger_source", "")
-        refreshed_settings["last_exit_checked_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-        updated_orders = update_exit_settings_for_symbol(symbol, updated_orders, refreshed_settings)
-        changed = True
-    if changed:
-        broker_state_store.replace_all(updated_orders)
-        st.session_state["tracked_alpaca_orders"] = updated_orders
-    return changed
+def persist_current_position_plan(
+    position: dict,
+    exit_settings: dict,
+    entry_settings: dict | None,
+) -> list[dict]:
+    """Atomically upsert only one position plan without replacing unrelated broker state."""
+    current_records = broker_state_store.read()
+    updated_records = upsert_position_plan(
+        position,
+        alpaca_orders,
+        current_records,
+        exit_settings,
+        entry_settings,
+    )
+    cycle_id = str(exit_settings.get("position_cycle_id") or "").strip()
+    expected_id = f"position-plan-{cycle_id}" if cycle_id else ""
+    plan_record = next(
+        (
+            record for record in reversed(updated_records)
+            if str(record.get("source") or "").strip().lower() == "position_plan"
+            and (not expected_id or str(record.get("broker_order_id") or "").strip() == expected_id)
+            and str(record.get("symbol") or "").strip().upper()
+            == str(position.get("Symbol") or "").strip().upper()
+        ),
+        None,
+    )
+    if plan_record is None:
+        raise ValueError("The current Alpaca fill cycle could not be saved as a position plan.")
+    broker_state_store.upsert(plan_record)
+    return broker_state_store.read()
 
 
 optimizer_market_fingerprint = "synthetic-default"
@@ -3839,6 +3468,8 @@ if intent is not None:
             "sizing_account_source": paper_order_account_source,
             "sizing_account_equity": paper_order_risk_equity,
             "sizing_available_cash": paper_order_available_cash,
+            "account_size": paper_order_risk_equity,
+            "risk_limits_at_entry": asdict(risk_limits),
         }
     )
     current_exit_settings.update(current_strategy_settings)
@@ -3966,9 +3597,6 @@ duplicate_alpaca_reasons = duplicate_exposure_reasons(
 open_order_reasons = open_order_exposure_reasons(intent, alpaca_orders)
 duplicate_preview_submitted = preview_already_tracked(alpaca_preview.preview_hash, tracked_alpaca_orders)
 exit_previews = build_exit_order_previews(alpaca_positions, alpaca_adapter.config)
-if alpaca_positions and tracked_alpaca_orders:
-    if refresh_trailing_state_for_open_positions():
-        tracked_alpaca_orders = st.session_state.get("tracked_alpaca_orders", [])
 cancelable_alpaca_orders = cancelable_alpaca_order_records(alpaca_orders)
 managed_cancelable_alpaca_orders = enriched_cancelable_order_records(cancelable_alpaca_orders, tracked_alpaca_orders, alpaca_orders)
 waiting_limit_buy_rows = waiting_limit_buy_order_records(
@@ -3987,8 +3615,17 @@ limit_buy_allowed_outside_market = (
 auto_buy_session_allows_order = regular_market_open or limit_buy_allowed_outside_market
 first_exit_preview = next((preview for preview in exit_previews if preview.valid), None)
 first_exit_symbol = str(first_exit_preview.order.get("symbol", "")).strip().upper() if first_exit_preview else ""
-saved_exit_settings = saved_exit_settings_for_symbol(first_exit_symbol, tracked_alpaca_orders) if first_exit_symbol else None
-auto_exit_enabled_for_position = bool(saved_exit_settings.get("auto_exit_enabled", True)) if saved_exit_settings else False
+first_exit_position = next(
+    (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == first_exit_symbol),
+    None,
+)
+first_exit_resolution = (
+    resolve_position_plan(first_exit_position, alpaca_orders, tracked_alpaca_orders)
+    if first_exit_position
+    else None
+)
+saved_exit_settings = first_exit_resolution.exit_settings if first_exit_resolution else None
+auto_exit_enabled_for_position = bool(saved_exit_settings.get("auto_exit_enabled", False)) if saved_exit_settings else False
 exit_settings_available = True if not first_exit_symbol else bool(saved_exit_settings and auto_exit_enabled_for_position)
 managed_exit_ready, managed_exit_reason = evaluate_exit_rule_from_settings(saved_exit_settings) if first_exit_symbol else (False, "No Alpaca paper position is waiting for auto-exit.")
 exit_settings_reason = (
@@ -4111,234 +3748,8 @@ auto_exit_status = auto_exit_decision(
     exit_blockers=exit_blockers_by_hash_for_auto,
     entry_settings_match=exit_settings_available,
     entry_settings_reason=exit_settings_reason,
-    already_sent_hashes=set(st.session_state.get("auto_exit_sent_hashes", [])),
+    already_sent_hashes=set(),
 )
-
-
-def record_automation_decisions(checked_at: str) -> None:
-    auto_exit_key = (
-        active_automation_level,
-        auto_exit_status.status,
-        auto_exit_status.preview_hash,
-        tuple(auto_exit_status.reasons),
-    )
-    if active_automation_level != "Manual review only" and st.session_state.get("last_auto_exit_decision_key") != auto_exit_key:
-        auto_exit_event = AuditEvent(
-            event_type="auto_exit_decision_recorded",
-            message=f"Automatic paper exit decision: {auto_exit_status.status}.",
-            payload={
-                "automation_level": automation_level,
-                "active_automation_level": active_automation_level,
-                "status": auto_exit_status.status,
-                "ready": auto_exit_status.ready,
-                "symbol": auto_exit_status.symbol,
-                "quantity": auto_exit_status.quantity,
-                "preview_hash": auto_exit_status.preview_hash,
-                "reasons": auto_exit_status.reasons,
-                "broker_writes_submitted": 0,
-            },
-        )
-        st.session_state["session_audit_events"].append(auto_exit_event)
-        if persist_audit_log:
-            audit_store.append(auto_exit_event)
-        st.session_state["last_auto_exit_decision_key"] = auto_exit_key
-
-
-def auto_cancel_stale_limit_buy_once(automation_checked_at: str) -> bool:
-    if not auto_cancel_stale_limit_orders:
-        return False
-    blockers = stale_limit_cancel_blockers(managed_cancelable_alpaca_orders, stale_limit_order_minutes)
-    if blockers:
-        set_automation_action("Limit buy cancel waiting", " ".join(blockers), automation_checked_at)
-        return False
-    stale_orders = stale_limit_buy_orders(managed_cancelable_alpaca_orders, stale_limit_order_minutes)
-    if not stale_orders:
-        return False
-    selected_order = stale_orders[0]
-    selected_order_id = selected_order.get("Alpaca Order ID") or selected_order.get("Broker Order ID", "")
-    age_minutes = order_age_minutes(selected_order)
-    cancel_preview = build_alpaca_cancel_preview(selected_order, alpaca_adapter.config)
-    if not cancel_preview.valid:
-        set_automation_action("Limit buy cancel blocked", " ".join(cancel_preview.blocked_reasons), automation_checked_at)
-        return False
-    try:
-        cancel_result = alpaca_adapter.cancel_order(
-            selected_order_id,
-            expected_cancel_hash=cancel_preview.preview_hash,
-        )
-        broker_state_store.upsert(
-            {
-                "broker_order_id": selected_order_id,
-                "preview_hash": selected_order.get("Review ID", ""),
-                "symbol": selected_order.get("Symbol", ""),
-                "side": selected_order.get("Side", ""),
-                "quantity": selected_order.get("Quantity", ""),
-                "order_type": selected_order.get("Order Type", ""),
-                "limit_price": selected_order.get("Limit Price", ""),
-                "status": "cancel_requested",
-                "submitted_at": selected_order.get("Submitted", ""),
-                "source": "auto_cancel_old_limit_buy",
-            }
-        )
-        st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
-        set_automation_action(
-            f"Canceled old limit buy: {selected_order.get('Symbol', '')}",
-            f"Order waited {order_age_label(age_minutes)}.",
-            automation_checked_at,
-        )
-        cancel_event = AuditEvent(
-            event_type="auto_old_limit_buy_cancel_submitted",
-            message="Automatic stale paper limit buy cancel sent to Alpaca.",
-            payload={
-                "broker_order_id": selected_order_id,
-                "symbol": selected_order.get("Symbol", ""),
-                "side": selected_order.get("Side", ""),
-                "quantity": selected_order.get("Quantity", ""),
-                "limit_price": selected_order.get("Limit Price", ""),
-                "age_minutes": age_minutes,
-                "cancel_after_minutes": stale_limit_order_minutes,
-                "cancel_preview_hash": cancel_preview.preview_hash,
-                "cancel_status": str(getattr(cancel_result, "status", "cancel_requested")),
-                "checked_at": automation_checked_at,
-                "broker_writes_submitted": 1,
-            },
-        )
-        st.session_state["session_audit_events"].append(cancel_event)
-        if persist_audit_log:
-            audit_store.append(cancel_event)
-        return True
-    except Exception as exc:
-        set_automation_action("Limit buy cancel blocked", str(exc), automation_checked_at)
-        cancel_event = AuditEvent(
-            event_type="auto_old_limit_buy_cancel_blocked",
-            message=str(exc),
-            payload={
-                "broker_order_id": selected_order_id,
-                "symbol": selected_order.get("Symbol", ""),
-                "cancel_after_minutes": stale_limit_order_minutes,
-                "checked_at": automation_checked_at,
-                "broker_writes_submitted": 0,
-            },
-        )
-        st.session_state["session_audit_events"].append(cancel_event)
-        if persist_audit_log:
-            audit_store.append(cancel_event)
-        return False
-
-
-def run_paper_automation_once() -> None:
-    automation_checked_at = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-    st.session_state["last_automation_checked_at"] = automation_checked_at
-    record_automation_decisions(automation_checked_at)
-    _, broker_order_state_changed = refresh_tracked_alpaca_orders_from_broker()
-    if broker_order_state_changed:
-        set_automation_action(
-            "Alpaca orders refreshed",
-            "Order status changed at Alpaca. Automation will re-check with fresh order state.",
-            automation_checked_at,
-        )
-        st.rerun()
-
-    if auto_exit_status.ready:
-        auto_exit_preview = next((preview for preview in exit_previews if preview.preview_hash == auto_exit_status.preview_hash), None)
-        auto_exit_symbol = str(auto_exit_status.symbol).strip().upper()
-        auto_exit_position = next(
-            (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == auto_exit_symbol),
-            None,
-        )
-        auto_exit_intent = (
-            TradeIntent(
-                symbol=auto_exit_symbol,
-                side="sell",
-                quantity=int(float(auto_exit_status.quantity)),
-                order_type="market",
-                time_in_force="day",
-                rationale="Automatic paper exit generated from an existing Alpaca paper position.",
-                source_signals=["auto_exit_only", "alpaca_position_exit_preview"],
-            )
-            if auto_exit_preview is not None and auto_exit_position is not None
-            else None
-        )
-        auto_exit_execution_decision = ExecutionDecision(
-            mode="paper",
-            approved_for_execution=True,
-            requires_manual_approval=False,
-            reason="Paper exit passed all automation checks.",
-            risk_check=RiskCheckResult(approved=True, rejected_reasons=[], checks={"auto_exit_position": True}),
-        )
-        try:
-            if auto_exit_intent is None:
-                raise ValueError("Automatic exit could not match an open Alpaca paper position.")
-            alpaca_auto_exit_order = alpaca_adapter.submit_order(
-                auto_exit_intent,
-                auto_exit_execution_decision,
-                expected_preview_hash=auto_exit_status.preview_hash,
-            )
-            broker_order_id = str(getattr(alpaca_auto_exit_order, "id", ""))
-            if broker_order_id:
-                tracked_record = {
-                    "broker_order_id": broker_order_id,
-                    "preview_hash": auto_exit_status.preview_hash,
-                    "symbol": auto_exit_symbol,
-                    "side": "sell",
-                    "quantity": auto_exit_intent.quantity,
-                    "status": str(getattr(alpaca_auto_exit_order, "status", "")),
-                    "submitted_at": str(getattr(alpaca_auto_exit_order, "submitted_at", "")),
-                    "source": "auto_exit_only",
-                }
-                st.session_state["tracked_alpaca_orders"].append(tracked_record)
-                broker_state_store.upsert(tracked_record)
-            st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
-            set_automation_action(f"Paper exit sent: {auto_exit_intent.quantity} {auto_exit_symbol}", "", automation_checked_at)
-            auto_submit_event = AuditEvent(
-                event_type="auto_paper_exit_submitted",
-                message="Automatic paper exit sent to Alpaca.",
-                payload={
-                    "symbol": auto_exit_symbol,
-                    "side": "sell",
-                    "quantity": auto_exit_intent.quantity,
-                    "preview_hash": auto_exit_status.preview_hash,
-                    "broker_order_id": broker_order_id,
-                    "automation_level": automation_level,
-                    "checked_at": automation_checked_at,
-                    "broker_writes_submitted": 1,
-                },
-            )
-            st.session_state["session_audit_events"].append(auto_submit_event)
-            if persist_audit_log:
-                audit_store.append(auto_submit_event)
-        except Exception as exc:
-            st.session_state["auto_exit_sent_hashes"].append(auto_exit_status.preview_hash)
-            set_automation_action("Paper exit blocked", str(exc), automation_checked_at)
-            auto_block_event = AuditEvent(
-                event_type="auto_paper_exit_blocked",
-                message=str(exc),
-                payload={
-                    "symbol": auto_exit_symbol,
-                    "preview_hash": auto_exit_status.preview_hash,
-                    "automation_level": automation_level,
-                    "checked_at": automation_checked_at,
-                    "broker_writes_submitted": 0,
-                },
-            )
-            st.session_state["session_audit_events"].append(auto_block_event)
-            if persist_audit_log:
-                audit_store.append(auto_block_event)
-
-    elif auto_cancel_stale_limit_buy_once(automation_checked_at):
-        st.rerun()
-
-automation_timer_enabled = active_automation_level != "Manual review only" and not background_worker_enabled
-if automation_timer_enabled:
-    @st.fragment(run_every=f"{automation_refresh_seconds}s")
-    def automation_timer_tick() -> None:
-        run_paper_automation_once()
-        st.caption(
-            f"Automation checked: {st.session_state.get('last_automation_checked_at', 'Not checked yet')}. "
-            f"Last action: {st.session_state.get('last_automation_action', 'None')}."
-        )
-
-    automation_timer_tick()
 
 
 position_records = paper_broker.position_records()
@@ -4386,19 +3797,19 @@ def render_automation_status() -> None:
             if active_automation_level == "Manual review only"
             else auto_exit_status.status
         ),
-        last_checked_at=st.session_state.get("last_automation_checked_at", "Not checked yet"),
-        last_action=st.session_state.get("last_automation_action", "None"),
-        blocked_reason=st.session_state.get("last_automation_blocked_reason", ""),
+        last_checked_at=automation_worker_status.last_checked_at or "Not checked yet",
+        last_action=automation_worker_status.last_action or "None",
+        blocked_reason=automation_worker_status.last_error or "",
     )
     st.caption(
         f"Last checked: {runtime_state.last_checked_at}. "
-        f"Next check: every {automation_refresh_seconds} seconds while automation is on. "
+        f"Worker interval: every {automation_refresh_seconds} seconds while the worker is running. "
         f"Last action: {runtime_state.last_action}."
     )
-    if background_worker_enabled:
+    if sidebar_worker_present:
         st.info(
-            "Background worker mode is on. Use Start Worker and Stop Worker under the Kill Switch. "
-            "The in-page timer is paused while the worker is enabled."
+            "The Background Worker is the only process allowed to send automatic orders. "
+            "Use Start Worker and Stop Worker under the Kill Switch."
         )
         st.dataframe(pd.DataFrame(worker_status_records(automation_worker_status)), width="stretch", hide_index=True)
     if show_portfolio_evidence:
@@ -4631,11 +4042,17 @@ def render_buy_watchlist_manager() -> None:
 
 
 def render_open_positions_panel() -> None:
-    position_settings_by_symbol = {
-        str(position.get("Symbol", "")).strip().upper(): (
-            saved_exit_settings_for_symbol(str(position.get("Symbol", "")).strip().upper(), st.session_state["tracked_alpaca_orders"]) or {}
+    position_resolutions = {
+        str(position.get("Symbol", "")).strip().upper(): resolve_position_plan(
+            position,
+            alpaca_orders,
+            st.session_state["tracked_alpaca_orders"],
         )
         for position in alpaca_positions
+    }
+    position_settings_by_symbol = {
+        symbol: resolution.exit_settings or {}
+        for symbol, resolution in position_resolutions.items()
     }
     managed_count = sum(1 for settings in position_settings_by_symbol.values() if settings)
     auto_exit_on_count = sum(1 for settings in position_settings_by_symbol.values() if settings.get("auto_exit_enabled", False))
@@ -4687,12 +4104,29 @@ def render_open_positions_panel() -> None:
     )
     selected_position = alpaca_positions[selected_position_idx]
     selected_position_symbol = str(selected_position.get("Symbol", "")).strip().upper()
-    selected_entry_settings = saved_buy_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"])
-    selected_exit_settings = (
-        saved_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"])
-        or selected_entry_settings
-        or {**current_exit_settings, "symbol": selected_position_symbol}
+    save_notice = st.session_state.pop("position_exit_save_notice", None)
+    if save_notice and save_notice.get("symbol") == selected_position_symbol:
+        st.success(
+            f"Exit settings saved for {selected_position_symbol}. "
+            f"Method: {save_notice.get('method')}. Interval: {save_notice.get('interval')}. "
+            f"Current position cycle: {save_notice.get('cycle_id')}."
+        )
+    selected_resolution = resolve_position_plan(
+        selected_position,
+        alpaca_orders,
+        st.session_state["tracked_alpaca_orders"],
     )
+    selected_entry_settings = selected_resolution.entry_settings
+    selected_exit_settings = selected_resolution.exit_settings or {}
+    has_saved_exit_plan = bool(selected_exit_settings)
+    exit_editor_settings = selected_exit_settings or {
+        **current_exit_settings,
+        "symbol": selected_position_symbol,
+        "auto_exit_enabled": False,
+        "exit_mode": "atr_only",
+        "strategy_label": "ATR protection only",
+        "entry_source": "manual Alpaca position",
+    }
     selected_exit_details = evaluate_exit_rule_details_from_settings(selected_exit_settings)
     selected_exit_ready = bool(selected_exit_details["ready"])
     selected_exit_reason = str(selected_exit_details["reason"])
@@ -4700,8 +4134,8 @@ def render_open_positions_panel() -> None:
     selected_strategy_exit_price = selected_exit_details.get("strategy_exit_price")
     selected_atr_stop_price = selected_exit_details.get("atr_stop_price")
     selected_trailing_stop_price = selected_exit_details.get("trailing_stop_price")
-    selected_exit_interval = str(selected_exit_details.get("interval") or selected_exit_settings.get("interval", interval))
-    selected_exit_window = int(selected_exit_details.get("exit_window") or selected_exit_settings.get("exit_window", exit_w))
+    selected_exit_interval = str(selected_exit_details.get("interval") or exit_editor_settings.get("interval", interval))
+    selected_exit_window = int(selected_exit_details.get("exit_window") or exit_editor_settings.get("exit_window", exit_w))
 
     try:
         selected_avg_entry = float(selected_position.get("Average Entry") or 0)
@@ -4722,9 +4156,16 @@ def render_open_positions_panel() -> None:
         pct_or_missing(selected_unrealized_pct) if selected_unrealized_pct is not None else "Alpaca paper",
         "pos" if (selected_unrealized or 0) >= 0 else "neg",
     )
-    if selected_exit_trigger_price:
+    if not has_saved_exit_plan:
+        st.info(
+            f"No exit settings are saved for {selected_position_symbol}. Automatic exit is off. "
+            "Choose settings below and save them only if you want the app to manage this position."
+        )
+        if selected_resolution.cycle and not selected_resolution.cycle.reliable:
+            st.error(selected_resolution.reason)
+    elif selected_exit_trigger_price:
         st.info(f"Auto exit: sell {selected_position_symbol} if price is at or below ${float(selected_exit_trigger_price):,.2f}.")
-    if selected_exit_ready:
+    if has_saved_exit_plan and selected_exit_ready:
         st.warning(selected_exit_reason)
     st.markdown("#### Position plan")
     st.dataframe(
@@ -4738,16 +4179,17 @@ def render_open_positions_panel() -> None:
         width="stretch",
         hide_index=True,
     )
-    if exit_mode_for_settings(selected_exit_settings) == "strategy_and_atr":
+    if has_saved_exit_plan and exit_mode_for_settings(selected_exit_settings) == "strategy_and_atr":
         buy_snapshot = selected_exit_details.get("buy_level_snapshot") or {}
         with st.expander("Strategy BUY requirements attached to this position", expanded=False):
             st.caption(
                 "These are the current BUY requirements for the strategy governing this position. They explain the attached strategy; they do not add to the position automatically."
             )
             st.dataframe(pd.DataFrame(buy_snapshot.get("records") or []), width="stretch", hide_index=True)
-    else:
+    elif has_saved_exit_plan:
         st.caption("This position uses ATR protection only. No strategy BUY or sell line is attached.")
-    with st.expander("Quick exit changes", expanded=False):
+    if has_saved_exit_plan:
+      with st.expander("Quick exit changes", expanded=False):
         quick_cols = st.columns(3)
         if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
             quick_settings = adjust_initial_stop_settings(
@@ -4755,8 +4197,8 @@ def render_open_positions_panel() -> None:
                 max(0.5, float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))) - 0.25),
             )
             quick_settings["symbol"] = selected_position_symbol
-            updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-            broker_state_store.replace_all(updated_orders)
+            quick_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
+            updated_orders = persist_current_position_plan(selected_position, quick_settings, selected_entry_settings)
             st.session_state["tracked_alpaca_orders"] = updated_orders
             st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_tightened", message="ATR stop tightened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
             st.rerun()
@@ -4766,13 +4208,22 @@ def render_open_positions_panel() -> None:
                 min(5.0, float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))) + 0.25),
             )
             quick_settings["symbol"] = selected_position_symbol
-            updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-            broker_state_store.replace_all(updated_orders)
+            quick_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
+            updated_orders = persist_current_position_plan(selected_position, quick_settings, selected_entry_settings)
             st.session_state["tracked_alpaca_orders"] = updated_orders
             st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_loosened", message="ATR stop loosened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
             st.rerun()
         if quick_cols[2].button("Use Current Sidebar Exit Settings", key=f"use_current_exit_{selected_position_symbol}"):
-            quick_settings = {**current_exit_settings, "symbol": selected_position_symbol, "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", True))}
+            quick_settings = replace_exit_rules(selected_exit_settings, current_exit_settings)
+            quick_settings.update({
+                "symbol": selected_position_symbol,
+                "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", False)),
+            })
+            quick_settings = adjust_initial_stop_settings(
+                quick_settings,
+                float(current_exit_settings.get("entry_stop_atr_multiplier", current_exit_settings.get("atr_stop_multiplier", atr_mult))),
+            )
+            quick_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
             quick_preview = evaluate_exit_rule_details_from_settings(quick_settings)
             if quick_preview.get("ready") and quick_preview.get("trigger_source") == "strategy exit":
                 st.error(
@@ -4780,12 +4231,11 @@ def render_open_positions_panel() -> None:
                     f"its strategy exit at {money_or_missing(quick_preview.get('strategy_exit_price'))}. Edit the exit settings instead."
                 )
             else:
-                updated_orders = update_exit_settings_for_symbol(selected_position_symbol, st.session_state["tracked_alpaca_orders"], quick_settings)
-                broker_state_store.replace_all(updated_orders)
+                updated_orders = persist_current_position_plan(selected_position, quick_settings, selected_entry_settings)
                 st.session_state["tracked_alpaca_orders"] = updated_orders
                 st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
                 st.rerun()
-    if show_portfolio_evidence:
+    if show_portfolio_evidence and has_saved_exit_plan:
         with st.expander("Saved exit rule details *", expanded=False):
             st.dataframe(
                 pd.DataFrame(
@@ -4806,25 +4256,15 @@ def render_open_positions_panel() -> None:
                 hide_index=True,
             )
 
-    with st.form(f"exit_settings_{selected_position_symbol}"):
+    with st.container():
         st.markdown("#### Edit exit settings")
-        if str(selected_exit_settings.get("exit_mode") or "strategy_and_atr") == "atr_only":
+        if not has_saved_exit_plan:
             st.caption(
-                f"ATR protection interval: {selected_exit_interval}. No strategy sell line is attached to this position."
-            )
-        elif str(selected_exit_settings.get("strategy_type", "")) == "rsi_scalp":
-            st.caption(
-                f"Exit interval: {selected_exit_interval}. RSI uses completed {selected_exit_interval} bars. "
-                + ("The optional maximum holding period uses the same bars." if selected_exit_settings.get("rsi_max_holding_enabled", True) else "The maximum holding period is off.")
-            )
-        else:
-            st.caption(
-                f"Exit interval: {selected_exit_interval}. "
-                f"Sell exit length uses {selected_exit_interval} bars, so {selected_exit_window} bars means {selected_exit_window} bars on the {selected_exit_interval} chart."
+                "These are draft settings only. Nothing is saved and the app will not manage this position until you click Save Exit Settings For This Position."
             )
         exit_auto_enabled = st.checkbox(
             "Auto exit this position",
-            value=bool(selected_exit_settings.get("auto_exit_enabled", True)),
+            value=bool(exit_editor_settings.get("auto_exit_enabled", False)),
             key=f"auto_exit_enabled_{selected_position_symbol}",
         )
         exit_strategy_options = {
@@ -4834,13 +4274,14 @@ def render_open_positions_panel() -> None:
             "Trendline retest continuation": "trendline_retest",
             "RSI mean-reversion scalp": "rsi_scalp",
         }
-        default_exit_strategy = str(selected_exit_settings.get("strategy_type", strategy_type))
+        default_exit_strategy = str(exit_editor_settings.get("strategy_type", strategy_type))
         default_exit_strategy_label = next(
             (label for label, value in exit_strategy_options.items() if value == default_exit_strategy),
             "Breakout continuation",
         )
-        existing_exit_mode = exit_mode_for_settings(selected_exit_settings)
-        edited_exit_method_label = st.selectbox(
+        existing_exit_mode = exit_mode_for_settings(exit_editor_settings)
+        control_cols = st.columns(3)
+        edited_exit_method_label = control_cols[0].selectbox(
             "Exit method",
             ["ATR protection only", "Strategy exit + ATR protection"],
             index=0 if existing_exit_mode == "atr_only" else 1,
@@ -4852,20 +4293,50 @@ def render_open_positions_panel() -> None:
         )
         edited_exit_mode = "atr_only" if edited_exit_method_label == "ATR protection only" else "strategy_and_atr"
         strategy_exit_enabled = edited_exit_mode == "strategy_and_atr"
-        edited_exit_strategy_label = st.selectbox(
+        exit_interval_options = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"]
+        default_exit_interval = selected_exit_interval if selected_exit_interval in exit_interval_options else "4h"
+        edited_exit_interval = control_cols[1].selectbox(
+            "Exit interval",
+            exit_interval_options,
+            index=exit_interval_options.index(default_exit_interval),
+            key=f"exit_interval_{selected_position_symbol}",
+            help=(
+                "The worker uses completed bars from this interval for this position's ATR, strategy sell line, RSI exit, "
+                "break-even progress, and trailing stop. This setting belongs only to this position and does not use the current sidebar interval."
+            ),
+        )
+        edited_exit_strategy_label = control_cols[2].selectbox(
             "Exit strategy",
             list(exit_strategy_options.keys()),
             index=list(exit_strategy_options.keys()).index(default_exit_strategy_label),
             key=f"exit_strategy_{selected_position_symbol}",
             disabled=not strategy_exit_enabled,
+            help=(
+                "Choose Strategy exit + ATR protection under Exit method to enable this selector. "
+                "ATR protection only intentionally ignores every strategy sell line."
+            ),
         )
         edited_exit_strategy_type = exit_strategy_options[edited_exit_strategy_label]
+        if not strategy_exit_enabled:
+            st.caption(
+                f"ATR protection only is selected. The app will use completed {edited_exit_interval} bars for ATR protection, "
+                "but the Exit strategy and strategy-specific inputs are intentionally inactive."
+            )
+        elif edited_exit_strategy_type == "rsi_scalp":
+            st.caption(
+                f"RSI mean-reversion scalp will use completed {edited_exit_interval} bars for RSI and all ATR protection."
+            )
+        else:
+            st.caption(
+                f"{edited_exit_strategy_label} and ATR protection will both use completed {edited_exit_interval} bars. "
+                "The app follows whichever active sell protection level is highest."
+            )
         edit_cols = st.columns(3)
         edited_exit_window = edit_cols[0].slider(
             "Sell exit length",
             5,
             30,
-            int(selected_exit_settings.get("exit_window", exit_w)),
+            int(exit_editor_settings.get("exit_window", exit_w)),
             step=5,
             key=f"exit_window_{selected_position_symbol}",
             disabled=not strategy_exit_enabled,
@@ -4874,7 +4345,7 @@ def render_open_positions_panel() -> None:
             "Initial stop ATR multiplier",
             0.5,
             5.0,
-            float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))),
+            float(exit_editor_settings.get("entry_stop_atr_multiplier", exit_editor_settings.get("atr_stop_multiplier", atr_mult))),
             step=0.1,
             key=f"exit_atr_mult_{selected_position_symbol}",
             help=(
@@ -4886,13 +4357,13 @@ def render_open_positions_panel() -> None:
             "Trend filter length",
             10,
             300,
-            int(selected_exit_settings.get("moving_average_window", ma_w)),
+            int(exit_editor_settings.get("moving_average_window", ma_w)),
             step=10,
             key=f"exit_trend_filter_{selected_position_symbol}",
             help="Calculates the trend filter for this position's saved exit plan. A shorter filter reacts faster but changes trend direction more often.",
             disabled=not strategy_exit_enabled,
         )
-        saved_entry_atr = optional_float(selected_exit_settings.get("entry_atr"))
+        saved_entry_atr = optional_float(exit_editor_settings.get("entry_atr"))
         projected_fill_adjusted_stop = (
             selected_avg_entry - saved_entry_atr * edited_atr_mult
             if selected_avg_entry and saved_entry_atr is not None
@@ -4905,7 +4376,7 @@ def render_open_positions_panel() -> None:
         st.markdown("#### Profit protection")
         profit_protection_enabled = st.checkbox(
             "Protect profits with ATR trail",
-            value=bool(selected_exit_settings.get("profit_protection_enabled", True)),
+            value=bool(exit_editor_settings.get("profit_protection_enabled", True)),
             key=f"profit_protection_enabled_{selected_position_symbol}",
             help="After the position has enough profit, the app can trail from the highest price since entry.",
         )
@@ -4914,7 +4385,7 @@ def render_open_positions_panel() -> None:
             "Move stop to break-even after",
             0.5,
             3.0,
-            float(selected_exit_settings.get("breakeven_after_r", 1.0)),
+            float(exit_editor_settings.get("breakeven_after_r", 1.0)),
             step=0.5,
             key=f"breakeven_after_r_{selected_position_symbol}",
             help="1R means the trade is up by the amount originally risked.",
@@ -4923,7 +4394,7 @@ def render_open_positions_panel() -> None:
             "Start ATR trail after",
             1.0,
             5.0,
-            float(selected_exit_settings.get("trail_after_r", 2.0)),
+            float(exit_editor_settings.get("trail_after_r", 2.0)),
             step=0.5,
             key=f"trail_after_r_{selected_position_symbol}",
             help="The ATR trail starts only after this much profit.",
@@ -4932,7 +4403,7 @@ def render_open_positions_panel() -> None:
             "Trailing ATR distance",
             1.0,
             5.0,
-            float(selected_exit_settings.get("trailing_atr_multiplier", 3.0)),
+            float(exit_editor_settings.get("trailing_atr_multiplier", 3.0)),
             step=0.1,
             key=f"trailing_atr_multiplier_{selected_position_symbol}",
             help="Higher numbers give profitable trades more room before the trail sells.",
@@ -4942,7 +4413,7 @@ def render_open_positions_panel() -> None:
             "Pullback average length",
             10,
             200,
-            int(selected_exit_settings.get("pullback_average_length", pullback_w)),
+            int(exit_editor_settings.get("pullback_average_length", pullback_w)),
             step=5,
             key=f"exit_pullback_length_{selected_position_symbol}",
             help="Used by Trend pullback continuation as the pullback-zone average for this position.",
@@ -4952,18 +4423,18 @@ def render_open_positions_panel() -> None:
             "Momentum turn length",
             3,
             20,
-            int(selected_exit_settings.get("momentum_turn_length", momentum_w)),
+            int(exit_editor_settings.get("momentum_turn_length", momentum_w)),
             step=1,
             key=f"exit_momentum_length_{selected_position_symbol}",
             help="Used by Trend pullback continuation and Trendline retest continuation to confirm price turned back up.",
             disabled=not strategy_exit_enabled,
         )
-        edited_rsi_length = int(selected_exit_settings.get("rsi_length", 14))
-        edited_rsi_recovery = float(selected_exit_settings.get("rsi_sell_recovery_points", 35.0))
-        edited_rsi_sell_cap = float(selected_exit_settings.get("rsi_overbought", 70.0))
-        edited_rsi_profit_only_exit = bool(selected_exit_settings.get("rsi_profit_only_exit", False))
-        edited_rsi_max_hold_enabled = bool(selected_exit_settings.get("rsi_max_holding_enabled", True))
-        edited_rsi_max_hold = int(selected_exit_settings.get("rsi_max_holding_bars", 100))
+        edited_rsi_length = int(exit_editor_settings.get("rsi_length", 14))
+        edited_rsi_recovery = float(exit_editor_settings.get("rsi_sell_recovery_points", 35.0))
+        edited_rsi_sell_cap = float(exit_editor_settings.get("rsi_overbought", 70.0))
+        edited_rsi_profit_only_exit = bool(exit_editor_settings.get("rsi_profit_only_exit", False))
+        edited_rsi_max_hold_enabled = bool(exit_editor_settings.get("rsi_max_holding_enabled", True))
+        edited_rsi_max_hold = int(exit_editor_settings.get("rsi_max_holding_bars", 100))
         if strategy_exit_enabled and edited_exit_strategy_type == "rsi_scalp":
             st.markdown("#### RSI mean-reversion exit")
             edited_rsi_profit_only_exit = st.checkbox(
@@ -5001,14 +4472,20 @@ def render_open_positions_panel() -> None:
                 "Maximum hold", 1, 500, edited_rsi_max_hold, step=25,
                 key=f"exit_rsi_max_hold_{selected_position_symbol}",
                 disabled=not edited_rsi_max_hold_enabled,
-                help=f"Exit after this many completed {selected_exit_interval} bars if the position is still open.",
+                help=f"Exit after this many completed {edited_exit_interval} bars if the position is still open.",
             ))
-        save_exit_settings = st.form_submit_button("Save Exit Settings For This Position")
+        save_exit_settings = st.button(
+            "Save Exit Settings For This Position",
+            key=f"save_exit_settings_{selected_position_symbol}",
+            type="primary",
+        )
 
     if save_exit_settings:
-        edited_exit_settings = adjust_initial_stop_settings({
-            **selected_exit_settings,
+        edited_exit_template = {
+            **exit_editor_settings,
             "symbol": selected_position_symbol,
+            "interval": edited_exit_interval,
+            "history": exit_plan_history_for_interval(edited_exit_interval),
             "exit_mode": edited_exit_mode,
             "strategy_type": edited_exit_strategy_type,
             "strategy_label": "ATR protection only" if edited_exit_mode == "atr_only" else edited_exit_strategy_label,
@@ -5028,31 +4505,78 @@ def render_open_positions_panel() -> None:
             "breakeven_after_r": edited_breakeven_after_r,
             "trail_after_r": edited_trail_after_r,
             "trailing_atr_multiplier": edited_trailing_atr_multiplier,
-        }, edited_atr_mult)
-        edited_preview = evaluate_exit_rule_details_from_settings(edited_exit_settings)
-        immediate_strategy_exit = bool(
-            edited_exit_mode == "strategy_and_atr"
-            and edited_preview.get("ready")
-            and edited_preview.get("trigger_source") == "strategy exit"
-        )
-        if immediate_strategy_exit:
-            st.error(
-                "These strategy settings would sell the position on the next worker check because the current price is already at or below "
-                f"the strategy exit at {money_or_missing(edited_preview.get('strategy_exit_price'))}. Choose ATR protection only or change the strategy settings."
+        }
+        try:
+            interval_changed = edited_exit_interval != str(exit_editor_settings.get("interval") or "")
+            needs_atr_snapshot = (
+                not has_saved_exit_plan
+                or interval_changed
+                or optional_float(edited_exit_template.get("entry_atr")) is None
             )
-        else:
-            updated_orders = update_exit_settings_for_symbol(
-            selected_position_symbol,
-            st.session_state["tracked_alpaca_orders"],
-            edited_exit_settings,
+            if needs_atr_snapshot:
+                edited_exit_template.update({
+                    "account_size": float(paper_order_risk_equity),
+                    "sizing_account_source": "Alpaca paper account",
+                    "sizing_account_equity": float(paper_order_risk_equity),
+                    "sizing_available_cash": float(paper_order_available_cash),
+                    "risk_limits_at_entry": asdict(risk_limits),
+                    "risk_per_trade_pct": float(current_strategy_settings["risk_per_trade_pct"]),
+                })
+                selected_plan_data = fetch_price_data_for_source(
+                    selected_position_symbol,
+                    str(edited_exit_template["history"]),
+                    edited_exit_interval,
+                    str(edited_exit_template.get("price_data_source", "Ticker (Alpaca)")),
+                )
+                selected_position_atr, atr_measured_at = latest_atr_snapshot(selected_plan_data)
+                edited_exit_template.update({
+                    "entry_atr": selected_position_atr,
+                    "entry_atr_pct": (
+                        selected_position_atr / selected_avg_entry * 100
+                        if selected_avg_entry > 0
+                        else None
+                    ),
+                    "entry_atr_source": f"Latest completed {edited_exit_interval} bar when this exit plan was saved",
+                    "entry_atr_measured_at": atr_measured_at,
+                    "entry_reference_price": selected_avg_entry,
+                    "planned_entry_price": selected_avg_entry,
+                })
+            if not has_saved_exit_plan:
+                if selected_resolution.cycle is None or not selected_resolution.cycle.reliable:
+                    raise ValueError(selected_resolution.reason)
+                edited_exit_template = initialize_exit_settings_for_position(
+                    selected_resolution.cycle,
+                    edited_exit_template,
+                    current_atr=float(edited_exit_template["entry_atr"]),
+                    atr_multiplier=edited_atr_mult,
+                )
+            edited_exit_settings = adjust_initial_stop_settings(edited_exit_template, edited_atr_mult)
+            edited_exit_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
+            edited_preview = evaluate_exit_rule_details_from_settings(edited_exit_settings)
+            immediate_strategy_exit = bool(
+                edited_exit_mode == "strategy_and_atr"
+                and edited_preview.get("ready")
+                and edited_preview.get("trigger_source") == "strategy exit"
             )
-            broker_state_store.replace_all(updated_orders)
+            if immediate_strategy_exit:
+                raise ValueError(
+                    "These settings would sell the position on the next worker check because the current price is already at or below "
+                    f"the strategy exit at {money_or_missing(edited_preview.get('strategy_exit_price'))}. "
+                    "Choose ATR protection only or change the strategy settings."
+                )
+            updated_orders = persist_current_position_plan(
+                selected_position,
+                edited_exit_settings,
+                selected_entry_settings,
+            )
             st.session_state["tracked_alpaca_orders"] = updated_orders
             settings_event = AuditEvent(
                 event_type="position_exit_settings_saved",
                 message="Exit settings saved for an Alpaca paper position.",
                 payload={
                     "symbol": selected_position_symbol,
+                    "position_cycle_id": edited_exit_settings.get("position_cycle_id"),
+                    "position_basis_order_id": edited_exit_settings.get("position_basis_order_id"),
                     "exit_settings": edited_exit_settings,
                     "broker_writes_submitted": 0,
                 },
@@ -5060,7 +4584,15 @@ def render_open_positions_panel() -> None:
             st.session_state["session_audit_events"].append(settings_event)
             if persist_audit_log:
                 audit_store.append(settings_event)
+            st.session_state["position_exit_save_notice"] = {
+                "symbol": selected_position_symbol,
+                "method": edited_exit_method_label,
+                "interval": edited_exit_interval,
+                "cycle_id": edited_exit_settings.get("position_cycle_id"),
+            }
             st.rerun()
+        except Exception as exc:
+            st.error(f"Exit settings were not saved: {exc}")
 
     with st.expander("Saved entry plan", expanded=False):
         if selected_entry_settings:
@@ -5331,8 +4863,12 @@ def render_manual_order_form() -> None:
                     "sizing_account_source": paper_order_account_source,
                     "sizing_account_equity": paper_order_risk_equity,
                     "sizing_available_cash": paper_order_available_cash,
+                    "account_size": paper_order_risk_equity,
+                    "risk_limits_at_entry": asdict(risk_limits),
                     "auto_exit_enabled": manual_auto_exit,
                 }
+                if broker_order_id:
+                    manual_exit_settings["entry_broker_order_id"] = broker_order_id
                 tracked_record = {
                     "broker_order_id": broker_order_id,
                     "preview_hash": manual_preview.preview_hash,
@@ -5350,13 +4886,6 @@ def render_manual_order_form() -> None:
                 if broker_order_id:
                     st.session_state["tracked_alpaca_orders"].append(tracked_record)
                     broker_state_store.upsert(tracked_record)
-                    updated_orders = update_exit_settings_for_symbol(
-                        manual_intent.symbol_clean,
-                        st.session_state["tracked_alpaca_orders"],
-                        manual_exit_settings,
-                    )
-                    broker_state_store.replace_all(updated_orders)
-                    st.session_state["tracked_alpaca_orders"] = updated_orders
                 manual_event = AuditEvent(
                     event_type="alpaca_paper_manual_buy_submitted",
                     message="Manual paper buy submitted to Alpaca without requiring a strategy BUY signal.",
@@ -6541,6 +6070,15 @@ if command_center_view == "Alpaca":
                 execution_decision,
                 expected_preview_hash=alpaca_preview.preview_hash,
             )
+            broker_order_id = str(getattr(alpaca_order, "id", ""))
+            owned_strategy_settings = {
+                **current_strategy_settings,
+                "entry_broker_order_id": broker_order_id,
+            }
+            owned_exit_settings = {
+                **current_exit_settings,
+                "entry_broker_order_id": broker_order_id,
+            }
             alpaca_event = AuditEvent(
                 event_type=f"alpaca_{alpaca_order_noun}_order_submitted",
                 message=f"Alpaca {alpaca_order_noun} order submitted through the gated adapter.",
@@ -6551,12 +6089,11 @@ if command_center_view == "Alpaca":
                     "order_type": intent.order_type,
                     "limit_price": intent.limit_price,
                     "preview_hash": alpaca_preview.preview_hash,
-                    "broker_order_id": str(getattr(alpaca_order, "id", "")),
-                    "strategy_settings": current_strategy_settings,
-                    "exit_settings": current_exit_settings,
+                    "broker_order_id": broker_order_id,
+                    "strategy_settings": owned_strategy_settings,
+                    "exit_settings": owned_exit_settings,
                 },
             )
-            broker_order_id = str(getattr(alpaca_order, "id", ""))
             if broker_order_id:
                 tracked_record = {
                     "broker_order_id": broker_order_id,
@@ -6568,18 +6105,12 @@ if command_center_view == "Alpaca":
                     "limit_price": intent.limit_price,
                     "status": str(getattr(alpaca_order, "status", "")),
                     "submitted_at": str(getattr(alpaca_order, "submitted_at", "")),
-                    "strategy_settings": current_strategy_settings,
-                    "exit_settings": current_exit_settings,
+                    "source": "approved_strategy_order",
+                    "strategy_settings": owned_strategy_settings,
+                    "exit_settings": owned_exit_settings,
                 }
                 st.session_state["tracked_alpaca_orders"].append(tracked_record)
                 broker_state_store.upsert(tracked_record)
-                updated_orders = update_exit_settings_for_symbol(
-                    intent.symbol_clean,
-                    st.session_state["tracked_alpaca_orders"],
-                    current_exit_settings,
-                )
-                broker_state_store.replace_all(updated_orders)
-                st.session_state["tracked_alpaca_orders"] = updated_orders
             st.session_state["session_audit_events"].append(alpaca_event)
             if persist_audit_log:
                 audit_store.append(alpaca_event)
@@ -6603,6 +6134,11 @@ if command_center_view == "Alpaca":
                 item.get("preview_hash", ""),
             )
             for item in tracked_alpaca_orders
+            if str(item.get("source") or "").strip().lower() not in {
+                "position_plan",
+                "position_observation",
+                "adopted_alpaca_position",
+            }
         ]
         st.dataframe(pd.DataFrame(tracked_rows), width="stretch", hide_index=True)
     
@@ -6635,47 +6171,12 @@ if command_center_view == "Alpaca":
                 )
                 st.dataframe(pd.DataFrame(position_lifecycle_rows), width="stretch", hide_index=True)
                 st.caption("These rows explain how Alpaca positions connect to local app records.")
-            untracked_position_rows = [row for row in position_lifecycle_rows if row.get("Tracking Status") == "Needs app tracking"]
+            untracked_position_rows = [row for row in position_lifecycle_rows if row.get("Tracking Status") == "Unmanaged position"]
             if untracked_position_rows:
-                st.markdown("#### Track Alpaca position in this app")
-                st.warning("Alpaca has a position that is not linked to an app record yet.")
-                adopt_options = [
-                    f"{row.get('Symbol', '')} qty {row.get('Position Qty', '')}"
-                    for row in untracked_position_rows
-                ]
-                selected_adopt_idx = st.selectbox(
-                    "Position to track",
-                    range(len(adopt_options)),
-                    format_func=lambda idx: adopt_options[idx],
+                st.warning(
+                    "One or more open positions could not be reconciled to Alpaca fill history. "
+                    "Automatic exits stay off for those positions until the order history and position quantity match."
                 )
-                selected_adopt_symbol = str(untracked_position_rows[selected_adopt_idx].get("Symbol", "")).strip().upper()
-                selected_adopt_position = next(
-                    (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == selected_adopt_symbol),
-                    None,
-                )
-                adopt_disabled = selected_adopt_position is None or not alpaca_status.connected or alpaca_state_health.stale
-                if st.button("Track This Alpaca Position in the App", disabled=adopt_disabled):
-                    adopted_record = adopt_alpaca_position(selected_adopt_position)
-                    broker_state_store.upsert(adopted_record)
-                    st.session_state["tracked_alpaca_orders"] = broker_state_store.read()
-                    adoption_event = AuditEvent(
-                        event_type="alpaca_paper_position_adopted",
-                        message="Alpaca paper position is now tracked by the app.",
-                        payload={
-                            "broker_order_id": adopted_record.get("broker_order_id", ""),
-                            "symbol": adopted_record.get("symbol", ""),
-                            "quantity": adopted_record.get("filled_quantity", ""),
-                            "average_fill_price": adopted_record.get("average_fill_price", ""),
-                            "source": adopted_record.get("source", ""),
-                            "broker_writes_submitted": 0,
-                        },
-                    )
-                    st.session_state["session_audit_events"].append(adoption_event)
-                    if persist_audit_log:
-                        audit_store.append(adoption_event)
-                    st.rerun()
-                st.caption("This only updates the app's local record. It does not send anything to Alpaca.")
-    
         refresh_state_disabled = not alpaca_status.connected or alpaca_state_health.stale
         if st.button("Refresh Alpaca Orders From Alpaca", disabled=refresh_state_disabled):
             refreshed_orders = refreshed_order_state
@@ -6695,87 +6196,6 @@ if command_center_view == "Alpaca":
             st.rerun()
         st.caption("Refresh reads Alpaca Orders and updates only the app's local tracking file.")
     
-    if show_portfolio_evidence and st.session_state.get("tracked_alpaca_orders"):
-        with st.expander("Practice fill and exit records *", expanded=False):
-            simulator_options = [
-                f"{order.get('symbol', '')} {order.get('side', '')} {order.get('quantity', '')} ({str(order.get('broker_order_id', ''))[:8]})"
-                for order in st.session_state["tracked_alpaca_orders"]
-            ]
-            selected_sim_idx = st.selectbox(
-                "Tracked order to simulate",
-                range(len(simulator_options)),
-                format_func=lambda idx: simulator_options[idx],
-            )
-            selected_sim_order = st.session_state["tracked_alpaca_orders"][selected_sim_idx]
-            default_fill_price = float(live["last_p"]) if live.get("last_p") else 0.0
-            simulated_fill_price = st.number_input(
-                "Simulated fill price",
-                min_value=0.0,
-                value=round(default_fill_price, 2),
-                step=0.01,
-            )
-            if st.button("Simulate Alpaca Paper Fill"):
-                filled_record = simulated_alpaca_fill_order(selected_sim_order, fill_price=simulated_fill_price)
-                simulated_position = simulated_position_from_filled_order(filled_record)
-                refreshed_orders = [
-                    filled_record if item.get("broker_order_id") == filled_record.get("broker_order_id") else item
-                    for item in st.session_state["tracked_alpaca_orders"]
-                ]
-                broker_state_store.replace_all(refreshed_orders)
-                st.session_state["tracked_alpaca_orders"] = refreshed_orders
-                st.session_state["simulated_alpaca_positions"] = [simulated_position]
-                fill_event = AuditEvent(
-                    event_type="simulated_alpaca_paper_fill_recorded",
-                    message="Local Alpaca paper fill simulation recorded without contacting Alpaca.",
-                    payload={
-                        "broker_order_id": filled_record.get("broker_order_id", ""),
-                        "symbol": filled_record.get("symbol", ""),
-                        "quantity": filled_record.get("filled_quantity", ""),
-                        "average_fill_price": filled_record.get("average_fill_price", ""),
-                        "broker_writes_submitted": 0,
-                    },
-                )
-                st.session_state["session_audit_events"].append(fill_event)
-                if persist_audit_log:
-                    audit_store.append(fill_event)
-                st.rerun()
-    
-            simulated_positions = st.session_state.get("simulated_alpaca_positions", [])
-            if simulated_positions:
-                st.markdown("#### Practice position record")
-                simulated_lifecycle_rows = alpaca_position_lifecycle_records(
-                    simulated_positions,
-                    st.session_state["tracked_alpaca_orders"],
-                )
-                st.dataframe(
-                    pd.DataFrame(alpaca_position_lifecycle_summary_records(simulated_lifecycle_rows)),
-                    width="stretch",
-                    hide_index=True,
-                )
-                st.dataframe(pd.DataFrame(simulated_lifecycle_rows), width="stretch", hide_index=True)
-    
-            st.markdown("#### Practice exit check")
-            exit_readiness_rows = simulated_exit_preview_readiness_records(
-                selected_sim_order,
-                alpaca_adapter.config,
-            )
-            st.dataframe(pd.DataFrame(exit_readiness_rows), width="stretch", hide_index=True)
-            if st.button("Save Practice Exit Check"):
-                exit_sim_event = AuditEvent(
-                    event_type="simulated_exit_readiness_recorded",
-                    message="Local exit-path readiness simulation recorded without contacting Alpaca.",
-                    payload={
-                        "broker_order_id": selected_sim_order.get("broker_order_id", ""),
-                        "symbol": selected_sim_order.get("symbol", ""),
-                        "checks": exit_readiness_rows,
-                        "broker_writes_submitted": 0,
-                    },
-                )
-                st.session_state["session_audit_events"].append(exit_sim_event)
-                if persist_audit_log:
-                    audit_store.append(exit_sim_event)
-                st.rerun()
-            st.caption("These practice tools update local records only. They never submit, cancel, or exit Alpaca orders.")
     if exit_previews:
         st.markdown("#### Sell paper position")
         exit_options = [
@@ -6849,6 +6269,15 @@ if command_center_view == "Alpaca":
         exit_button_label = "Send Paper Exit to Alpaca" if alpaca_adapter.config.paper else "Send Live Exit to Alpaca"
         if st.button(exit_button_label, disabled=alpaca_exit_submit_disabled):
             try:
+                exit_position_resolution = (
+                    resolve_position_plan(
+                        selected_exit_position,
+                        alpaca_orders,
+                        st.session_state["tracked_alpaca_orders"],
+                    )
+                    if selected_exit_position is not None
+                    else None
+                )
                 alpaca_exit_order = alpaca_adapter.submit_order(
                     selected_exit_intent,
                     exit_decision,
@@ -6863,10 +6292,26 @@ if command_center_view == "Alpaca":
                         "quantity": selected_exit_intent.quantity,
                         "preview_hash": alpaca_exit_preview.preview_hash,
                         "broker_order_id": str(getattr(alpaca_exit_order, "id", "")),
+                        "position_cycle_id": (
+                            exit_position_resolution.cycle.cycle_id
+                            if exit_position_resolution and exit_position_resolution.cycle
+                            else ""
+                        ),
+                        "position_basis_order_id": (
+                            exit_position_resolution.cycle.basis_order_id
+                            if exit_position_resolution and exit_position_resolution.cycle
+                            else ""
+                        ),
+                        "position_average_entry": (
+                            exit_position_resolution.cycle.average_entry
+                            if exit_position_resolution and exit_position_resolution.cycle
+                            else None
+                        ),
                     },
                 )
                 broker_order_id = str(getattr(alpaca_exit_order, "id", ""))
                 if broker_order_id:
+                    cycle = exit_position_resolution.cycle if exit_position_resolution else None
                     tracked_record = {
                         "broker_order_id": broker_order_id,
                         "preview_hash": alpaca_exit_preview.preview_hash,
@@ -6875,6 +6320,9 @@ if command_center_view == "Alpaca":
                         "quantity": selected_exit_intent.quantity,
                         "status": str(getattr(alpaca_exit_order, "status", "")),
                         "submitted_at": str(getattr(alpaca_exit_order, "submitted_at", "")),
+                        "source": "manual_exit",
+                        "parent_position_cycle_id": cycle.cycle_id if cycle else "",
+                        "parent_position_basis_order_id": cycle.basis_order_id if cycle else "",
                     }
                     st.session_state["tracked_alpaca_orders"].append(tracked_record)
                     broker_state_store.upsert(tracked_record)

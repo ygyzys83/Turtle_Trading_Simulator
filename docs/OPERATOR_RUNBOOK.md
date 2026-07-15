@@ -31,13 +31,13 @@ Use this runbook for paper testing, emergency halt, recovery, and evidence expor
 5. Click `Submit Alpaca Paper Exit` only after manual approval.
 6. Export evidence after the exit test.
 
-## Local Simulator Test
+## Position Lifecycle Test
 
-1. Open `Local paper lifecycle simulators`.
-2. Click `Simulate Alpaca Paper Fill`.
-3. Confirm simulated lifecycle tables update.
-4. Click `Record Simulated Exit Readiness`.
-5. Treat simulator evidence as UI evidence only. It does not replace real Alpaca paper fill evidence.
+1. Fill a BUY in Alpaca paper.
+2. Confirm `Open Positions & Queued Setups` shows the actual Alpaca average entry and the current BUY order ID.
+3. Confirm `Position plan` uses only that fill cycle's saved entry and exit settings.
+4. Fully exit the position, then buy the same ticker again.
+5. Confirm the new position has a new cycle ID, a new average entry, and no high-water mark from the prior position.
 
 ## Emergency Halt
 

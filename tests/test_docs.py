@@ -27,15 +27,15 @@ def test_operator_runbook_names_halt_recovery_and_evidence_export():
     assert "Emergency Halt" in text
     assert "Recovery" in text
     assert "Evidence Export" in text
-    assert "Local Simulator Test" in text
+    assert "Position Lifecycle Test" in text
 
 
-def test_paper_test_plan_includes_local_simulator_check():
+def test_paper_test_plan_includes_position_lifecycle_check():
     text = (ROOT / "docs" / "PAPER_TEST_PLAN.md").read_text(encoding="utf-8")
 
-    assert "Local Simulator Check" in text
-    assert "Simulate Alpaca Paper Fill" in text
-    assert "Record Simulated Exit Readiness" in text
+    assert "Position Lifecycle Check" in text
+    assert "does not inherit the prior cycle's high-water mark" in text
+    assert "remains unmanaged until exit settings are explicitly saved" in text
 
 
 def test_readme_explains_product_and_backtest_contract_without_ui_story_copy():
@@ -172,8 +172,8 @@ def test_daily_loss_replaces_automatic_buy_count_cap():
 def test_buy_watchlist_readiness_distinguishes_worker_state_from_market_hours():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 
-    assert "The Streamlit page timer does not monitor queued setups." in text
-    assert "Only the background worker monitors the durable Buy watchlist." in text
+    assert "The Background Worker is the only process allowed to send automatic orders." in text
+    assert "only setups you explicitly save" in text
     assert 'allow_limit_buys_outside_market_hours\n    and paper_buy_order_style != "Market"' in text
 
 
@@ -230,3 +230,14 @@ def test_position_stop_labels_distinguish_planned_price_from_fill_adjusted_stop(
     assert "Projected fill-adjusted initial stop:" in text
     assert '"Stop loss at entry"' not in text
     assert '"Original stop"' not in text
+
+
+def test_position_exit_editor_reacts_before_save_and_owns_its_interval():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert 'with st.form(f"exit_settings_' not in text
+    assert '"Exit interval"' in text
+    assert 'key=f"exit_interval_{selected_position_symbol}"' in text
+    assert "This setting belongs only to this position and does not use the current sidebar interval." in text
+    assert "Choose Strategy exit + ATR protection under Exit method to enable this selector." in text
+    assert 'st.session_state["position_exit_save_notice"]' in text

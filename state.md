@@ -783,6 +783,38 @@ New queued buys remain governed by the deterministic account and order controls:
 
 Max daily loss is intentionally separate from the Kill Switch. It blocks new buys but does not turn on the Kill Switch, allowing automatic exits to continue protecting open positions. The Kill Switch remains a deliberate manual emergency control that blocks both entries and automatic exits. The sidebar helper now explains this distinction directly.
 
+## Unsaved Manual Position Exit Isolation (July 15, 2026)
+
+A manual CRWV buy placed directly in Alpaca exposed a UI/state separation defect. Its adopted broker-state record correctly contained no strategy settings and no exit settings, so the background worker did not submit a sell. The Open Positions screen nevertheless fell back to the current sidebar strategy and displayed an unsaved draft as if it were CRWV's active plan, including a false strategy-exit warning at $83.70.
+
+The position screen now evaluates and displays only persisted settings. A position with no saved plan explicitly shows `Saved exit plan: Not saved`, `Auto exit: Off`, and `Current action: Not managed`; it produces no automatic-exit price or sell-now warning. The editor still provides ATR-only draft values, but defaults Auto exit to off and clearly states that nothing becomes active until `Save Exit Settings For This Position` is submitted.
+
+Position-cycle lookup is also hardened. A newly adopted Alpaca position acts as a boundary, so settings from an older trade in the same ticker cannot leak into the new manual position. Saving a plan updates only the current position-cycle record instead of rewriting every historical buy record for that symbol. Worker regression coverage proves that full automation does not load bars or submit a sell for an adopted manual position without saved settings. The completed checkpoint passed 366 tests. No Streamlit server was started and no broker order was submitted during development or verification.
+
+## Exact Position-Cycle Lifecycle Architecture (July 15, 2026)
+
+NVDA exposed the deeper lifecycle defect behind several earlier symptoms. A new queued BUY filled 23 shares at $210.758696, but symbol-based lookup skipped that order's stale local status and selected a July 9 NVDA BUY at $202.48. The new position therefore inherited the prior trade's entry facts, high-water mark, and break-even state. Historical same-symbol orders were also being rewritten together in some UI paths. This was an ownership failure, not a display-only bug.
+
+Position ownership is now reconstructed from exact filled Alpaca BUY and SELL order IDs. A position cycle starts with the first BUY after net quantity reached zero. Add-on BUYs and partial SELLs remain in that cycle. A full SELL closes it permanently, and any later re-entry receives a new cycle ID. The reconstructed quantity must match Alpaca's live position quantity or automatic exit fails closed. The actual Alpaca average entry is always the current cost basis.
+
+Each managed position has one dedicated `position_plan` record keyed by its exact cycle ID. Entry settings can be inherited only from BUY orders in that same current cycle. A new cycle clears the prior high-water mark, break-even state, ATR trail, and saved trigger. A same-cycle add-on rebases average entry and the initial stop while retaining observed profit-protection state; its combined initial risk is capped by the saved account and risk limits. Partial SELLs retain the same plan and high-water mark. Additional fills on the same pending order rebase to the final fill and clear any pre-fill dynamic state.
+
+Manual positions created directly in Alpaca remain explicitly unmanaged until the user saves exit settings for that exact cycle. They cannot inherit the current sidebar draft or a prior same-symbol trade. The UI and worker use the same lifecycle resolver. The worker is the only unattended broker executor; Streamlit retains explicit manual send, exit, and cancel buttons but no second timed automation loop.
+
+Broker-state persistence now uses locked atomic writes. Both bulk replacement and single-record upsert protect a newer user-edited plan from an older worker snapshot. Broker refresh merges facts by exact order ID and preserves strategy metadata. Internal plan/observation records are excluded from broker order counts and lifecycle order history.
+
+Automatic-exit audit rows now include the position cycle ID, basis BUY order ID, all BUY IDs in the cycle, actual average entry, fill/start times, decision price, trigger price and source, current R, and highest R. Current-position reports use only the current cycle. Obsolete adoption, fake-fill, simulated-position, symbol-wide plan lookup, and duplicate UI exit-evaluation paths were removed.
+
+The exact NVDA regression now resolves the July 15 BUY, uses $210.758696 as entry, computes the saved $6.78 initial risk distance as a $203.978696 initial stop, starts the high-water mark at $210.758696, and contains none of the old cycle's $213.775 high or break-even state. Lifecycle, worker, runtime, persistence, reporting, and documentation tests were expanded accordingly.
+
+## Reactive Position Exit Editor (July 15, 2026)
+
+CRWV exposed a Streamlit form-state problem after the exact-cycle refactor. The exit editor was inside `st.form`, so changing `Exit method` did not rerun the page and `Exit strategy` remained disabled even after selecting `Strategy exit + ATR protection`. The editor also had no per-position interval control, and an old legacy `managed-exit-CRWV` record was correctly ignored without giving sufficiently visible confirmation that the new exact-cycle plan had been saved.
+
+The editor is now a reactive settings container. Changing `Exit method` immediately enables or disables the strategy and its inputs. Every position has an explicit `Exit interval` selector from 1-minute through daily bars. The saved interval belongs only to that position and governs its ATR, strategy sell line, RSI exit, break-even progress, and trailing stop; it is independent of the research interval currently shown in the sidebar.
+
+Creating a plan or changing its interval downloads a bounded history appropriate for that interval, calculates ATR from the latest valid completed bar, records the ATR value and measurement timestamp, and rebuilds the initial stop from the actual Alpaca average entry. Saving is wrapped in one visible error path and produces a persistent success message containing the method, interval, and exact position cycle ID. A manually opened position remains unmanaged until this exact-cycle save succeeds.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

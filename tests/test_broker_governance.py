@@ -4,7 +4,6 @@ from pathlib import Path
 
 from agentloop_trader.broker_governance import (
     BrokerStateStore,
-    adopt_alpaca_position,
     alpaca_order_lifecycle_records,
     alpaca_order_lifecycle_summary_records,
     alpaca_position_lifecycle_records,
@@ -21,9 +20,6 @@ from agentloop_trader.broker_governance import (
     preview_already_tracked,
     reconcile_alpaca_positions,
     refresh_tracked_alpaca_orders,
-    simulated_alpaca_fill_order,
-    simulated_exit_preview_readiness_records,
-    simulated_position_from_filled_order,
 )
 from agentloop_trader.brokers import AlpacaConfig, build_alpaca_order_preview
 from agentloop_trader.models import ExecutionDecision, RiskCheckResult
@@ -147,13 +143,18 @@ def test_cancelable_alpaca_order_records_require_open_status_and_full_order_id()
 
 def test_reconcile_alpaca_positions_marks_matched_and_unmatched_rows():
     positions = [{"Symbol": "AAPL", "Quantity": "10", "Market Value": "1000"}]
-    tracked = [{"symbol": "AAPL"}, {"symbol": "MSFT"}]
+    tracked = [{
+        "symbol": "AAPL",
+        "source": "position_plan",
+        "position_cycle_id": "buy-1",
+        "status": "managed_exit_settings",
+    }]
 
     rows = reconcile_alpaca_positions(positions, tracked)
 
-    assert rows[0]["Status"] == "matched"
-    assert rows[1]["Symbol"] == "MSFT"
-    assert rows[1]["Status"] == "tracked_order_without_position"
+    assert rows[0]["Status"] == "Managed current position"
+    assert rows[0]["Current Cycle"] == "buy-1"
+    assert rows[0]["Exit Plan Saved"]
 
 
 def test_refresh_tracked_alpaca_orders_updates_lifecycle_from_alpaca_orders():
@@ -231,25 +232,25 @@ def test_alpaca_position_lifecycle_matches_filled_order_to_position():
     ]
     tracked = [
         {
-            "broker_order_id": "abcdef123456",
+            "broker_order_id": "position-plan-abcdef123456",
             "symbol": "AAPL",
-            "side": "buy",
-            "quantity": "40",
-            "status": "filled",
-            "filled_quantity": "40",
-            "average_fill_price": "212.34",
+            "source": "position_plan",
+            "status": "managed_exit_settings",
+            "position_cycle_id": "abcdef123456",
+            "position_basis_order_id": "abcdef123456",
+            "exit_settings": {"auto_exit_enabled": True},
         }
     ]
 
     rows = alpaca_position_lifecycle_records(positions, tracked)
     summary = alpaca_position_lifecycle_summary_records(rows)
 
-    assert rows[0]["Tracking Status"] == "Matched to app order"
-    assert rows[0]["Exit Ready"]
-    assert rows[0]["Tracked Order Qty"] == "40"
+    assert rows[0]["Tracking Status"] == "Managed current position"
+    assert rows[0]["Auto Exit On"]
+    assert rows[0]["Current Cycle"] == "abcdef123456"
     metrics = {row["Metric"]: row["Value"] for row in summary}
-    assert metrics["Positions matched to app orders"] == 1
-    assert metrics["Exit orders ready to review"] == 1
+    assert metrics["Positions with saved exit plans"] == 1
+    assert metrics["Positions with auto exit on"] == 1
 
 
 def test_alpaca_position_lifecycle_marks_untracked_position():
@@ -258,66 +259,26 @@ def test_alpaca_position_lifecycle_marks_untracked_position():
         [],
     )
 
-    assert rows[0]["Tracking Status"] == "Needs app tracking"
-    assert rows[0]["Exit Ready"]
+    assert rows[0]["Tracking Status"] == "Unmanaged position"
+    assert not rows[0]["Auto Exit On"]
 
 
-def test_adopt_alpaca_position_creates_local_filled_tracking_record():
-    adopted = adopt_alpaca_position(
-        {"Symbol": "AAPL", "Quantity": "40", "Average Entry": "309.139"},
-        adopted_at=datetime(2026, 7, 6, 9, 45, tzinfo=UTC),
-    )
-
-    assert adopted["broker_order_id"].startswith("adopted-AAPL-")
-    assert adopted["symbol"] == "AAPL"
-    assert adopted["side"] == "buy"
-    assert adopted["status"] == "filled"
-    assert adopted["filled_quantity"] == "40"
-    assert adopted["average_fill_price"] == "309.139"
-    assert adopted["lifecycle_status"] == "adopted_alpaca_position"
-    assert adopted["source"] == "adopted_alpaca_position"
-    assert adopted["broker_writes_submitted"] == 0
-
-
-def test_adopted_alpaca_position_survives_order_refresh_and_matches_position():
-    adopted = adopt_alpaca_position(
-        {"Symbol": "AAPL", "Quantity": "40", "Average Entry": "309.139"},
-        adopted_at=datetime(2026, 7, 6, 9, 45, tzinfo=UTC),
-    )
-
-    refreshed = refresh_tracked_alpaca_orders([adopted], [])
-    lifecycle_rows = alpaca_position_lifecycle_records(
-        [{"Symbol": "AAPL", "Quantity": "40", "Market Value": "12535.6", "Average Entry": "309.139"}],
-        refreshed,
-    )
-    summary = alpaca_position_lifecycle_summary_records(lifecycle_rows)
-    summary_values = {row["Metric"]: row["Value"] for row in summary}
-
-    assert refreshed[0]["lifecycle_status"] == "adopted_alpaca_position"
-    assert lifecycle_rows[0]["Tracking Status"] == "Tracked manually"
-    assert lifecycle_rows[0]["Matched Saved Orders"] == 1
-    assert lifecycle_rows[0]["Exit Ready"]
-    assert summary_values["Positions manually added to app"] == 1
-    assert summary_values["Positions needing app tracking"] == 0
-
-
-def test_alpaca_position_lifecycle_marks_filled_order_without_position():
+def test_old_filled_order_does_not_make_a_new_position_look_managed():
     rows = alpaca_position_lifecycle_records(
-        [],
-        [
-            {
-                "symbol": "AAPL",
-                "side": "buy",
-                "quantity": "40",
-                "status": "filled",
-                "filled_quantity": "40",
-                "average_fill_price": "212.34",
-            }
-        ],
+        [{"Symbol": "NVDA", "Quantity": "23", "Market Value": "4850", "Average Entry": "210.75"}],
+        [{
+            "broker_order_id": "old-buy",
+            "symbol": "NVDA",
+            "side": "buy",
+            "status": "filled",
+            "filled_quantity": "24",
+            "average_fill_price": "202.48",
+        }],
     )
 
-    assert rows[0]["Tracking Status"] == "No open Alpaca position"
-    assert not rows[0]["Exit Ready"]
+    assert rows[0]["Tracking Status"] == "Unmanaged position"
+    assert not rows[0]["Exit Plan Saved"]
+    assert not rows[0]["Auto Exit On"]
 
 
 def test_broker_state_health_flags_stale_refreshes():
@@ -383,6 +344,83 @@ def test_broker_state_store_preserves_exit_settings_during_refresh():
 
     assert record["status"] == "filled"
     assert record["exit_settings"] == {"interval": "1h"}
+
+
+def test_broker_state_store_rejects_stale_position_plan_overwrite():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BrokerStateStore(f"{tmp_dir}/broker_state.json")
+        store.upsert({
+            "broker_order_id": "position-plan-buy-1",
+            "source": "position_plan",
+            "exit_settings": {
+                "interval": "4h",
+                "plan_user_updated_at": "2026-07-15T12:01:00-07:00",
+            },
+        })
+        store.replace_all([{
+            "broker_order_id": "position-plan-buy-1",
+            "source": "position_plan",
+            "exit_settings": {
+                "interval": "1h",
+                "plan_user_updated_at": "2026-07-15T12:00:00-07:00",
+                "highest_high_since_entry": 220.0,
+            },
+        }])
+
+        record = store.read()[0]
+
+    assert record["exit_settings"]["interval"] == "4h"
+    assert "highest_high_since_entry" not in record["exit_settings"]
+
+
+def test_broker_state_store_upsert_rejects_stale_position_plan_overwrite():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BrokerStateStore(f"{tmp_dir}/broker_state.json")
+        store.upsert({
+            "broker_order_id": "position-plan-buy-1",
+            "source": "position_plan",
+            "exit_settings": {
+                "interval": "4h",
+                "plan_user_updated_at": "2026-07-15T12:01:00-07:00",
+            },
+        })
+        store.upsert({
+            "broker_order_id": "position-plan-buy-1",
+            "source": "position_plan",
+            "exit_settings": {
+                "interval": "1h",
+                "plan_user_updated_at": "2026-07-15T12:00:00-07:00",
+            },
+        })
+
+        record = store.read()[0]
+
+    assert record["exit_settings"]["interval"] == "4h"
+
+
+def test_broker_state_store_accepts_worker_state_for_current_user_plan_revision():
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        store = BrokerStateStore(f"{tmp_dir}/broker_state.json")
+        user_updated_at = "2026-07-15T12:01:00-07:00"
+        store.upsert({
+            "broker_order_id": "position-plan-buy-1",
+            "source": "position_plan",
+            "exit_settings": {"interval": "4h", "plan_user_updated_at": user_updated_at},
+        })
+        store.replace_all([{
+            "broker_order_id": "position-plan-buy-1",
+            "source": "position_plan",
+            "exit_settings": {
+                "interval": "4h",
+                "plan_user_updated_at": user_updated_at,
+                "highest_high_since_entry": 220.0,
+            },
+        }])
+
+        record = store.read()[0]
+
+    assert record["exit_settings"]["interval"] == "4h"
+    assert record["exit_settings"]["highest_high_since_entry"] == 220.0
 
 
 def test_broker_state_store_waits_for_short_lived_writer_lock(monkeypatch, tmp_path):
@@ -469,34 +507,3 @@ def test_market_session_advisory_exposes_regular_open_flag():
 
     assert advisory["Market Session"] == "open"
     assert advisory["Open"] is True
-
-
-def test_simulated_alpaca_fill_order_marks_local_lifecycle_without_broker_write():
-    tracked = {
-        "broker_order_id": "order-1",
-        "symbol": "AAPL",
-        "side": "buy",
-        "quantity": "40",
-        "status": "accepted",
-    }
-
-    filled = simulated_alpaca_fill_order(tracked, fill_price=200)
-    position = simulated_position_from_filled_order(filled)
-
-    assert filled["status"] == "filled"
-    assert filled["lifecycle_status"] == "filled_at_alpaca"
-    assert filled["simulated"]
-    assert position["Symbol"] == "AAPL"
-    assert position["Market Value"] == 8000
-
-
-def test_simulated_exit_preview_readiness_is_local_only():
-    rows = simulated_exit_preview_readiness_records(
-        {"broker_order_id": "order-1", "symbol": "AAPL", "quantity": "10"},
-        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
-    )
-    checks = {row["Check"]: row for row in rows}
-
-    assert checks["Filled order selected"]["Passed"]
-    assert checks["Position can be exited"]["Passed"]
-    assert checks["Orders sent"]["Detail"] == "0"

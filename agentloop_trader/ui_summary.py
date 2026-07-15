@@ -467,7 +467,7 @@ def position_exit_plan_records(
     strategy_type = str(settings.get("strategy_type", ""))
     rows = [
         {"Field": "Exit Method", "Value": "ATR protection only" if exit_mode == "atr_only" else "Strategy exit + ATR protection"},
-        {"Field": "Auto Exit", "Value": "On" if settings.get("auto_exit_enabled", True) else "Off"},
+        {"Field": "Auto Exit", "Value": "On" if settings.get("auto_exit_enabled", False) else "Off"},
         {
             "Field": "Auto Exit Trigger Price",
             "Value": _money(exit_trigger_price) if exit_trigger_price else "Not available",
@@ -622,6 +622,11 @@ def saved_records_overview_records(
     audit_records = audit_records or []
     tracked_orders = tracked_orders or []
     automation_snapshots = automation_snapshots or []
+    broker_orders = [
+        order for order in tracked_orders
+        if str(order.get("source") or "").strip().lower()
+        not in {"position_plan", "position_observation"}
+    ]
     event_types = [str(record.get("event_type", "")) for record in audit_records]
     return [
         {
@@ -631,7 +636,7 @@ def saved_records_overview_records(
         },
         {
             "Record Set": "Alpaca paper orders",
-            "Count": len(tracked_orders),
+            "Count": len(broker_orders),
             "Why It Matters": "Local record of paper orders submitted, canceled, filled, or reconciled.",
         },
         {
@@ -641,12 +646,12 @@ def saved_records_overview_records(
         },
         {
             "Record Set": "Paper buys sent",
-            "Count": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted"),
+            "Count": event_types.count("alpaca_paper_order_submitted") + event_types.count("auto_paper_entry_submitted") + event_types.count("worker_paper_buy_sent"),
             "Why It Matters": "Confirms how many paper buys reached Alpaca.",
         },
         {
             "Record Set": "Paper exits sent",
-            "Count": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted"),
+            "Count": event_types.count("alpaca_paper_exit_submitted") + event_types.count("auto_paper_exit_submitted") + event_types.count("worker_paper_exit_sent"),
             "Why It Matters": "Confirms how many paper exits reached Alpaca.",
         },
     ]

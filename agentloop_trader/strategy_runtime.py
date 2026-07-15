@@ -15,7 +15,7 @@ from agentloop_trader.backtest import (
     simulate_turtle_strategy,
 )
 from agentloop_trader.fees import fee_adjusted_break_even_price
-from agentloop_trader.indicators import calc_rsi
+from agentloop_trader.indicators import calc_atr, calc_rsi
 from agentloop_trader.models import RiskLimits, TradeIntent
 from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
@@ -27,6 +27,42 @@ STRATEGY_TYPES = {
     "Trendline retest continuation": "trendline_retest",
     "RSI mean-reversion scalp": "rsi_scalp",
 }
+
+EXIT_PLAN_HISTORY_BY_INTERVAL = {
+    "1m": "7d",
+    "5m": "1mo",
+    "15m": "3mo",
+    "30m": "3mo",
+    "1h": "1y",
+    "4h": "2y",
+    "1d": "5y",
+}
+
+
+def exit_plan_history_for_interval(interval: str) -> str:
+    """Return enough history to calculate position exits without excessive downloads."""
+    return EXIT_PLAN_HISTORY_BY_INTERVAL.get(str(interval), "1y")
+
+
+def latest_atr_snapshot(market_data: pd.DataFrame, length: int = 14) -> tuple[float, str]:
+    """Return the latest valid ATR and the completed bar that produced it."""
+    required = {"Close", "High", "Low"}
+    missing = required.difference(market_data.columns)
+    if missing:
+        raise ValueError(f"Price data is missing: {', '.join(sorted(missing))}.")
+    values = calc_atr(
+        market_data["Close"].to_numpy(),
+        length,
+        highs=market_data["High"].to_numpy(),
+        lows=market_data["Low"].to_numpy(),
+    )
+    for index in range(len(values) - 1, -1, -1):
+        value = values[index]
+        if value is not None and pd.notna(value) and float(value) > 0:
+            timestamp = market_data.index[index]
+            measured_at = timestamp.isoformat() if hasattr(timestamp, "isoformat") else str(timestamp)
+            return float(value), measured_at
+    raise ValueError(f"Not enough completed bars were available to calculate {length}-bar ATR.")
 
 
 def exit_mode_for_settings(settings: dict[str, Any] | None) -> str:
@@ -171,57 +207,6 @@ def reprice_trade_intent(intent: TradeIntent | None, current_price: float | None
     return replace(intent, entry_price=round(float(current_price), 2), stop_loss=stop_loss)
 
 
-def saved_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict]) -> dict[str, Any] | None:
-    clean = str(symbol).strip().upper()
-    matches = [
-        row for row in tracked_orders
-        if str(row.get("symbol", "")).strip().upper() == clean
-        and str(row.get("side", "")).strip().lower() == "buy"
-        and (row.get("exit_settings") or row.get("strategy_settings"))
-    ]
-    if not matches:
-        return None
-    def priority(row: dict[str, Any]) -> int:
-        status = str(row.get("status", row.get("Status", ""))).strip().lower().rsplit(".", 1)[-1]
-        source = str(row.get("source", "")).strip().lower()
-        if source == "position_exit_settings" or status == "managed_exit_settings":
-            return 3
-        if status in {"filled", "partially_filled"}:
-            return 2
-        if source == "adopted_alpaca_position":
-            return 1
-        return 0
-
-    latest = max(enumerate(matches), key=lambda item: (priority(item[1]), item[0]))[1]
-    settings = dict(latest.get("exit_settings") or latest.get("strategy_settings") or {})
-    settings.setdefault("entry_submitted_at", latest.get("submitted_at", ""))
-    settings.setdefault("entry_filled_at", latest.get("filled_at", ""))
-    settings.setdefault("entry_broker_order_id", latest.get("broker_order_id", ""))
-    return settings
-
-
-def update_exit_settings_for_symbol(symbol: str, tracked_orders: list[dict], exit_settings: dict[str, Any]) -> list[dict]:
-    clean = str(symbol).strip().upper()
-    updated: list[dict] = []
-    matched = False
-    for row in tracked_orders:
-        record = dict(row)
-        if str(record.get("symbol", "")).strip().upper() == clean and str(record.get("side", "")).lower() == "buy":
-            record["exit_settings"] = dict(exit_settings)
-            matched = True
-        updated.append(record)
-    if not matched:
-        updated.append({
-            "broker_order_id": f"managed-exit-{clean}",
-            "symbol": clean,
-            "side": "buy",
-            "status": "managed_exit_settings",
-            "source": "position_exit_settings",
-            "exit_settings": dict(exit_settings),
-        })
-    return updated
-
-
 def _parse_time(value: Any) -> pd.Timestamp | None:
     try:
         timestamp = pd.Timestamp(value)
@@ -266,7 +251,7 @@ def evaluate_exit_settings(
 ) -> dict[str, Any]:
     if not settings:
         return {"ready": False, "reason": "No saved exit settings; automatic exit is paused.", "trigger_price": None}
-    if not bool(settings.get("auto_exit_enabled", True)):
+    if not bool(settings.get("auto_exit_enabled", False)):
         return {"ready": False, "reason": "Automatic exit is off for this position.", "trigger_price": None}
     symbol = str(position.get("Symbol") or settings.get("symbol") or "").strip().upper()
     try:
