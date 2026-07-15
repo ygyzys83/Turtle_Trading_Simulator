@@ -69,6 +69,7 @@ from agentloop_trader.buy_watchlist import (
     BuyWatchlistStore,
     buy_watch_plan_id,
     buy_watch_plan_detail_records,
+    buy_watch_plan_sidebar_inputs,
     buy_watchlist_records,
 )
 from agentloop_trader.display import dataframe_for_streamlit
@@ -1820,6 +1821,26 @@ sidebar_control_store = AutomationControlStore()
 saved_sidebar_control = sidebar_control_store.read()
 sidebar_worker_status_store = WorkerStatusStore()
 sidebar_worker_status = reconcile_worker_process_state(sidebar_worker_status_store)
+
+queued_setup_to_load = st.session_state.pop("queued_setup_to_load_in_sidebar", None)
+if queued_setup_to_load:
+    queued_setup_plan = next(
+        (
+            plan
+            for plan in BuyWatchlistStore().read()
+            if plan.plan_id == queued_setup_to_load
+        ),
+        None,
+    )
+    if queued_setup_plan is not None:
+        for widget_key, saved_value in buy_watch_plan_sidebar_inputs(queued_setup_plan).items():
+            st.session_state[widget_key] = saved_value
+        st.session_state["command_center_page_input"] = "New Trade"
+        st.session_state["loaded_queued_setup_notice"] = (
+            f"Loaded {queued_setup_plan.symbol} | {queued_setup_plan.interval} | "
+            f"{queued_setup_plan.strategy_label} from the Buy watchlist."
+        )
+
 sidebar_worker_active = worker_status_is_active(sidebar_worker_status)
 sidebar_worker_code_current = worker_status_uses_current_code(sidebar_worker_status)
 sidebar_worker_present = bool(
@@ -2003,6 +2024,7 @@ automation_refresh_seconds = st.sidebar.selectbox(
     "Check automation every",
     [5, 15, 30, 60],
     index=1,
+    key="automation_refresh_seconds_input",
     format_func=lambda seconds: f"{seconds} seconds",
     help="How often the open app checks saved exits and old limit orders. Queued buys are checked separately by the Background Worker.",
 )
@@ -2011,6 +2033,7 @@ paper_buy_order_style = st.sidebar.selectbox(
     "Paper buy price",
     ["Limit below current price", "Limit at current price", "Limit above current price", "Custom limit price", "Market"],
     index=1,
+    key="paper_buy_order_style_input",
     help=(
         "Limit below current price waits for a pullback. Limit at current price uses the current reference price. "
         "Limit above current price adds a small cushion. Custom limit price lets you type the exact max buy price. "
@@ -2020,12 +2043,14 @@ paper_buy_order_style = st.sidebar.selectbox(
 auto_cancel_stale_limit_orders = st.sidebar.checkbox(
     "Auto-cancel old limit buys",
     value=False,
+    key="auto_cancel_stale_limit_orders_input",
     help="When this is on, the app cancels unfilled paper BUY limit orders after the waiting time you choose below.",
 )
 stale_limit_order_label = st.sidebar.selectbox(
     "Cancel unfilled limit buy after",
     list(STALE_LIMIT_ORDER_OPTIONS.keys()),
     index=4,
+    key="stale_limit_order_label_input",
     disabled=not auto_cancel_stale_limit_orders,
     help="Default is 1 hour. Shorter times keep stale limit orders from lingering; longer times give the order more time to fill.",
 )
@@ -2033,6 +2058,7 @@ stale_limit_order_minutes = STALE_LIMIT_ORDER_OPTIONS[stale_limit_order_label]
 allow_limit_buys_outside_market_hours = st.sidebar.checkbox(
     "Allow limit buys outside market hours",
     value=False,
+    key="allow_limit_buys_outside_market_hours_input",
     disabled=paper_buy_order_style == "Market",
     help=(
         "Allows automatic paper BUY limit orders while the regular market is closed. "
@@ -2043,6 +2069,7 @@ with st.sidebar.expander("Advanced safety", expanded=False):
     allowed_symbols_text = st.text_input(
         "Allowed symbols",
         value="",
+        key="allowed_symbols_input",
         help=(
             "Optional whitelist for paper orders. Leave blank to allow the ticker you typed and every queued setup. "
             "Use commas to restrict both manual and queued paper orders to specific tickers, such as AAPL, MSFT, NVDA."
@@ -2051,6 +2078,7 @@ with st.sidebar.expander("Advanced safety", expanded=False):
     allow_add_to_existing_position = st.checkbox(
         "Allow adding to an existing paper position",
         value=False,
+        key="allow_add_to_existing_position_input",
         help=(
             "When this is on, a new BUY can add shares to an Alpaca paper position you already hold. "
             "Risk limits, cash, concentration, and open-order checks still apply."
@@ -2062,12 +2090,14 @@ with st.sidebar.expander("Advanced safety", expanded=False):
         max_value=20,
         value=3,
         step=1,
+        key="max_auto_buys_per_session_input",
         help="Caps BUY orders sent from the Buy watchlist during one worker session.",
     )
     reentry_cooldown_minutes = st.selectbox(
         "Wait after an exit before re-buying",
         [0, 15, 30, 60, 120, 240],
         index=3,
+        key="reentry_cooldown_minutes_input",
         format_func=lambda minutes: "No wait" if minutes == 0 else f"{minutes} minutes",
         help="Prevents the app from automatically re-buying the same ticker right after an app-recorded paper exit.",
     )
@@ -2082,6 +2112,7 @@ if paper_buy_order_style == "Limit below current price":
         value=0.25,
         step=0.01,
         format="%.2f",
+        key="paper_buy_limit_adjustment_pct_input",
         help="Subtracts this percent from the current reference price. Example: 0.50% on $100 sets a $99.50 buy limit.",
     )
 elif paper_buy_order_style == "Limit above current price":
@@ -2092,6 +2123,7 @@ elif paper_buy_order_style == "Limit above current price":
         value=0.10,
         step=0.01,
         format="%.2f",
+        key="paper_buy_limit_adjustment_pct_input",
         help="Adds this percent above the current reference price. Example: 0.10% on $100 sets a $100.10 buy limit.",
     )
 elif paper_buy_order_style == "Custom limit price":
@@ -2101,6 +2133,7 @@ elif paper_buy_order_style == "Custom limit price":
         value=0.00,
         step=0.01,
         format="%.2f",
+        key="paper_buy_custom_limit_price_input",
         help="The order will not buy above this exact price. Leave at 0.00 to block sending until you type a price.",
 )
 reset_paper_broker = False
@@ -2110,6 +2143,7 @@ asset_type = st.sidebar.radio(
     "Asset type",
     ["Stocks", "Crypto"],
     horizontal=True,
+    key="asset_type_input",
     help="Stocks use whole-share sizing and stock market hours. Crypto uses Alpaca pairs such as BTC/USD, fractional sizing, and trades 24/7.",
 )
 asset_class = "crypto" if asset_type == "Crypto" else "equity"
@@ -2121,6 +2155,7 @@ else:
         "Prices to use",
         ["Synthetic", "Ticker (Alpaca)", "Ticker (yfinance)"],
         horizontal=True,
+        key="price_data_source_input",
     )
 market_data = None
 source_caption = "synthetic price data"
@@ -2135,6 +2170,7 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
         st.sidebar.text_input(
             "Ticker or pair",
             value="",
+            key="ticker_or_pair_input",
             placeholder="BTC/USD" if asset_class == "crypto" else "Enter ticker",
         ),
         asset_class,
@@ -2253,6 +2289,7 @@ account = st.sidebar.number_input(
     max_value=10_000_000,
     value=100000,
     step=1000,
+    key="simulator_account_size_input",
     help="Used by the local simulator and strategy sizing. Alpaca account balance is read separately from Alpaca.",
 )
 strategy_options = {
@@ -2530,6 +2567,7 @@ max_risk_limit = st.sidebar.slider(
     5.0,
     0.5,
     step=0.25,
+    key="max_risk_limit_input",
     help="Hard cap on dollars at risk for one trade. If the stop loss would risk more than this, the app reduces size or blocks the trade.",
 )
 max_notional_limit = st.sidebar.slider(
@@ -2538,6 +2576,7 @@ max_notional_limit = st.sidebar.slider(
     100.0,
     5.0,
     step=5.0,
+    key="max_notional_limit_input",
     help="Hard cap on each new buy order as a percent of account value. Total exposure to one ticker is controlled separately by Max symbol concentration.",
 )
 max_portfolio_exposure = st.sidebar.slider(
@@ -2546,6 +2585,7 @@ max_portfolio_exposure = st.sidebar.slider(
     100.0,
     80.0,
     step=5.0,
+    key="max_portfolio_exposure_input",
     help="Hard cap on total open exposure across all tracked positions and orders. This keeps the app from putting too much of the account to work at once.",
 )
 max_symbol_concentration = st.sidebar.slider(
@@ -2554,6 +2594,7 @@ max_symbol_concentration = st.sidebar.slider(
     100.0,
     5.0,
     step=5.0,
+    key="max_symbol_concentration_input",
     help="Hard cap on exposure to one ticker. This prevents one symbol from becoming too large relative to the account.",
 )
 max_session_loss = st.sidebar.slider(
@@ -2562,6 +2603,7 @@ max_session_loss = st.sidebar.slider(
     10.0,
     2.0,
     step=0.5,
+    key="max_session_loss_input",
     help="Hard cap on today's account loss. For Alpaca this compares current equity with Alpaca's prior-day equity; new buys are blocked after the limit is reached.",
 )
 max_open_positions = st.sidebar.slider(
@@ -2570,6 +2612,7 @@ max_open_positions = st.sidebar.slider(
     20,
     20,
     step=1,
+    key="max_open_positions_input",
     help="Maximum number of positions the app can have open or tracked at the same time.",
 )
 st.sidebar.markdown("### :material/query_stats: Research options")
@@ -3841,7 +3884,12 @@ with st.container(key="top_navigation"):
         ["Positions & Queue", "Ideas", "New Trade", "Alpaca", "Paper Review"],
         horizontal=True,
         label_visibility="collapsed",
+        key="command_center_page_input",
     )
+
+loaded_queued_setup_notice = st.session_state.pop("loaded_queued_setup_notice", "")
+if loaded_queued_setup_notice and command_center_view == "New Trade":
+    st.success(loaded_queued_setup_notice)
 
 status_rows = compact_status_records(
     mode_label=mode_label,
@@ -4393,6 +4441,18 @@ def persist_repeat_after_exit_change(plan_id: str, widget_key: str) -> None:
     buy_watchlist_store.update(selected_plan.plan_id, **repeat_changes)
 
 
+def remove_buy_watch_plan(plan_id: str) -> None:
+    """Remove only the setup attached to the button that was clicked."""
+    buy_watchlist_store.remove(plan_id)
+    st.session_state.pop("selected_buy_watch_plan", None)
+    st.session_state.pop(f"manage_repeat_after_exit_{plan_id}", None)
+
+
+def load_buy_watch_plan_in_new_trade(plan_id: str) -> None:
+    """Stage one durable queue record for sidebar loading on the next rerun."""
+    st.session_state["queued_setup_to_load_in_sidebar"] = plan_id
+
+
 @st.fragment(run_every=f"{automation_refresh_seconds}s" if background_worker_enabled else None)
 def render_buy_watchlist_manager() -> None:
     st.markdown(
@@ -4449,6 +4509,19 @@ def render_buy_watchlist_manager() -> None:
                 width="stretch",
                 hide_index=True,
             )
+            load_setup_requested = st.button(
+                "Load This Setup in New Trade",
+                key=f"load_buy_watch_plan_{selected_watch_plan.plan_id}",
+                on_click=load_buy_watch_plan_in_new_trade,
+                args=(selected_watch_plan.plan_id,),
+                help=(
+                    "Loads this setup's ticker, price source, interval, history, strategy inputs, risk limits, "
+                    "and paper-order settings into the sidebar, then opens New Trade so you can reproduce its backtest. "
+                    "It does not start automation or send an order."
+                ),
+            )
+            if load_setup_requested:
+                st.rerun(scope="app")
         manage_cols = st.columns(2)
         toggle_label = "Pause Selected Setup" if selected_watch_plan.enabled else "Resume Selected Setup"
         if manage_cols[0].button(toggle_label, key="toggle_selected_buy_watch_plan"):
@@ -4463,9 +4536,12 @@ def render_buy_watchlist_manager() -> None:
                 ),
             )
             st.rerun()
-        if manage_cols[1].button("Remove Selected Setup", key="remove_selected_buy_watch_plan"):
-            buy_watchlist_store.remove(selected_watch_plan.plan_id)
-            st.rerun()
+        manage_cols[1].button(
+            "Remove Selected Setup",
+            key=f"remove_selected_buy_watch_plan_{selected_watch_plan.plan_id}",
+            on_click=remove_buy_watch_plan,
+            args=(selected_watch_plan.plan_id,),
+        )
     else:
         st.caption("No queued setups. Research a ticker in New Trade, then click Add or Update Buy Setup.")
     st.markdown("#### Queue automation status")

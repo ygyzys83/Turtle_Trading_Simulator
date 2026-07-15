@@ -140,6 +140,81 @@ def buy_watchlist_records(plans: list[BuyWatchPlan]) -> list[dict[str, Any]]:
     ]
 
 
+def buy_watch_plan_sidebar_inputs(plan: BuyWatchPlan) -> dict[str, Any]:
+    """Map one durable queued setup to the matching editable sidebar widgets."""
+    settings = dict(plan.strategy_settings or {})
+    limits = dict(plan.risk_limits or {})
+    stop_mode_labels = {
+        "standard_atr": "Standard ATR stop",
+        "emergency_atr": "Emergency ATR stop",
+        "no_price_stop": "No price stop - backtest only",
+    }
+    stale_minutes = int(settings.get("stale_limit_order_minutes", 60))
+    stale_labels = {
+        5: "5 minutes",
+        10: "10 minutes",
+        15: "15 minutes",
+        30: "30 minutes",
+        60: "1 hour",
+        120: "2 hours",
+        240: "4 hours",
+        480: "8 hours",
+    }
+    asset_type = "Crypto" if plan.asset_class == "crypto" else "Stocks"
+    values = {
+        "asset_type_input": asset_type,
+        "ticker_or_pair_input": plan.symbol,
+        "price_interval_input": plan.interval,
+        "history_period_input": plan.history,
+        "simulator_account_size_input": int(settings.get("account_size", 100_000)),
+        "strategy_label_input": settings.get("strategy_label", plan.strategy_label),
+        "entry_window_input": int(settings.get("entry_window", 20)),
+        "exit_window_input": int(settings.get("exit_window", 10)),
+        "atr_stop_multiplier_input": float(settings.get("atr_stop_multiplier", 1.5)),
+        "risk_pct_input": float(settings.get("risk_per_trade_pct", 0.5)),
+        "moving_average_window_input": int(settings.get("moving_average_window", 50)),
+        "pullback_average_length_input": int(settings.get("pullback_average_length", 20)),
+        "momentum_turn_length_input": int(settings.get("momentum_turn_length", 10)),
+        "rsi_entry_filter_input": bool(settings.get("rsi_entry_filter_enabled", False)),
+        "rsi_length_input": int(settings.get("rsi_length", 14)),
+        "rsi_oversold_input": float(settings.get("rsi_oversold", 30.0)),
+        "rsi_overbought_input": float(settings.get("rsi_overbought", 70.0)),
+        "rsi_decline_points_input": float(settings.get("rsi_decline_points", 40.0)),
+        "rsi_rebound_points_input": float(settings.get("rsi_rebound_points", 3.0)),
+        "rsi_sell_recovery_points_input": float(settings.get("rsi_sell_recovery_points", 35.0)),
+        "rsi_swing_lookback_input": int(settings.get("rsi_swing_lookback", 24)),
+        "rsi_stop_mode_input": stop_mode_labels.get(
+            str(settings.get("rsi_stop_mode", "standard_atr")), "Standard ATR stop"
+        ),
+        "rsi_emergency_atr_multiplier_input": float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
+        "rsi_max_holding_enabled_input": bool(settings.get("rsi_max_holding_enabled", True)),
+        "rsi_max_holding_bars_input": int(settings.get("rsi_max_holding_bars", 100)),
+        "rsi_profit_only_exit_input": bool(settings.get("rsi_profit_only_exit", False)),
+        "automation_refresh_seconds_input": int(settings.get("automation_refresh_seconds", 15)),
+        "paper_buy_order_style_input": plan.order_style,
+        "auto_cancel_stale_limit_orders_input": bool(settings.get("auto_cancel_stale_limit_orders", False)),
+        "stale_limit_order_label_input": stale_labels.get(stale_minutes, "1 hour"),
+        "allow_limit_buys_outside_market_hours_input": bool(
+            settings.get("allow_limit_buys_outside_market_hours", False)
+        ),
+        "allowed_symbols_input": ", ".join(limits.get("allowed_symbols") or ()),
+        "allow_add_to_existing_position_input": bool(limits.get("allow_add_to_existing_position", False)),
+        "max_auto_buys_per_session_input": int(settings.get("max_auto_buys_per_session", 3)),
+        "reentry_cooldown_minutes_input": int(settings.get("reentry_cooldown_minutes", 60)),
+        "paper_buy_limit_adjustment_pct_input": float(plan.limit_adjustment_pct),
+        "paper_buy_custom_limit_price_input": float(plan.custom_limit_price),
+        "max_risk_limit_input": float(limits.get("max_risk_per_trade_pct", 0.5)),
+        "max_notional_limit_input": float(limits.get("max_position_notional_pct", 5.0)),
+        "max_portfolio_exposure_input": float(limits.get("max_portfolio_exposure_pct", 80.0)),
+        "max_symbol_concentration_input": float(limits.get("max_symbol_concentration_pct", 5.0)),
+        "max_session_loss_input": float(limits.get("max_session_loss_pct", 2.0)),
+        "max_open_positions_input": int(limits.get("max_open_positions", 20)),
+    }
+    if plan.asset_class != "crypto":
+        values["price_data_source_input"] = plan.price_data_source
+    return values
+
+
 def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
     """Return every saved input that can affect a queued BUY or its initial exit plan."""
     settings = dict(plan.strategy_settings or {})
