@@ -38,6 +38,8 @@ class BuyWatchPlan:
     updated_at: str = ""
     last_checked_at: str = ""
     order_sent_at: str = ""
+    active_order_id: str = ""
+    cycle_had_filled_position: bool = False
     latest_price: float | None = None
     next_buy_level: float | None = None
     distance_to_buy_pct: float | None = None

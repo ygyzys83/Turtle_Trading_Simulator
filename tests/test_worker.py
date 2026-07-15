@@ -324,6 +324,152 @@ def test_repeating_setup_waits_for_prior_buy_signal_to_clear(monkeypatch, tmp_pa
     assert store.read()[0].enabled is True
 
 
+def test_repeating_setup_retries_an_unfilled_canceled_order_without_signal_reset(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("HOOD", "4h", "Trend pullback continuation"),
+        symbol="HOOD",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+        strategy_settings={"reentry_cooldown_minutes": 0},
+        repeat_after_exit=True,
+        cycle_state="order_pending",
+        active_order_id="queued-order-1",
+    )
+    store.upsert(plan)
+    canceled_order = {
+        "Alpaca Order ID": "queued-order-1",
+        "Symbol": "HOOD",
+        "Side": "buy",
+        "Status": "canceled",
+        "Filled Qty": 0,
+    }
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (
+            1,
+            [*args[4], {"broker_order_id": "queued-order-2"}],
+            "Sent paper buy for 5 HOOD.",
+        ),
+    )
+    control = AutomationControl(mode="Auto entries and exits", full_automation_enabled=True)
+    adapter = SimpleNamespace(position_records=lambda **kwargs: [], order_records=lambda **kwargs: [])
+    common = (
+        control,
+        adapter,
+        [],
+        [],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+    )
+
+    _send_watchlist_entries(
+        control, adapter, [], [canceled_order], [], lambda *_: None,
+        SimpleNamespace(append=lambda event: None), store,
+        latest_prices={"HOOD": 115.0}, max_to_send=1,
+    )
+    assert store.read()[0].cycle_state == "waiting_for_retry"
+
+    _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0}, max_to_send=1)
+    assert store.read()[0].cycle_state == "waiting_for_buy"
+
+    sent, _, _ = _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0}, max_to_send=1)
+    updated = store.read()[0]
+    assert sent == 1
+    assert updated.cycle_state == "order_pending"
+    assert updated.active_order_id == "queued-order-2"
+
+
+def test_manual_buy_order_does_not_become_the_queued_setups_cycle(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("HOOD", "4h", "Trend pullback continuation"),
+        symbol="HOOD",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+        repeat_after_exit=True,
+    )
+    store.upsert(plan)
+    manual_order = {
+        "Alpaca Order ID": "manual-order-1",
+        "Symbol": "HOOD",
+        "Side": "buy",
+        "Status": "accepted",
+        "Filled Qty": 0,
+    }
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (0, args[4], "No BUY setup right now."),
+    )
+    common = (
+        AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
+        SimpleNamespace(),
+        [],
+        [],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+    )
+
+    _send_watchlist_entries(
+        common[0], common[1], [], [manual_order], [], common[5], common[6], store,
+        latest_prices={"HOOD": 115.0}, max_to_send=1,
+    )
+    blocked = store.read()[0]
+    assert blocked.cycle_state == "blocked_by_order"
+    assert blocked.active_order_id == ""
+
+    _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0}, max_to_send=1)
+    resumed = store.read()[0]
+    assert resumed.cycle_state == "waiting_for_buy"
+    assert resumed.cycle_had_filled_position is False
+
+
+def test_legacy_canceled_order_is_migrated_out_of_signal_reset(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    sent_at = "2026-07-14T13:13:11-07:00"
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("HOOD", "4h", "Trend pullback continuation"),
+        symbol="HOOD",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+        repeat_after_exit=True,
+        cycle_state="waiting_for_signal_reset",
+        order_sent_at=sent_at,
+        last_cycle_completed_at="2026-07-15T00:03:03-07:00",
+    )
+    store.replace_all([plan])
+    tracked = [{
+        "broker_order_id": "legacy-queued-order",
+        "symbol": "HOOD",
+        "side": "buy",
+        "status": "canceled",
+        "filled_quantity": 0,
+        "submitted_at": "2026-07-14T20:13:12+00:00",
+    }]
+
+    _send_watchlist_entries(
+        AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
+        SimpleNamespace(), [], [], tracked, lambda *_: None,
+        SimpleNamespace(append=lambda event: None), store,
+        latest_prices={"HOOD": 115.0}, max_to_send=1,
+    )
+
+    updated = store.read()[0]
+    assert updated.cycle_state == "waiting_for_retry"
+    assert updated.status == "Waiting to retry"
+    assert updated.cycle_had_filled_position is False
+
+
 def test_worker_reuses_recent_price_history_for_queued_setups(monkeypatch):
     calls = []
     data = SimpleNamespace(copy=lambda: "copied-bars")

@@ -9,6 +9,10 @@ from agentloop_trader.parameter_loop import (
     BOUNDED_ENTRY_WINDOWS,
     BOUNDED_EXIT_WINDOWS,
     BOUNDED_MA_WINDOWS,
+    OPTIMIZER_ATR_MULTIPLIERS,
+    OPTIMIZER_ENTRY_WINDOWS,
+    OPTIMIZER_EXIT_WINDOWS,
+    OPTIMIZER_TREND_WINDOWS,
     CandidateDiagnostics,
     buy_and_hold_benchmark,
     candidate_verdict,
@@ -16,7 +20,10 @@ from agentloop_trader.parameter_loop import (
     candidate_records,
     evaluate_parameter_candidates,
     generate_bounded_candidates,
+    generate_local_optimizer_settings,
     generate_optimizer_settings,
+    historical_trade_evidence,
+    optimize_strategy_families,
     optimize_strategy_inputs,
     optimize_strategy_intervals,
     optimizer_candidate_records,
@@ -28,6 +35,10 @@ from agentloop_trader.parameter_loop import (
     recommendation_evidence_status,
     recommend_candidate,
     recommendation_summary,
+    strategy_search_detail_records,
+    strategy_search_interval_records,
+    strategy_search_ranking_records,
+    strategy_search_settings_records,
     validate_settings_across_tickers,
 )
 
@@ -131,7 +142,7 @@ def test_parameter_loop_recommendation_and_records_are_display_ready():
     assert "Try these settings next" in summary
 
 
-def test_optimizer_searches_all_strategies_and_returns_display_records():
+def test_optimizer_searches_four_trend_strategies_and_returns_display_records():
     current_settings = dict(CURRENT_SETTINGS)
 
     settings = generate_optimizer_settings(current_settings, max_candidates_per_strategy=2)
@@ -142,7 +153,6 @@ def test_optimizer_searches_all_strategies_and_returns_display_records():
         "Trend pullback continuation",
         "Trendline breakout",
         "Trendline retest continuation",
-        "RSI mean-reversion scalp",
     }
 
     result = optimize_strategy_inputs(
@@ -151,13 +161,14 @@ def test_optimizer_searches_all_strategies_and_returns_display_records():
         account_equity=50_000,
         train_fraction=0.65,
         max_candidates_per_strategy=2,
+        max_local_candidates_per_strategy=0,
     )
 
     assert result.tested_candidates > 0
     assert result.best is not None
     assert result.best.tested_periods >= 2
     assert 0 <= result.best.profitable_test_periods <= result.best.tested_periods
-    assert result.candidates == sorted(result.candidates, key=lambda row: row.score, reverse=True)
+    assert result.candidates[0] == result.best
     assert optimizer_recommendation_records(result)
     assert optimizer_candidate_records(result.candidates)
     assert result.robustness is not None
@@ -184,14 +195,107 @@ def test_optimizer_candidate_subset_varies_more_than_one_input_dimension():
     assert len({row["moving_average_window"] for row in breakout}) > 1
 
 
-def test_optimizer_tests_each_setting_with_rsi_entry_rule_off_and_on():
+def test_optimizer_excludes_all_rsi_rules_and_rsi_strategy():
     rows = generate_optimizer_settings(CURRENT_SETTINGS, max_candidates_per_strategy=2)
 
-    for strategy_type in {row[1] for row in rows}:
-        strategy_rows = [settings for _, row_type, settings in rows if row_type == strategy_type]
-        expected = {False} if strategy_type == "rsi_scalp" else {False, True}
-        assert {settings["rsi_entry_filter_enabled"] for settings in strategy_rows} == expected
-        assert len(strategy_rows) == (2 if strategy_type == "rsi_scalp" else 4)
+    assert {strategy_type for _, strategy_type, _ in rows} == {
+        "breakout", "pullback", "trendline", "trendline_retest",
+    }
+    assert all(settings["rsi_entry_filter_enabled"] is False for _, _, settings in rows)
+    assert not generate_optimizer_settings(
+        CURRENT_SETTINGS,
+        max_candidates_per_strategy=2,
+        strategy_types={"rsi_scalp"},
+    )
+
+
+def test_local_optimizer_searches_distinct_numeric_neighbors():
+    broad = generate_optimizer_settings(
+        CURRENT_SETTINGS,
+        max_candidates_per_strategy=8,
+        strategy_types={"breakout"},
+    )
+    seeds = [settings for _, _, settings in broad[:2]]
+
+    local = generate_local_optimizer_settings(seeds, "breakout", max_candidates=24)
+
+    identities = {
+        (
+            row["entry_window"], row["exit_window"],
+            row["atr_stop_multiplier"], row["moving_average_window"],
+        )
+        for row in local
+    }
+    assert len(local) == len(identities) == 24
+    assert all(row["rsi_entry_filter_enabled"] is False for row in local)
+
+
+def test_optimizer_broad_search_covers_full_allowed_ranges():
+    rows = generate_optimizer_settings(CURRENT_SETTINGS, max_candidates_per_strategy=32)
+    breakout = [settings for _, strategy, settings in rows if strategy == "breakout"]
+
+    assert len(breakout) == 32
+    assert {row["entry_window"] for row in breakout} == set(OPTIMIZER_ENTRY_WINDOWS)
+    assert {row["exit_window"] for row in breakout} == set(OPTIMIZER_EXIT_WINDOWS)
+    assert {row["atr_stop_multiplier"] for row in breakout} == set(OPTIMIZER_ATR_MULTIPLIERS)
+    assert {row["moving_average_window"] for row in breakout} == set(OPTIMIZER_TREND_WINDOWS)
+
+
+def test_optimizer_can_limit_search_to_one_strategy_family():
+    rows = generate_optimizer_settings(
+        CURRENT_SETTINGS,
+        max_candidates_per_strategy=8,
+        strategy_types={"pullback"},
+    )
+
+    assert len(rows) == 8
+    assert {strategy for _, strategy, _ in rows} == {"pullback"}
+
+
+def test_historical_trade_evidence_is_clear_and_never_rejects_small_samples():
+    assert historical_trade_evidence(35) == "Enough historical trades"
+    assert historical_trade_evidence(34) == "Smaller historical sample"
+    assert historical_trade_evidence(14) == "Very small historical sample"
+
+
+def test_multi_strategy_search_returns_one_ranked_result_for_each_strategy():
+    data = synthetic_ohlc_frame(n=500, seed=44)
+    data.index = pd.date_range("2024-01-01", periods=len(data), freq="4h")
+    strategy_intervals = {
+        "breakout": ("4h",),
+        "pullback": ("4h",),
+        "trendline": ("4h",),
+        "trendline_retest": ("4h",),
+    }
+
+    result = optimize_strategy_families(
+        market_data_by_interval={"4h": ("500 bars", data)},
+        strategy_intervals=strategy_intervals,
+        current_settings=CURRENT_SETTINGS,
+        account_equity=50_000,
+        max_candidates_per_strategy=1,
+        max_local_candidates_per_strategy=0,
+        bootstrap_samples=10,
+    )
+
+    assert len(result.strategy_results) == 4
+    ranking_rows = strategy_search_ranking_records(result)
+    assert len(ranking_rows) == 4
+    assert "Older 55% Trades" in ranking_rows[0]
+    assert "Newer 25% vs Buy and Hold" in ranking_rows[0]
+    assert "Latest 20% vs Buy and Hold" in ranking_rows[0]
+    assert result.best_strategy is result.strategy_results[0]
+    for strategy_result in result.strategy_results:
+        assert strategy_result.best_interval == "4h"
+        assert strategy_search_detail_records(strategy_result)
+        setting_rows = strategy_search_settings_records(strategy_result)
+        assert setting_rows
+        assert next(
+            row["Value"] for row in setting_rows
+            if row["Item"] == "Other settings with similar results"
+        ) == "No stable nearby range found"
+        assert strategy_result.best_result.best.confidence == "Low"
+        assert strategy_search_interval_records(strategy_result)
 
 
 def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():
@@ -200,6 +304,7 @@ def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():
         current_settings=CURRENT_SETTINGS,
         account_equity=50_000,
         max_candidates_per_strategy=2,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=200,
     )
 
@@ -210,6 +315,7 @@ def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():
         current_settings=CURRENT_SETTINGS,
         account_equity=50_000,
         max_candidates_per_strategy=2,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=200,
     ).robustness.bootstrap
 
@@ -220,6 +326,7 @@ def test_cross_ticker_check_uses_the_selected_settings_without_reoptimizing():
         current_settings=CURRENT_SETTINGS,
         account_equity=50_000,
         max_candidates_per_strategy=2,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=100,
     )
     selected_settings = dict(result.best.settings)
@@ -256,6 +363,7 @@ def test_optimizer_reports_newer_and_locked_results_against_buy_and_hold():
         current_settings=CURRENT_SETTINGS,
         account_equity=50_000,
         max_candidates_per_strategy=2,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=100,
     )
 
@@ -270,7 +378,9 @@ def test_optimizer_reports_newer_and_locked_results_against_buy_and_hold():
         2,
     )
     record_names = {row["Item"] for row in optimizer_recommendation_records(result)}
-    assert {"Recommendation status", "Validation and final-period comparison", "RSI entry rule", "Next step"} <= record_names
+    assert {"Recommendation status", "Validation and final-period comparison", "Next step"} <= record_names
+    assert not any("RSI" in name for name in record_names)
+    assert not any("RSI" in column for column in optimizer_candidate_records(result.candidates)[0])
     assert recommendation_evidence_status(result) in {"Research only", "Ready for paper test"}
 
 
@@ -281,6 +391,7 @@ def test_optimizer_ranks_allocated_return_but_preserves_account_impact():
         account_equity=100_000,
         risk_limits=RiskLimits(max_symbol_concentration_pct=5.0),
         max_candidates_per_strategy=1,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=50,
     )
 
@@ -298,6 +409,7 @@ def test_interval_optimizer_returns_one_ranked_result_per_interval():
         current_settings=CURRENT_SETTINGS,
         account_equity=50_000,
         max_candidates_per_strategy=1,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=50,
     )
 
@@ -324,6 +436,7 @@ def test_interval_optimizer_uses_one_shared_calendar_period_and_long_history_che
         current_settings=CURRENT_SETTINGS,
         account_equity=50_000,
         max_candidates_per_strategy=1,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=20,
         comparison_years=2,
     )
@@ -347,6 +460,7 @@ def _verdict_result(**overrides):
         account_equity=100_000,
         risk_limits=RiskLimits(max_symbol_concentration_pct=5.0),
         max_candidates_per_strategy=1,
+        max_local_candidates_per_strategy=0,
         bootstrap_samples=20,
     )
     candidate = replace(

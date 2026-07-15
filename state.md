@@ -711,6 +711,34 @@ The intended process behavior is explicit:
 
 The four trend strategies now allow a `Trend filter length` as short as 10 completed bars. The sidebar and per-position editor use a 10-to-300 range in 10-bar increments while retaining 50 bars as the default. Ten- and 20-bar filters are also valid optimizer candidates, and regime analysis no longer silently replaces a selected 10-bar filter with 20 bars. The UI warns that short filters react faster and generally create more trend changes and false signals.
 
+## Broad Five-Strategy Input Search (July 14, 2026)
+
+`Run Strategy Input Search` was redesigned to answer a simpler question: which historical settings worked best for each distinct strategy, primarily by return versus equal-capital buy-and-hold. It now samples each strategy's full allowed input ranges instead of only the values nearest the sidebar settings. The sidebar count is the actual number of settings tested per strategy, including the optional RSI 50-70 filter tests for trend strategies.
+
+The historical split remains 65% / 15% / 20%. The older 65% finds settings, the newer 15% chooses among the strongest older-price settings, and the latest 20% reports what subsequently happened without changing the winner. A result with 35 or more trades is labeled `Enough historical trades`; 15-34 is `Smaller historical sample`; fewer than 15 is `Very small historical sample`. A small sample does not erase the result, but it is shown plainly.
+
+The search returns one independently selected result for all five strategies. Breakout continuation, Trend pullback continuation, Trendline breakout, and Trendline retest continuation compare 1-hour, 4-hour, and daily prices. RSI mean-reversion scalp compares 15-minute, 1-hour, and 4-hour prices. The main ranking shows each strategy's best interval, older-price trade count, newer and latest buy-and-hold differences, complete-history annualized difference, complete-history trades, and maximum historical decline. Selecting a strategy shows exact settings, similar nearby ranges, all four price sections, interval comparisons, and an explicit `Use These Inputs` action that never sends an order.
+
+Drawdown remains visible but does not rank or reject strategies in this search. The latest 20% also does not affect ranking. Trading-cost and market-condition details remain collapsed in Full Records and Evidence.
+
+## Four-Strategy Broad And Local Input Search (July 14, 2026)
+
+After live review showed an exact one-point "range," the input search was narrowed to the four trend strategies. RSI mean-reversion scalp and the optional RSI 50-70 entry filter are completely excluded from this search; they remain available elsewhere in the app. Each trend strategy now receives 64 distinct settings sampled across its allowed numeric ranges, followed by up to 24 deliberate neighboring settings around the two strongest discovery regions.
+
+The historical split is now 55% / 25% / 20%. The older 55% finds broad regions, the next 25% chooses among only those discovered regions, and the latest 20% reports what happened afterward without changing the selected settings. A nearby range is displayed only when at least four similar, profitable numeric neighbors exist and at least two inputs vary. Otherwise the UI explicitly says `No stable nearby range found` and marks confidence Low instead of repeating one exact setting as a misleading range.
+
+Real-ticker loading also has a visible three-step progress display: download completed bars, run the five ordinary strategy backtests, and prepare decisions/tables/charts. This is especially useful for BTC/USD on short intervals, where paginated 24/7 history can take several minutes. It does not pretend to know API page-level completion; the bar-download step remains visibly active until the synchronous history request returns.
+
+The completed checkpoint passed 351 tests. No Streamlit server was started and no broker order was submitted during development or verification.
+
+## Queued Order Ownership And Unfilled Retry (July 15, 2026)
+
+HOOD exposed an overly broad repeat-cycle rule. A queued limit buy was canceled with zero filled shares, but the setup was moved to `waiting_for_signal_reset` and could not buy again while the original BUY conditions remained continuously true. A later manual order for the same ticker could also be mistaken for the queued setup's own order because ownership was tracked only by symbol.
+
+Queued setups now persist their exact active Alpaca order ID and tag worker-created orders with the saved plan ID. An open manual order or manual position still blocks duplicate exposure, but it no longer becomes the queued setup's completed trade cycle. When a worker-owned order is canceled, expired, or rejected with zero filled shares, the setup waits for its saved re-entry delay and then checks the still-active BUY requirements again without requiring the signal to turn off. Only a worker-owned order that actually filled and later exited requires the BUY signal to turn off and back on before repeating.
+
+Legacy records are migrated by matching the saved order-sent time to the corresponding non-manual tracked order. A read-only check matched HOOD to worker order `906e2327-76b7-4587-9bd7-9ff4d7b76a3c`, status canceled, filled quantity zero. The completed checkpoint passed 354 tests. Updating the worker source correctly stopped the old detached process with `Restart required`; the user must click `Start Worker` to load this fix. No broker order was submitted during development or verification.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

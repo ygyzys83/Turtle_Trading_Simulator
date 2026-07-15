@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
+from hashlib import sha256
 from itertools import product
 from math import e, sqrt
 from statistics import NormalDist, median
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,8 @@ class OptimizerCandidate:
     tested_periods: int
     train_return_percent: float
     train_trades: int
+    train_benchmark_return_percent: float
+    train_excess_return_percent: float
     stability: str
     recommended_risk_per_trade_percent: float
     plateau_neighbors: int = 1
@@ -173,6 +176,12 @@ class IntervalOptimizationResult:
     durability_excess_return_percent: float = 0.0
     durability_max_drawdown_percent: float = 0.0
     durability_trades: int = 0
+    durability_annualized_return_percent: float | None = None
+    durability_benchmark_annualized_return_percent: float | None = None
+    durability_annualized_excess_percent: float | None = None
+    older_dates: str = "Older prices"
+    newer_dates: str = "Newer prices"
+    latest_dates: str = "Latest prices"
 
 
 @dataclass(frozen=True)
@@ -182,6 +191,26 @@ class MultiIntervalRecommendation:
     best_result: StrategyInputRecommendation
     interval_results: tuple[IntervalOptimizationResult, ...]
     summary: str
+
+
+@dataclass(frozen=True)
+class StrategySearchResult:
+    strategy_label: str
+    strategy_type: str
+    best_interval: str
+    best_history: str
+    best_result: StrategyInputRecommendation
+    interval_results: tuple[IntervalOptimizationResult, ...]
+
+
+@dataclass(frozen=True)
+class MultiStrategySearchResult:
+    strategy_results: tuple[StrategySearchResult, ...]
+    summary: str
+
+    @property
+    def best_strategy(self) -> StrategySearchResult | None:
+        return self.strategy_results[0] if self.strategy_results else None
 
 
 @dataclass(frozen=True)
@@ -212,16 +241,12 @@ OPTIMIZER_ATR_MULTIPLIERS = (0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 5.0)
 OPTIMIZER_TREND_WINDOWS = (10, 20, 50, 100, 150, 200)
 OPTIMIZER_PULLBACK_WINDOWS = (10, 20, 30, 50, 100, 150, 200)
 OPTIMIZER_MOMENTUM_WINDOWS = (3, 5, 10, 15, 20)
-OPTIMIZER_RSI_LENGTHS = (7, 9, 14, 21)
-OPTIMIZER_RSI_OVERSOLD = (25.0, 30.0, 35.0)
-OPTIMIZER_RSI_OVERBOUGHT = (65.0, 70.0, 75.0)
-OPTIMIZER_RSI_DECLINES = (30.0, 40.0, 50.0)
-OPTIMIZER_RSI_REBOUNDS = (2.0, 3.0, 5.0)
-OPTIMIZER_RSI_RECOVERIES = (30.0, 35.0, 40.0)
-OPTIMIZER_RSI_LOOKBACKS = (12, 24, 36)
-OPTIMIZER_RSI_MAX_HOLDS = (50, 100, 150)
-OPTIMIZER_RSI_STOP_MODES = ("standard_atr", "emergency_atr", "no_price_stop")
-OPTIMIZER_RSI_EMERGENCY_ATR = (4.0, 5.0, 6.0)
+OPTIMIZER_STRATEGY_TYPES = {
+    label: strategy_type
+    for label, strategy_type in STRATEGY_TYPES.items()
+    if strategy_type != "rsi_scalp"
+}
+OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY = 24
 
 
 def generate_bounded_candidates(current: StrategyConfig, max_candidates: int = 12) -> list[StrategyConfig]:
@@ -339,6 +364,43 @@ def score_evaluation(evaluation: WalkForwardResult) -> float:
     )
 
 
+def historical_trade_evidence(trades: int) -> str:
+    if trades >= 35:
+        return "Enough historical trades"
+    if trades >= 15:
+        return "Smaller historical sample"
+    return "Very small historical sample"
+
+
+def _trade_evidence_rank(trades: int) -> int:
+    if trades >= 35:
+        return 2
+    if trades >= 15:
+        return 1
+    return 0
+
+
+def _discovery_selection_key(candidate: OptimizerCandidate) -> tuple[float, ...]:
+    """Rank the broad discovery search without using the later price sections."""
+    return (
+        float(_trade_evidence_rank(candidate.train_trades)),
+        float(candidate.train_excess_return_percent),
+        float(candidate.train_return_percent),
+        float(candidate.train_trades),
+    )
+
+
+def _validation_selection_key(candidate: OptimizerCandidate) -> tuple[float, ...]:
+    """Choose among older-price finalists using the unchanged newer-price result."""
+    return (
+        float(_trade_evidence_rank(candidate.train_trades)),
+        float(candidate.excess_return_percent),
+        float(candidate.test_return_percent),
+        float(candidate.test_trades),
+        float(candidate.train_excess_return_percent),
+    )
+
+
 def recommend_candidate(candidates: list[ParameterCandidate]) -> ParameterCandidate | None:
     viable = [c for c in candidates if c.evaluation is not None and c.status in {"Candidate", "Needs review"}]
     return viable[0] if viable else None
@@ -382,18 +444,24 @@ def optimize_strategy_inputs(
     account_equity: float,
     risk_limits: RiskLimits | None = None,
     *,
-    train_fraction: float = 0.65,
+    train_fraction: float = 0.55,
     max_candidates_per_strategy: int = 18,
+    max_local_candidates_per_strategy: int = OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY,
     min_test_trades: int = 2,
     target_max_drawdown_percent: float = 8.0,
     locked_fraction: float = 0.20,
     rolling_windows: int = 4,
     bootstrap_samples: int = 1000,
+    strategy_types: set[str] | None = None,
 ) -> StrategyInputRecommendation:
-    """Select stable settings, then evaluate the winner on an untouched final period."""
+    """Search broadly, verify nearby settings, choose on 25%, and report the latest 20%."""
     data = market_data.copy() if market_data is not None else synthetic_ohlc_frame(seed=42)
-    candidates = generate_optimizer_settings(current_settings, max_candidates_per_strategy=max_candidates_per_strategy)
-    ranked: list[OptimizerCandidate] = []
+    candidates = generate_optimizer_settings(
+        current_settings,
+        max_candidates_per_strategy=max_candidates_per_strategy,
+        strategy_types=strategy_types,
+    )
+    broad_ranked: list[OptimizerCandidate] = []
     rejected = 0
     for strategy_label, strategy_type, settings in candidates:
         try:
@@ -412,37 +480,73 @@ def optimize_strategy_inputs(
         except ValueError:
             rejected += 1
             continue
-        ranked.append(candidate)
+        broad_ranked.append(candidate)
+
+    ranked = list(broad_ranked)
+    tested_settings = {
+        _optimizer_settings_identity(row.strategy_type, row.settings)
+        for row in broad_ranked
+    }
+    for strategy_type in sorted({row.strategy_type for row in broad_ranked}):
+        discovery_rows = [row for row in broad_ranked if row.strategy_type == strategy_type]
+        discovery_rows.sort(key=_discovery_selection_key, reverse=True)
+        local_settings = generate_local_optimizer_settings(
+            [row.settings for row in discovery_rows[:2]],
+            strategy_type,
+            max_candidates=max_local_candidates_per_strategy,
+            excluded_identities=tested_settings,
+        )
+        strategy_label = next(
+            label for label, value in OPTIMIZER_STRATEGY_TYPES.items() if value == strategy_type
+        )
+        for settings in local_settings:
+            try:
+                candidate = _evaluate_optimizer_candidate(
+                    strategy_label=strategy_label,
+                    strategy_type=strategy_type,
+                    settings=settings,
+                    market_data=data,
+                    account_equity=account_equity,
+                    risk_limits=risk_limits,
+                    train_fraction=train_fraction,
+                    locked_fraction=locked_fraction,
+                    min_test_trades=min_test_trades,
+                    target_max_drawdown_percent=target_max_drawdown_percent,
+                )
+            except ValueError:
+                rejected += 1
+                continue
+            ranked.append(candidate)
+            tested_settings.add(_optimizer_settings_identity(strategy_type, settings))
 
     ranked = _attach_plateau_scores(ranked)
-    ranked.sort(key=lambda row: row.score, reverse=True)
-    shortlist_size = min(12, len(ranked))
-    shortlist = []
-    for candidate in ranked[:shortlist_size]:
-        rolling = _rolling_evidence(
-            candidate.strategy_type,
-            candidate.settings,
-            data,
-            account_equity,
-            risk_limits,
-            locked_fraction=locked_fraction,
-            windows=rolling_windows,
-        )
-        rolling_bonus = (
-            rolling["median_return_percent"] * 0.35
-            + (rolling["profitable_windows"] / max(1, rolling["windows"])) * 3.0
-            - rolling["worst_drawdown_percent"] * 0.15
-        )
-        shortlist.append(replace(
-            candidate,
-            score=round(candidate.score + rolling_bonus, 2),
-            rolling_profitable_windows=rolling["profitable_windows"],
-            rolling_windows=rolling["windows"],
-            rolling_median_return_percent=rolling["median_return_percent"],
-            rolling_worst_drawdown_percent=rolling["worst_drawdown_percent"],
-        ))
-    ranked = shortlist + ranked[shortlist_size:]
-    ranked.sort(key=lambda row: row.score, reverse=True)
+    finalists: list[OptimizerCandidate] = []
+    remainder: list[OptimizerCandidate] = []
+    for strategy_type in sorted({row.strategy_type for row in ranked}):
+        strategy_rows = [row for row in ranked if row.strategy_type == strategy_type]
+        strategy_rows.sort(key=_discovery_selection_key, reverse=True)
+        shortlist_size = min(10, len(strategy_rows))
+        for candidate in strategy_rows[:shortlist_size]:
+            rolling = _rolling_evidence(
+                candidate.strategy_type,
+                candidate.settings,
+                data,
+                account_equity,
+                risk_limits,
+                locked_fraction=locked_fraction,
+                windows=rolling_windows,
+            )
+            finalists.append(replace(
+                candidate,
+                rolling_profitable_windows=rolling["profitable_windows"],
+                rolling_windows=rolling["windows"],
+                rolling_median_return_percent=rolling["median_return_percent"],
+                rolling_worst_drawdown_percent=rolling["worst_drawdown_percent"],
+            ))
+        remainder.extend(strategy_rows[shortlist_size:])
+    finalists.sort(key=_validation_selection_key, reverse=True)
+    remainder.sort(key=_discovery_selection_key, reverse=True)
+    ranked = finalists + remainder
     best = ranked[0] if ranked else None
     robustness = None
     if best is not None:
@@ -479,6 +583,11 @@ def optimize_strategy_inputs(
             stress_rows,
             trial_adjustment,
         )
+        if not parameter_range:
+            final_confidence = "Low"
+            final_stability = (
+                "No stable nearby numeric range was found. Treat this as an isolated historical result, not a durable setting recommendation."
+            )
         updated_best = replace(best, confidence=final_confidence, stability=final_stability)
         ranked = [updated_best if row is best else row for row in ranked]
         best = updated_best
@@ -774,6 +883,7 @@ def optimize_strategy_intervals(
     *,
     train_fraction: float = 0.65,
     max_candidates_per_strategy: int = 12,
+    max_local_candidates_per_strategy: int = OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY,
     bootstrap_samples: int = 1000,
     comparison_years: int = 2,
 ) -> MultiIntervalRecommendation:
@@ -794,6 +904,7 @@ def optimize_strategy_intervals(
             risk_limits=risk_limits,
             train_fraction=train_fraction,
             max_candidates_per_strategy=max_candidates_per_strategy,
+            max_local_candidates_per_strategy=max_local_candidates_per_strategy,
             bootstrap_samples=bootstrap_samples,
         )
         candidate = result.best
@@ -914,6 +1025,180 @@ def optimize_strategy_intervals(
     )
 
 
+def optimize_strategy_families(
+    market_data_by_interval: dict[str, tuple[str, pd.DataFrame]],
+    strategy_intervals: dict[str, tuple[str, ...]],
+    current_settings: dict[str, Any],
+    account_equity: float,
+    risk_limits: RiskLimits | None = None,
+    *,
+    train_fraction: float = 0.55,
+    max_candidates_per_strategy: int = 32,
+    max_local_candidates_per_strategy: int = OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY,
+    bootstrap_samples: int = 250,
+    progress_callback: Callable[[int, int, str], None] | None = None,
+) -> MultiStrategySearchResult:
+    """Return one independently selected result for every strategy family."""
+    tasks = [
+        (strategy_label, strategy_type, interval)
+        for strategy_label, strategy_type in OPTIMIZER_STRATEGY_TYPES.items()
+        for interval in strategy_intervals.get(strategy_type, ())
+        if interval in market_data_by_interval
+    ]
+    completed = 0
+    strategy_results: list[StrategySearchResult] = []
+    for strategy_label, strategy_type in OPTIMIZER_STRATEGY_TYPES.items():
+        interval_rows: list[IntervalOptimizationResult] = []
+        for interval in strategy_intervals.get(strategy_type, ()):
+            payload = market_data_by_interval.get(interval)
+            if payload is None:
+                continue
+            history, market_data = payload
+            if progress_callback:
+                progress_callback(completed, len(tasks), f"Testing {strategy_label} with {interval} prices")
+            settings = dict(current_settings)
+            settings.update({"strategy_label": strategy_label, "strategy_type": strategy_type, "interval": interval})
+            recommendation = optimize_strategy_inputs(
+                market_data=market_data,
+                current_settings=settings,
+                account_equity=account_equity,
+                risk_limits=risk_limits,
+                train_fraction=train_fraction,
+                max_candidates_per_strategy=max_candidates_per_strategy,
+                max_local_candidates_per_strategy=max_local_candidates_per_strategy,
+                bootstrap_samples=bootstrap_samples,
+                strategy_types={strategy_type},
+            )
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(tasks), f"Finished {strategy_label} with {interval} prices")
+            candidate = recommendation.best
+            if candidate is None:
+                continue
+            full_result = _run_one(strategy_type, market_data, candidate.settings, account_equity, risk_limits)
+            full_stats = _closed_trade_stats(
+                account_equity,
+                list(full_result["trade_log"]),
+                len(market_data),
+                risk_limits,
+                elapsed_years(market_data.index),
+            )
+            full_benchmark = buy_and_hold_benchmark(
+                market_data,
+                account_equity,
+                allocated_capital=ticker_allocated_capital(account_equity, risk_limits),
+            )
+            annualized_strategy = full_stats["annualized_allocated_return_pct"]
+            annualized_benchmark = full_benchmark.annualized_return_percent
+            annualized_excess = (
+                None
+                if annualized_strategy is None or annualized_benchmark is None
+                else round(float(annualized_strategy) - float(annualized_benchmark), 2)
+            )
+            older_dates, newer_dates, latest_dates = _optimizer_date_ranges(
+                market_data,
+                train_fraction=train_fraction,
+                locked_fraction=recommendation.locked_fraction,
+            )
+            interval_rows.append(IntervalOptimizationResult(
+                interval=interval,
+                history=history,
+                recommendation=recommendation,
+                selection_score=candidate.excess_return_percent,
+                evidence_status=historical_trade_evidence(candidate.train_trades),
+                comparison_history=history,
+                durability_return_percent=float(full_stats["allocated_return_pct"]),
+                durability_benchmark_return_percent=full_benchmark.return_percent,
+                durability_excess_return_percent=round(
+                    float(full_stats["allocated_return_pct"]) - full_benchmark.return_percent, 2
+                ),
+                durability_max_drawdown_percent=float(full_stats["allocated_max_drawdown_pct"]),
+                durability_trades=int(full_stats["total_trades"]),
+                durability_annualized_return_percent=annualized_strategy,
+                durability_benchmark_annualized_return_percent=annualized_benchmark,
+                durability_annualized_excess_percent=annualized_excess,
+                older_dates=older_dates,
+                newer_dates=newer_dates,
+                latest_dates=latest_dates,
+            ))
+        if not interval_rows:
+            continue
+        interval_rows.sort(key=_strategy_interval_selection_key, reverse=True)
+        best_row = interval_rows[0]
+        strategy_results.append(StrategySearchResult(
+            strategy_label=strategy_label,
+            strategy_type=strategy_type,
+            best_interval=best_row.interval,
+            best_history=best_row.history,
+            best_result=best_row.recommendation,
+            interval_results=tuple(interval_rows),
+        ))
+    strategy_results.sort(key=_strategy_family_selection_key, reverse=True)
+    if not strategy_results:
+        raise ValueError("No strategy produced a historical result.")
+    best = strategy_results[0]
+    candidate = best.best_result.best
+    older_percent, newer_percent, _ = _optimizer_split_percentages(best.best_result)
+    summary = (
+        f"Highest-ranked historical result: {best.strategy_label} using {best.best_interval} prices. "
+        f"On the newer {newer_percent}% of prices it returned {candidate.excess_return_percent:+.2f}% versus buying and holding. "
+        f"The older {older_percent}% produced {candidate.train_trades} completed trades "
+        f"({historical_trade_evidence(candidate.train_trades).lower()})."
+    )
+    return MultiStrategySearchResult(tuple(strategy_results), summary)
+
+
+def _strategy_interval_selection_key(row: IntervalOptimizationResult) -> tuple[float, ...]:
+    candidate = row.recommendation.best
+    if candidate is None:
+        return (-1.0, -9999.0, -9999.0)
+    return _validation_selection_key(candidate)
+
+
+def _strategy_family_selection_key(row: StrategySearchResult) -> tuple[float, ...]:
+    best_interval = row.interval_results[0]
+    candidate = best_interval.recommendation.best
+    if candidate is None:
+        return (-1.0, -9999.0, -9999.0)
+    return _validation_selection_key(candidate)
+
+
+def _optimizer_date_ranges(
+    market_data: pd.DataFrame,
+    *,
+    train_fraction: float,
+    locked_fraction: float,
+) -> tuple[str, str, str]:
+    if market_data.empty or not isinstance(market_data.index, pd.DatetimeIndex):
+        newer_fraction = max(0.0, 1.0 - train_fraction - locked_fraction)
+        return (
+            f"Older {train_fraction * 100:.0f}% of prices",
+            f"Newer {newer_fraction * 100:.0f}% of prices",
+            f"Latest {locked_fraction * 100:.0f}% of prices",
+        )
+    total = len(market_data)
+    latest_start = int(total * (1.0 - locked_fraction))
+    newer_start = min(int(total * train_fraction), latest_start)
+
+    def label(start: int, end: int) -> str:
+        if end <= start:
+            return "No dates available"
+        left = pd.Timestamp(market_data.index[start]).strftime("%b %Y")
+        right = pd.Timestamp(market_data.index[end - 1]).strftime("%b %Y")
+        return left if left == right else f"{left} to {right}"
+
+    return label(0, newer_start), label(newer_start, latest_start), label(latest_start, total)
+
+
+def _optimizer_split_percentages(
+    recommendation: StrategyInputRecommendation,
+) -> tuple[int, int, int]:
+    older = int(round(recommendation.train_fraction * 100))
+    latest = int(round(recommendation.locked_fraction * 100))
+    newer = max(0, 100 - older - latest)
+    return older, newer, latest
+
+
 def _shared_calendar_window(
     frames: list[pd.DataFrame],
     years: int,
@@ -949,60 +1234,22 @@ def generate_optimizer_settings(
     current_settings: dict[str, Any],
     *,
     max_candidates_per_strategy: int = 18,
+    strategy_types: set[str] | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
     base = _normal_settings(current_settings)
     rows: list[tuple[str, str, dict[str, Any]]] = []
-    for strategy_label, strategy_type in STRATEGY_TYPES.items():
+    for strategy_label, strategy_type in OPTIMIZER_STRATEGY_TYPES.items():
+        if strategy_types is not None and strategy_type not in strategy_types:
+            continue
         strategy_rows: list[dict[str, Any]] = []
-        entry_options = _nearby(base["entry_window"], OPTIMIZER_ENTRY_WINDOWS)
-        exit_options = _nearby(base["exit_window"], OPTIMIZER_EXIT_WINDOWS)
-        atr_options = _nearby(base["atr_stop_multiplier"], OPTIMIZER_ATR_MULTIPLIERS)
-        trend_options = _nearby(base["moving_average_window"], OPTIMIZER_TREND_WINDOWS)
-        pullback_options = _nearby(base["pullback_average_length"], OPTIMIZER_PULLBACK_WINDOWS)
-        momentum_options = _nearby(base["momentum_turn_length"], OPTIMIZER_MOMENTUM_WINDOWS)
+        entry_options = list(OPTIMIZER_ENTRY_WINDOWS)
+        exit_options = list(OPTIMIZER_EXIT_WINDOWS)
+        atr_options = list(OPTIMIZER_ATR_MULTIPLIERS)
+        trend_options = list(OPTIMIZER_TREND_WINDOWS)
+        pullback_options = list(OPTIMIZER_PULLBACK_WINDOWS)
+        momentum_options = list(OPTIMIZER_MOMENTUM_WINDOWS)
 
-        if strategy_type == "rsi_scalp":
-            rsi_dimensions = {
-                "rsi_length": _nearby(base["rsi_length"], OPTIMIZER_RSI_LENGTHS),
-                "rsi_oversold": _nearby(base["rsi_oversold"], OPTIMIZER_RSI_OVERSOLD),
-                "rsi_overbought": _nearby(base["rsi_overbought"], OPTIMIZER_RSI_OVERBOUGHT),
-                "rsi_decline_points": _nearby(base["rsi_decline_points"], OPTIMIZER_RSI_DECLINES),
-                "rsi_rebound_points": _nearby(base["rsi_rebound_points"], OPTIMIZER_RSI_REBOUNDS),
-                "rsi_sell_recovery_points": _nearby(base["rsi_sell_recovery_points"], OPTIMIZER_RSI_RECOVERIES),
-                "rsi_swing_lookback": _nearby(base["rsi_swing_lookback"], OPTIMIZER_RSI_LOOKBACKS),
-                "rsi_stop_mode": list(OPTIMIZER_RSI_STOP_MODES),
-                "rsi_emergency_atr_multiplier": _nearby(
-                    base["rsi_emergency_atr_multiplier"], OPTIMIZER_RSI_EMERGENCY_ATR
-                ),
-                "rsi_max_holding_bars": (
-                    _nearby(base["rsi_max_holding_bars"], OPTIMIZER_RSI_MAX_HOLDS)
-                    if base["rsi_max_holding_enabled"]
-                    else [base["rsi_max_holding_bars"]]
-                ),
-            }
-            strategy_rows.append(base | {"strategy_label": strategy_label, "strategy_type": strategy_type})
-            for key, values in rsi_dimensions.items():
-                for value in values:
-                    strategy_rows.append(base | {
-                        "strategy_label": strategy_label,
-                        "strategy_type": strategy_type,
-                        key: value,
-                    })
-            for oversold, decline, recovery, atr in product(
-                rsi_dimensions["rsi_oversold"],
-                rsi_dimensions["rsi_decline_points"],
-                rsi_dimensions["rsi_sell_recovery_points"],
-                atr_options,
-            ):
-                strategy_rows.append(base | {
-                    "strategy_label": strategy_label,
-                    "strategy_type": strategy_type,
-                    "rsi_oversold": oversold,
-                    "rsi_decline_points": decline,
-                    "rsi_sell_recovery_points": recovery,
-                    "atr_stop_multiplier": atr,
-                })
-        elif strategy_type == "pullback":
+        if strategy_type == "pullback":
             raw = product(exit_options, atr_options, trend_options, pullback_options, momentum_options)
             for exit_w, atr, trend_w, pullback_w, momentum_w in raw:
                 row = base | {
@@ -1048,17 +1295,151 @@ def generate_optimizer_settings(
             if identity not in seen_rows:
                 seen_rows.add(identity)
                 unique_rows.append(row)
-        strategy_rows = unique_rows
-        if strategy_type != "rsi_scalp":
-            strategy_rows.sort(key=lambda row: _settings_distance(base, row))
-        for row in strategy_rows[:max_candidates_per_strategy]:
-            for rsi_enabled in ((False,) if strategy_type == "rsi_scalp" else (False, True)):
-                rows.append((
-                    strategy_label,
-                    strategy_type,
-                    row | {"rsi_entry_filter_enabled": rsi_enabled},
-                ))
+        strategy_rows = _broad_optimizer_sample(
+            unique_rows,
+            base,
+            max_candidates=max_candidates_per_strategy,
+        )
+        for row in strategy_rows:
+            rows.append((
+                strategy_label,
+                strategy_type,
+                row | {"rsi_entry_filter_enabled": False},
+            ))
     return rows
+
+
+def _optimizer_numeric_keys(strategy_type: str) -> tuple[str, ...]:
+    if strategy_type == "pullback":
+        return (
+            "exit_window", "atr_stop_multiplier", "moving_average_window",
+            "pullback_average_length", "momentum_turn_length",
+        )
+    if strategy_type == "trendline_retest":
+        return (
+            "entry_window", "exit_window", "atr_stop_multiplier",
+            "moving_average_window", "momentum_turn_length",
+        )
+    return (
+        "entry_window", "exit_window", "atr_stop_multiplier", "moving_average_window",
+    )
+
+
+def _optimizer_options(key: str) -> tuple[float | int, ...]:
+    return {
+        "entry_window": OPTIMIZER_ENTRY_WINDOWS,
+        "exit_window": OPTIMIZER_EXIT_WINDOWS,
+        "atr_stop_multiplier": OPTIMIZER_ATR_MULTIPLIERS,
+        "moving_average_window": OPTIMIZER_TREND_WINDOWS,
+        "pullback_average_length": OPTIMIZER_PULLBACK_WINDOWS,
+        "momentum_turn_length": OPTIMIZER_MOMENTUM_WINDOWS,
+    }[key]
+
+
+def _optimizer_settings_identity(
+    strategy_type: str,
+    settings: dict[str, Any],
+) -> tuple[str, tuple[tuple[str, float | int], ...]]:
+    return (
+        strategy_type,
+        tuple((key, settings[key]) for key in _optimizer_numeric_keys(strategy_type)),
+    )
+
+
+def _adjacent_optimizer_values(key: str, value: float | int) -> tuple[float | int, ...]:
+    allowed = list(_optimizer_options(key))
+    index = min(range(len(allowed)), key=lambda item: abs(float(allowed[item]) - float(value)))
+    left = max(0, index - 1)
+    right = min(len(allowed), index + 2)
+    return tuple(allowed[left:right])
+
+
+def generate_local_optimizer_settings(
+    seed_settings: list[dict[str, Any]],
+    strategy_type: str,
+    *,
+    max_candidates: int = OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY,
+    excluded_identities: set[tuple[str, tuple[tuple[str, float | int], ...]]] | None = None,
+) -> list[dict[str, Any]]:
+    """Test deliberate numeric neighbors around the two strongest broad-search regions."""
+    if strategy_type not in OPTIMIZER_STRATEGY_TYPES.values() or max_candidates <= 0:
+        return []
+    excluded = set(excluded_identities or set())
+    keys = _optimizer_numeric_keys(strategy_type)
+    per_seed: list[list[dict[str, Any]]] = []
+    for seed in seed_settings[:2]:
+        rows: list[dict[str, Any]] = []
+        for values in product(*(_adjacent_optimizer_values(key, seed[key]) for key in keys)):
+            row = dict(seed)
+            row.update(dict(zip(keys, values)))
+            row["rsi_entry_filter_enabled"] = False
+            identity = _optimizer_settings_identity(strategy_type, row)
+            if identity in excluded or identity == _optimizer_settings_identity(strategy_type, seed):
+                continue
+            rows.append(row)
+        rows.sort(
+            key=lambda row: (
+                sum(row[key] != seed[key] for key in keys),
+                _settings_distance(seed, row),
+                sha256(repr(_optimizer_settings_identity(strategy_type, row)).encode("utf-8")).hexdigest(),
+            )
+        )
+        per_seed.append(rows)
+
+    selected: list[dict[str, Any]] = []
+    cursor = 0
+    while len(selected) < max_candidates and any(per_seed):
+        bucket_index = cursor % len(per_seed)
+        cursor += 1
+        bucket = per_seed[bucket_index]
+        while bucket:
+            row = bucket.pop(0)
+            identity = _optimizer_settings_identity(strategy_type, row)
+            if identity in excluded:
+                continue
+            selected.append(row)
+            excluded.add(identity)
+            break
+        if all(not bucket for bucket in per_seed):
+            break
+    return selected
+
+
+def _broad_optimizer_sample(
+    rows: list[dict[str, Any]],
+    base: dict[str, Any],
+    *,
+    max_candidates: int,
+) -> list[dict[str, Any]]:
+    """Return one current-like setup plus deterministic coverage of the full range."""
+    if not rows or max_candidates <= 0:
+        return []
+    nearest = min(rows, key=lambda row: _settings_distance(base, row))
+    if max_candidates == 1:
+        return [nearest]
+    remaining = [row for row in rows if row is not nearest]
+    varying_keys = {
+        key
+        for key in nearest
+        if len({str(row.get(key)) for row in rows}) > 1
+    }
+    covered = {(key, str(nearest.get(key))) for key in varying_keys}
+    selected = [nearest]
+    while remaining and len(selected) < max_candidates:
+        best = max(
+            remaining,
+            key=lambda row: (
+                sum((key, str(row.get(key))) not in covered for key in varying_keys),
+                _settings_distance(base, row),
+                sha256(
+                    repr(tuple(sorted((key, str(value)) for key, value in row.items()))).encode("utf-8")
+                ).hexdigest(),
+            ),
+        )
+        selected.append(best)
+        covered.update((key, str(best.get(key))) for key in varying_keys)
+        remaining.remove(best)
+    return selected
 
 
 def optimizer_summary(candidate: OptimizerCandidate | None) -> str:
@@ -1108,21 +1489,6 @@ def optimizer_recommendation_records(
             "Item": "Annualized allocated return",
             "Value": _annualized_text(candidate.test_annualized_return_percent),
             "Plain English": "Shown only when the middle validation period is longer than one year.",
-        },
-        {
-            "Item": "RSI entry rule",
-            "Value": (
-                "Built into RSI mean-reversion scalp"
-                if candidate.strategy_type == "rsi_scalp"
-                else "Require RSI 50-70"
-                if settings.get("rsi_entry_filter_enabled", False)
-                else "Off"
-            ),
-            "Plain English": (
-                "The RSI arm, rebound, and recovery levels are part of this strategy and were included in the search."
-                if candidate.strategy_type == "rsi_scalp"
-                else "The search tested the same strategy settings with this rule both off and on."
-            ),
         },
         {"Item": "Strong nearby range", "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}), "Plain English": "Nearby profitable settings. A useful result should not depend on one exact number."},
         {"Item": "Validation and final-period comparison", "Value": benchmark_read, "Plain English": f"Middle validation advantage {candidate.excess_return_percent:+.2f}%; untouched final-period advantage {locked.excess_return_percent:+.2f}%" if locked else "Untouched final-period comparison is unavailable."},
@@ -1190,24 +1556,6 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Trend Filter": candidate.settings["moving_average_window"],
             "Pullback Average": candidate.settings["pullback_average_length"],
             "Momentum Turn": candidate.settings["momentum_turn_length"],
-            "RSI Entry Rule": "Built into strategy" if candidate.strategy_type == "rsi_scalp" else "On" if candidate.settings.get("rsi_entry_filter_enabled", False) else "Off",
-            "RSI Length": candidate.settings.get("rsi_length", 14) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "RSI Arm Level": candidate.settings.get("rsi_oversold", 30) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "RSI Arm Drop": candidate.settings.get("rsi_decline_points", 40) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "RSI Buy Rebound": candidate.settings.get("rsi_rebound_points", 3) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "RSI Sell Recovery": candidate.settings.get("rsi_sell_recovery_points", 35) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "RSI Sell Cap": candidate.settings.get("rsi_overbought", 70) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "RSI Lookback": candidate.settings.get("rsi_swing_lookback", 24) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "Stop Protection": candidate.settings.get("rsi_stop_mode", "standard_atr") if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "Emergency Stop ATR": candidate.settings.get("rsi_emergency_atr_multiplier", 5.0) if candidate.strategy_type == "rsi_scalp" else "Not used",
-            "Maximum Hold": (
-                candidate.settings.get("rsi_max_holding_bars", 100)
-                if candidate.strategy_type == "rsi_scalp" and candidate.settings.get("rsi_max_holding_enabled", True)
-                else "Off" if candidate.strategy_type == "rsi_scalp" else "Not used"
-            ),
-            "Profit-Only RSI Exit": (
-                "On" if candidate.settings.get("rsi_profit_only_exit", False) else "Off"
-            ) if candidate.strategy_type == "rsi_scalp" else "Not used",
             "Middle Validation Return %": candidate.test_return_percent,
             "Middle Validation Account Return %": candidate.test_account_return_percent,
             "Annualized Allocated Return %": candidate.test_annualized_return_percent,
@@ -1256,30 +1604,156 @@ def optimizer_interval_records(result: MultiIntervalRecommendation) -> list[dict
     return rows
 
 
+def strategy_search_ranking_records(result: MultiStrategySearchResult) -> list[dict[str, Any]]:
+    rows = []
+    for rank, strategy_result in enumerate(result.strategy_results, start=1):
+        interval_result = strategy_result.interval_results[0]
+        candidate = strategy_result.best_result.best
+        locked = strategy_result.best_result.robustness.locked_test if strategy_result.best_result.robustness else None
+        if candidate is None:
+            continue
+        older_percent, newer_percent, latest_percent = _optimizer_split_percentages(strategy_result.best_result)
+        rows.append({
+            "Rank": rank,
+            "Strategy": strategy_result.strategy_label,
+            "Best Interval": strategy_result.best_interval,
+            f"Older {older_percent}% Trades": candidate.train_trades,
+            "Historical Sample": historical_trade_evidence(candidate.train_trades),
+            f"Newer {newer_percent}% vs Buy and Hold": f"{candidate.excess_return_percent:+.2f}%",
+            f"Latest {latest_percent}% vs Buy and Hold": (
+                f"{locked.excess_return_percent:+.2f}%" if locked is not None else "Not available"
+            ),
+            "Complete History Annualized vs Buy and Hold": (
+                f"{interval_result.durability_annualized_excess_percent:+.2f}%"
+                if interval_result.durability_annualized_excess_percent is not None
+                else "Not shown"
+            ),
+            "Complete History Trades": interval_result.durability_trades,
+            "Maximum Historical Decline": f"{interval_result.durability_max_drawdown_percent:.2f}%",
+        })
+    return rows
+
+
+def strategy_search_detail_records(strategy_result: StrategySearchResult) -> list[dict[str, Any]]:
+    interval_result = strategy_result.interval_results[0]
+    recommendation = strategy_result.best_result
+    candidate = recommendation.best
+    if candidate is None:
+        return []
+    evidence = recommendation.robustness
+    locked = evidence.locked_test if evidence else None
+    diagnostics = evidence.diagnostics if evidence else None
+    older_percent, newer_percent, latest_percent = _optimizer_split_percentages(recommendation)
+    return [
+        {
+            "Price section": f"Older {older_percent}% ({interval_result.older_dates})",
+            "Strategy return": f"{candidate.train_return_percent:.2f}%",
+            "Buy and hold": f"{candidate.train_benchmark_return_percent:.2f}%",
+            "Difference": f"{candidate.train_excess_return_percent:+.2f}%",
+            "Completed trades": candidate.train_trades,
+            "Plain English": historical_trade_evidence(candidate.train_trades),
+        },
+        {
+            "Price section": f"Newer {newer_percent}% ({interval_result.newer_dates})",
+            "Strategy return": f"{candidate.test_return_percent:.2f}%",
+            "Buy and hold": f"{candidate.benchmark_return_percent:.2f}%",
+            "Difference": f"{candidate.excess_return_percent:+.2f}%",
+            "Completed trades": candidate.test_trades,
+            "Plain English": "These unchanged settings were used to choose the result from the older-price finalists.",
+        },
+        {
+            "Price section": f"Latest {latest_percent}% ({interval_result.latest_dates})",
+            "Strategy return": f"{locked.return_percent:.2f}%" if locked else "Not available",
+            "Buy and hold": f"{locked.benchmark_return_percent:.2f}%" if locked else "Not available",
+            "Difference": f"{locked.excess_return_percent:+.2f}%" if locked else "Not available",
+            "Completed trades": locked.trades if locked else 0,
+            "Plain English": (
+                "This latest section only reports what happened. It did not choose or replace the settings."
+                if locked else "Latest-price results are unavailable."
+            ),
+        },
+        {
+            "Price section": f"Complete history ({strategy_result.best_history})",
+            "Strategy return": f"{interval_result.durability_return_percent:.2f}%",
+            "Buy and hold": f"{interval_result.durability_benchmark_return_percent:.2f}%",
+            "Difference": f"{interval_result.durability_excess_return_percent:+.2f}%",
+            "Completed trades": interval_result.durability_trades,
+            "Plain English": (
+                f"Maximum historical decline was {interval_result.durability_max_drawdown_percent:.2f}%. "
+                + (
+                    f"Return without the single best trade was {diagnostics.best_trade_removed_return_percent:+.2f}%."
+                    if diagnostics else ""
+                )
+            ).strip(),
+        },
+    ]
+
+
+def strategy_search_settings_records(strategy_result: StrategySearchResult) -> list[dict[str, Any]]:
+    recommendation = strategy_result.best_result
+    candidate = recommendation.best
+    if candidate is None:
+        return []
+    evidence = recommendation.robustness
+    settings_range = evidence.parameter_range if evidence else {}
+    stable_range = bool(settings_range)
+    _, newer_percent, _ = _optimizer_split_percentages(recommendation)
+    return [
+        {
+            "Item": "Exact settings to test first",
+            "Value": _settings_text(candidate.settings),
+            "Plain English": f"These exact settings produced this strategy's best result in the newer {newer_percent}% of prices.",
+        },
+        {
+            "Item": "Other settings with similar results",
+            "Value": (
+                _parameter_range_text(candidate.strategy_type, settings_range)
+                if stable_range else "No stable nearby range found"
+            ),
+            "Plain English": (
+                "Several distinct numeric combinations produced similar results across at least two inputs."
+                if stable_range else
+                "The surrounding numeric settings did not confirm this result. It may depend on one lucky combination."
+            ),
+        },
+        {
+            "Item": "Nearby settings that beat buy-and-hold",
+            "Value": f"{candidate.plateau_profitable_percent:.0f}% of {candidate.plateau_neighbors}",
+            "Plain English": (
+                "A broader area that repeatedly beats buy-and-hold is more useful than one isolated winning setup."
+            ),
+        },
+        {
+            "Item": "Estimated trading friction",
+            "Value": "Included in the detailed cost checks",
+            "Plain English": "The strategy result includes Alpaca fees; the detailed test also shows added price slippage.",
+        },
+    ]
+
+
+def strategy_search_interval_records(strategy_result: StrategySearchResult) -> list[dict[str, Any]]:
+    rows = []
+    older_percent, newer_percent, latest_percent = _optimizer_split_percentages(strategy_result.best_result)
+    for interval_result in strategy_result.interval_results:
+        candidate = interval_result.recommendation.best
+        locked = interval_result.recommendation.robustness.locked_test if interval_result.recommendation.robustness else None
+        if candidate is None:
+            continue
+        rows.append({
+            "Interval": interval_result.interval,
+            "History": interval_result.history,
+            f"Older {older_percent}% Trades": candidate.train_trades,
+            f"Older {older_percent}% vs Buy and Hold": f"{candidate.train_excess_return_percent:+.2f}%",
+            f"Newer {newer_percent}% vs Buy and Hold": f"{candidate.excess_return_percent:+.2f}%",
+            f"Latest {latest_percent}% vs Buy and Hold": f"{locked.excess_return_percent:+.2f}%" if locked else "Not available",
+            "Complete History vs Buy and Hold": f"{interval_result.durability_excess_return_percent:+.2f}%",
+            "Complete History Trades": interval_result.durability_trades,
+        })
+    return rows
+
+
 def _settings_text(settings: dict[str, Any]) -> str:
     strategy_type = str(settings.get("strategy_type", ""))
-    if strategy_type == "rsi_scalp":
-        stop_mode = str(settings.get("rsi_stop_mode", "standard_atr"))
-        parts = [
-            f"RSI length {int(settings.get('rsi_length', 14))}",
-            f"arm at RSI {float(settings.get('rsi_oversold', 30)):.0f} or a {float(settings.get('rsi_decline_points', 40)):.0f}-point drop",
-            f"buy after a {float(settings.get('rsi_rebound_points', 3)):.0f}-point rebound",
-            f"sell after a {float(settings.get('rsi_sell_recovery_points', 35)):.0f}-point recovery or RSI {float(settings.get('rsi_overbought', 70)):.0f}",
-            "require price above estimated fee-adjusted break-even"
-            if settings.get("rsi_profit_only_exit", False)
-            else "allow RSI exits below entry",
-            f"stop protection {stop_mode.replace('_', ' ')}",
-            (
-                f"maximum hold {int(settings.get('rsi_max_holding_bars', 100))} bars"
-                if settings.get("rsi_max_holding_enabled", True)
-                else "maximum hold off"
-            ),
-        ]
-        if stop_mode == "standard_atr":
-            parts.append(f"stop {float(settings['atr_stop_multiplier']):.2f}x ATR")
-        elif stop_mode == "emergency_atr":
-            parts.append(f"emergency stop {float(settings.get('rsi_emergency_atr_multiplier', 5.0)):.2f}x ATR")
-        return "; ".join(parts)
     parts = []
     if strategy_type != "pullback":
         parts.append(f"buy lookback {int(settings['entry_window'])}")
@@ -1292,11 +1766,6 @@ def _settings_text(settings: dict[str, Any]) -> str:
         parts.append(f"pullback average {int(settings['pullback_average_length'])}")
     if strategy_type in {"pullback", "trendline_retest"}:
         parts.append(f"momentum turn {int(settings['momentum_turn_length'])}")
-    parts.append(
-        "require RSI 50-70"
-        if settings.get("rsi_entry_filter_enabled", False)
-        else "RSI entry rule off"
-    )
     return "; ".join(parts)
 
 
@@ -1425,6 +1894,14 @@ def _evaluate_optimizer_candidate(
         risk_limits,
         elapsed_years(train_data.index),
     )
+    allocation = ticker_allocated_capital(account_equity, risk_limits)
+    train_benchmark = buy_and_hold_benchmark(
+        data,
+        account_equity,
+        start=0,
+        end=split_index,
+        allocated_capital=allocation,
+    )
 
     oos_start = max(0, split_index - warmup_bars)
     warmup_offset = split_index - oos_start
@@ -1443,7 +1920,6 @@ def _evaluate_optimizer_candidate(
         risk_limits,
         elapsed_years(data.index, start=split_index, end=locked_start),
     )
-    allocation = ticker_allocated_capital(account_equity, risk_limits)
     benchmark = buy_and_hold_benchmark(
         data,
         account_equity,
@@ -1468,22 +1944,11 @@ def _evaluate_optimizer_candidate(
     win_rate = float(oos_stats["win_rate"])
     train_return = float(train_stats["allocated_return_pct"])
     train_trades = int(train_stats["total_trades"])
+    train_excess_return = train_return - train_benchmark.return_percent
     profitable_periods = sum(value > 0 for value in period_pnl)
-    trade_penalty = 8.0 if test_trades < min_test_trades else 0.0
-    drawdown_penalty = max(0.0, drawdown - target_max_drawdown_percent) * 0.9
-    degradation_penalty = max(0.0, train_return - return_pct) * 0.15
-    profit_factor_bonus = min(profit_factor, 3.0) * 2.0 if profit_factor > 0 else 0.0
-    trade_bonus = min(test_trades, 8) * 0.4
-    stability_bonus = profitable_periods * 1.25
-    concentration_penalty = 3.0 if tested_periods > 1 and profitable_periods <= 1 else 0.0
     excess_return = return_pct - benchmark.return_percent
     drawdown_advantage = benchmark.max_drawdown_percent - drawdown
-    score = round(
-        return_pct + profit_factor_bonus + trade_bonus + stability_bonus
-        + excess_return * 0.65 + drawdown_advantage * 0.20
-        - drawdown * 0.35 - drawdown_penalty - degradation_penalty - trade_penalty - concentration_penalty,
-        2,
-    )
+    score = round(excess_return, 2)
     confidence = _optimizer_confidence(score, test_trades, drawdown, return_pct, profitable_periods, tested_periods)
     concern = _optimizer_concern(test_trades, drawdown, return_pct, train_return, min_test_trades)
     reason = (
@@ -1515,6 +1980,8 @@ def _evaluate_optimizer_candidate(
         tested_periods=tested_periods,
         train_return_percent=round(train_return, 2),
         train_trades=train_trades,
+        train_benchmark_return_percent=train_benchmark.return_percent,
+        train_excess_return_percent=round(train_excess_return, 2),
         stability=_stability_read(score, test_trades, drawdown, train_return, return_pct, profitable_periods, tested_periods),
         recommended_risk_per_trade_percent=recommended_risk,
         validation_trade_returns=trade_returns,
@@ -1558,24 +2025,48 @@ def _evaluate_range(
 def _attach_plateau_scores(candidates: list[OptimizerCandidate]) -> list[OptimizerCandidate]:
     updated = []
     for candidate in candidates:
-        neighbors = [
-            row for row in candidates
-            if row.strategy_type == candidate.strategy_type
-            and _settings_distance(candidate.settings, row.settings) <= 2.5
-        ]
-        returns = [row.test_return_percent for row in neighbors]
-        median_return = float(median(returns)) if returns else candidate.test_return_percent
+        neighbors = _distinct_numeric_neighbors(candidate, candidates)
+        returns = [row.excess_return_percent for row in neighbors]
+        median_return = float(median(returns)) if returns else candidate.excess_return_percent
         profitable_percent = sum(value > 0 for value in returns) / len(returns) * 100 if returns else 0.0
-        isolation_penalty = 2.0 if len(neighbors) < 3 else 0.0
-        plateau_adjustment = median_return * 0.25 + (profitable_percent / 100 - 0.5) * 3.0 - isolation_penalty
         updated.append(replace(
             candidate,
-            score=round(candidate.score + plateau_adjustment, 2),
             plateau_neighbors=len(neighbors),
             plateau_median_return_percent=round(median_return, 2),
             plateau_profitable_percent=round(profitable_percent, 1),
         ))
     return updated
+
+
+def _distinct_numeric_neighbors(
+    candidate: OptimizerCandidate,
+    candidates: list[OptimizerCandidate],
+) -> list[OptimizerCandidate]:
+    neighbors: dict[tuple[str, tuple[tuple[str, float | int], ...]], OptimizerCandidate] = {}
+    for row in candidates:
+        if row.strategy_type != candidate.strategy_type:
+            continue
+        if _settings_distance(candidate.settings, row.settings) > 3.5:
+            continue
+        identity = _optimizer_settings_identity(row.strategy_type, row.settings)
+        existing = neighbors.get(identity)
+        if existing is None or row.excess_return_percent > existing.excess_return_percent:
+            neighbors[identity] = row
+    return list(neighbors.values())
+
+
+def _similar_profitable_neighbors(
+    best: OptimizerCandidate,
+    candidates: list[OptimizerCandidate],
+) -> list[OptimizerCandidate]:
+    if best.excess_return_percent <= 0:
+        return []
+    tolerance = max(1.0, abs(best.excess_return_percent) * 0.20)
+    return [
+        row for row in _distinct_numeric_neighbors(best, candidates)
+        if row.excess_return_percent > 0
+        and row.excess_return_percent >= best.excess_return_percent - tolerance
+    ]
 
 
 def _rolling_evidence(
@@ -1618,24 +2109,14 @@ def _parameter_plateau_range(
     best: OptimizerCandidate,
     candidates: list[OptimizerCandidate],
 ) -> dict[str, tuple[float, float]]:
-    neighbors = [
-        row for row in candidates
-        if row.strategy_type == best.strategy_type
-        and row.test_return_percent >= 0
-        and _settings_distance(best.settings, row.settings) <= 2.5
-    ] or [best]
-    keys = (
-        (
-            "rsi_length", "rsi_oversold", "rsi_overbought", "rsi_decline_points",
-            "rsi_rebound_points", "rsi_sell_recovery_points", "rsi_swing_lookback",
-            "rsi_max_holding_bars", "atr_stop_multiplier",
-        )
-        if best.strategy_type == "rsi_scalp"
-        else (
-            "entry_window", "exit_window", "atr_stop_multiplier", "moving_average_window",
-            "pullback_average_length", "momentum_turn_length",
-        )
+    neighbors = _similar_profitable_neighbors(best, candidates)
+    keys = _optimizer_numeric_keys(best.strategy_type)
+    varied_keys = sum(
+        len({row.settings[key] for row in neighbors}) > 1
+        for key in keys
     )
+    if len(neighbors) < 4 or varied_keys < 2:
+        return {}
     return {
         key: (
             min(float(row.settings[key]) for row in neighbors),

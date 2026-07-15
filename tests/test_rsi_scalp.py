@@ -162,7 +162,7 @@ def test_saved_rsi_setup_low_drives_worker_exit():
     assert details["rsi_sell_level"] == 55.0
 
 
-def test_optimizer_and_buy_watchlist_preserve_rsi_inputs():
+def test_optimizer_excludes_rsi_while_buy_watchlist_preserves_rsi_inputs():
     settings = rsi_settings() | {
         "entry_window": 20,
         "exit_window": 10,
@@ -172,8 +172,7 @@ def test_optimizer_and_buy_watchlist_preserve_rsi_inputs():
     }
     candidates = generate_optimizer_settings(settings, max_candidates_per_strategy=18)
     rsi_candidates = [row for _, kind, row in candidates if kind == "rsi_scalp"]
-    assert rsi_candidates
-    assert any(row["rsi_sell_recovery_points"] != settings["rsi_sell_recovery_points"] for row in rsi_candidates)
+    assert not rsi_candidates
 
     plan = BuyWatchPlan(
         plan_id="test",

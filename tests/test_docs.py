@@ -129,7 +129,33 @@ def test_strategy_decision_sections_have_plain_language_helpers():
 
     assert "It answers which of those five exact strategies fits the ticker now; it does not search for better settings." in text
     assert "This table does not search for better settings" in text
-    assert "Use this as the strongest candidate for paper testing" in text
+    assert "The older 55% of prices finds useful regions" in text
+    assert "the newer 25% chooses among those regions" in text
+    assert "the latest 20% " in text
+    assert "only reports what happened afterward" in text
+    assert "RSI rules are not part of this search" in text
+
+
+def test_long_ticker_load_shows_numerical_progress_through_backtests():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert "load_progress_bar = st.progress(" in text
+    assert "Downloading completed price bars (step 1 of 3)" in text
+    assert "Running five backtests across" in text
+    assert "Building decisions, tables, and charts (step 3 of 3)" in text
+    assert 'load_progress_bar.progress(1.0, text=f"{ticker} is ready")' in text
+
+
+def test_sidebar_risk_ranges_allow_smaller_limits_without_changing_defaults():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert '"Strategy risk per trade (%)",\n    0.25,\n    3.0,\n    0.5,\n    step=0.25' in text
+    assert '"Max risk per trade (%)",\n    0.10,\n    5.0,\n    0.5,\n    step=0.05' in text
+    assert '"Max new order size (%)",\n    2.0,\n    100.0,\n    5.0,\n    step=1.0' in text
+    assert '"Max symbol concentration (%)",\n    2.0,\n    100.0,\n    5.0,\n    step=1.0' in text
+    assert '"Max daily loss (%)",\n    0.25,\n    10.0,\n    2.0,\n    step=0.25' in text
+    assert '"Max open positions",\n    1,\n    30,\n    20,\n    step=1' in text
+    assert 'max(0.25, min(3.0, round(optimizer_risk_pct * 4) / 4))' in text
 
 
 def test_buy_watchlist_readiness_distinguishes_worker_state_from_market_hours():

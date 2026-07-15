@@ -57,6 +57,7 @@ from agentloop_trader.strategy_levels import build_buy_level_snapshot
 _BAR_CACHE: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
 _BAR_CACHE_SECONDS = {"1m": 30, "5m": 60, "15m": 120, "30m": 180, "1h": 300, "4h": 900, "1d": 1800}
 SLEEP_RESUME_GRACE_SECONDS = 10.0
+UNFILLED_ORDER_END_STATUSES = {"canceled", "expired", "rejected", "done_for_day"}
 
 
 def _number(value: Any, default: float = 0.0) -> float:
@@ -132,6 +133,88 @@ def _open_buy_order_symbols(orders: list[dict]) -> set[str]:
         for row in orders
         if _enum_value(row.get("Side")) == "buy" and _enum_value(row.get("Status")) in OPEN_ORDER_STATUSES
     }
+
+
+def _broker_order_id(order: dict[str, Any] | None) -> str:
+    if not order:
+        return ""
+    return str(
+        order.get("Alpaca Order ID")
+        or order.get("Broker Order ID")
+        or order.get("broker_order_id")
+        or ""
+    ).strip()
+
+
+def _order_symbol(order: dict[str, Any]) -> str:
+    return str(order.get("Symbol") or order.get("symbol") or "").strip().upper()
+
+
+def _order_side(order: dict[str, Any]) -> str:
+    return _enum_value(order.get("Side") if "Side" in order else order.get("side"))
+
+
+def _order_status(order: dict[str, Any] | None) -> str:
+    if not order:
+        return ""
+    return _enum_value(order.get("Status") if "Status" in order else order.get("status"))
+
+
+def _order_filled_quantity(order: dict[str, Any] | None) -> float:
+    if not order:
+        return 0.0
+    return _number(
+        order.get("Filled Qty")
+        if "Filled Qty" in order
+        else order.get("filled_quantity"),
+    )
+
+
+def _tracked_plan_id(order: dict[str, Any]) -> str:
+    settings = order.get("strategy_settings") or order.get("exit_settings") or {}
+    return str(settings.get("buy_watch_plan_id") or "").strip() if isinstance(settings, dict) else ""
+
+
+def _order_for_watch_plan(
+    plan: BuyWatchPlan,
+    orders: list[dict],
+    tracked_orders: list[dict],
+) -> dict[str, Any] | None:
+    """Find the queued setup's own order without adopting unrelated manual orders."""
+    all_orders = [*orders, *tracked_orders]
+    if plan.active_order_id:
+        matches = [row for row in all_orders if _broker_order_id(row) == plan.active_order_id]
+        if matches:
+            return max(matches, key=lambda row: bool(_order_status(row)))
+
+    tagged = [row for row in tracked_orders if _tracked_plan_id(row) == plan.plan_id]
+    if tagged:
+        return max(tagged, key=lambda row: _parse_time(row.get("submitted_at") or row.get("Submitted")) or datetime.min.replace(tzinfo=PACIFIC_TIME))
+
+    sent_at = _parse_time(plan.order_sent_at)
+    if sent_at is None:
+        return None
+    legacy_matches: list[tuple[float, dict[str, Any]]] = []
+    for row in tracked_orders:
+        if _order_symbol(row) != plan.symbol.strip().upper() or _order_side(row) != "buy":
+            continue
+        if str(row.get("source") or "").strip().lower() == "manual_order":
+            continue
+        submitted_at = _parse_time(row.get("submitted_at") or row.get("Submitted"))
+        if submitted_at is None:
+            continue
+        difference = abs((submitted_at - sent_at).total_seconds())
+        if difference <= 600:
+            legacy_matches.append((difference, row))
+    return min(legacy_matches, key=lambda item: item[0])[1] if legacy_matches else None
+
+
+def _order_finished_without_fill(order: dict[str, Any] | None) -> bool:
+    return bool(
+        order
+        and _order_status(order) in UNFILLED_ORDER_END_STATUSES
+        and _order_filled_quantity(order) <= 0
+    )
 
 
 def _open_symbols(positions: list[dict]) -> set[str]:
@@ -424,7 +507,7 @@ def _control_for_watch_plan(control: AutomationControl, plan: BuyWatchPlan) -> A
         price_data_source=plan.price_data_source,
         history=plan.history,
         interval=plan.interval,
-        strategy_settings=dict(plan.strategy_settings),
+        strategy_settings=dict(plan.strategy_settings) | {"buy_watch_plan_id": plan.plan_id},
         risk_limits=saved_risk_limits,
         order_style=plan.order_style,
         limit_adjustment_pct=float(plan.limit_adjustment_pct),
@@ -535,38 +618,127 @@ def _send_watchlist_entries(
             clean_symbol = plan.symbol.strip().upper()
             position_open = clean_symbol in _open_symbols(current_positions)
             buy_order_open = clean_symbol in _open_buy_order_symbols(current_orders)
+            owned_order = _order_for_watch_plan(plan, current_orders, tracked)
+            owned_order_id = _broker_order_id(owned_order) or plan.active_order_id
+            owned_order_open = _order_status(owned_order) in OPEN_ORDER_STATUSES
+            owned_order_filled = _order_filled_quantity(owned_order) > 0 or _order_status(owned_order) == "filled"
             if position_open:
+                queue_owns_position = bool(
+                    plan.cycle_had_filled_position
+                    or owned_order_filled
+                    or (plan.cycle_state == "order_pending" and owned_order_id)
+                )
                 store.update(
                     plan.plan_id,
-                    cycle_state="position_open",
+                    cycle_state="position_open" if queue_owns_position else "blocked_by_position",
+                    cycle_had_filled_position=queue_owns_position,
+                    active_order_id=owned_order_id if queue_owns_position else plan.active_order_id,
                     status="Position open",
-                    detail="Repeat after exit is On. Waiting for this position to close before looking for another BUY.",
+                    detail=(
+                        "Repeat after exit is On. This queued order filled; waiting for its position to close before looking for another BUY."
+                        if queue_owns_position
+                        else "A separate position is open for this ticker. This queued setup will resume when that position closes."
+                    ),
                     last_checked_at=checked_at,
                 )
                 messages.append(f"{plan.symbol} {plan.strategy_label}: position open; repeat remains on.")
                 continue
-            if buy_order_open:
+            if owned_order_open:
                 store.update(
                     plan.plan_id,
                     cycle_state="order_pending",
+                    active_order_id=owned_order_id,
                     status="Buy order active",
-                    detail="Repeat after exit is On. Waiting for the current buy order to fill or finish.",
+                    detail="Repeat after exit is On. Waiting for this setup's current buy order to fill or finish.",
                     last_checked_at=checked_at,
                 )
                 messages.append(f"{plan.symbol} {plan.strategy_label}: buy order active; repeat remains on.")
                 continue
-            if plan.cycle_state in {"order_pending", "position_open"}:
+            if buy_order_open:
+                store.update(
+                    plan.plan_id,
+                    cycle_state="blocked_by_order",
+                    status="Other buy order open",
+                    detail="A separate buy order is open for this ticker. This queued setup will resume when that order finishes.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: another buy order is open.")
+                continue
+            if plan.cycle_state in {"blocked_by_position", "blocked_by_order"}:
+                store.update(
+                    plan.plan_id,
+                    cycle_state="waiting_for_buy",
+                    cycle_had_filled_position=False,
+                    status="Waiting for BUY",
+                    detail="The separate position or order finished. Checking this saved setup for a BUY again.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: separate position or order finished; queue resumed.")
+                continue
+            if plan.cycle_state == "order_pending":
+                if _order_finished_without_fill(owned_order):
+                    store.update(
+                        plan.plan_id,
+                        cycle_state="waiting_for_retry",
+                        last_cycle_completed_at=plan.last_cycle_completed_at or checked_at,
+                        cycle_had_filled_position=False,
+                        active_order_id=owned_order_id,
+                        status="Waiting to retry",
+                        detail=(
+                            "This setup's previous buy order was canceled without filling. It may retry after the saved wait time "
+                            "if the BUY requirements still pass; the signal does not need to turn off first."
+                        ),
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: unfilled order ended; waiting to retry.")
+                    continue
+                if owned_order_filled:
+                    store.update(
+                        plan.plan_id,
+                        cycle_state="waiting_for_signal_reset",
+                        last_cycle_completed_at=plan.last_cycle_completed_at or checked_at,
+                        cycle_had_filled_position=True,
+                        active_order_id=owned_order_id,
+                        status="Waiting for a new BUY",
+                        detail="The queued order filled and its position has closed. The prior BUY signal must turn off before buying again.",
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: filled cycle finished; waiting for a new BUY signal.")
+                    continue
+                store.update(
+                    plan.plan_id,
+                    status="Checking prior order",
+                    detail="The queued order is no longer open, but its final fill or cancellation status is not available yet.",
+                    last_checked_at=checked_at,
+                )
+                messages.append(f"{plan.symbol} {plan.strategy_label}: waiting for the prior order's final status.")
+                continue
+            if plan.cycle_state == "position_open":
                 store.update(
                     plan.plan_id,
                     cycle_state="waiting_for_signal_reset",
                     last_cycle_completed_at=checked_at,
+                    cycle_had_filled_position=True,
                     status="Waiting for a new BUY",
-                    detail="The previous order or position finished. The prior BUY signal must turn off before this setup can buy again.",
+                    detail="The queued position closed. The prior BUY signal must turn off before this setup can buy again.",
                     last_checked_at=checked_at,
                 )
-                messages.append(f"{plan.symbol} {plan.strategy_label}: previous cycle finished; waiting for the BUY signal to reset.")
+                messages.append(f"{plan.symbol} {plan.strategy_label}: filled cycle finished; waiting for the BUY signal to reset.")
                 continue
             if plan.cycle_state == "waiting_for_signal_reset":
+                if not plan.cycle_had_filled_position and _order_finished_without_fill(owned_order):
+                    store.update(
+                        plan.plan_id,
+                        cycle_state="waiting_for_retry",
+                        status="Waiting to retry",
+                        detail=(
+                            "The previous queued buy was canceled without filling. It may retry after the saved wait time "
+                            "without requiring the BUY signal to turn off."
+                        ),
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: corrected unfilled order state; waiting to retry.")
+                    continue
                 signal_active, signal_error = _repeat_signal_state(plan_control, adapter, fetch_bars)
                 if signal_active is None:
                     store.update(
@@ -588,11 +760,35 @@ def _send_watchlist_entries(
                     store.update(
                         plan.plan_id,
                         cycle_state="waiting_for_buy",
+                        cycle_had_filled_position=False,
+                        active_order_id="",
                         status="Waiting for BUY",
                         detail="Repeat after exit is On. The prior signal cleared; waiting for a new BUY signal.",
                         last_checked_at=checked_at,
                     )
                     messages.append(f"{plan.symbol} {plan.strategy_label}: signal reset; waiting for a new BUY.")
+                continue
+            if plan.cycle_state == "waiting_for_retry":
+                retry_wait = _repeat_cooldown_remaining(plan, datetime.now(PACIFIC_TIME))
+                if retry_wait > 0:
+                    store.update(
+                        plan.plan_id,
+                        status="Waiting to retry",
+                        detail=f"The previous buy was canceled without filling. Retrying in about {retry_wait:.0f} minutes if BUY requirements still pass.",
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: waiting before retrying the unfilled buy.")
+                else:
+                    store.update(
+                        plan.plan_id,
+                        cycle_state="waiting_for_buy",
+                        active_order_id="",
+                        cycle_had_filled_position=False,
+                        status="Waiting for BUY",
+                        detail="The unfilled-order wait is complete. Checking the saved BUY requirements again.",
+                        last_checked_at=checked_at,
+                    )
+                    messages.append(f"{plan.symbol} {plan.strategy_label}: unfilled-order wait complete; queue rearmed.")
                 continue
             cooldown_remaining = _repeat_cooldown_remaining(plan, datetime.now(PACIFIC_TIME))
             if cooldown_remaining > 0:
@@ -642,10 +838,13 @@ def _send_watchlist_entries(
         if count:
             sent += count
             if plan.repeat_after_exit:
+                submitted_order_id = _broker_order_id(tracked[-1]) if tracked else ""
                 store.update(
                     plan.plan_id,
                     enabled=True,
                     cycle_state="order_pending",
+                    active_order_id=submitted_order_id,
+                    cycle_had_filled_position=False,
                     status="Buy order sent",
                     detail="Repeat after exit is On. Waiting for this order and position cycle to finish.",
                     last_checked_at=checked_at,
