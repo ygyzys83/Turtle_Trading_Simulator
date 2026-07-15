@@ -15,6 +15,7 @@ from agentloop_trader.backtest import (
     simulate_turtle_strategy,
 )
 from agentloop_trader.fees import fee_adjusted_break_even_price
+from agentloop_trader.indicators import calc_rsi
 from agentloop_trader.models import RiskLimits, TradeIntent
 from agentloop_trader.strategy_levels import build_buy_level_snapshot
 
@@ -79,6 +80,7 @@ def _run_one(
             rsi_overbought=float(settings.get("rsi_overbought", 70.0)),
             rsi_decline_points=float(settings.get("rsi_decline_points", 40.0)),
             rsi_rebound_points=float(settings.get("rsi_rebound_points", 3.0)),
+            rsi_max_rebound_points=float(settings.get("rsi_max_rebound_points", 12.0)),
             rsi_sell_recovery_points=float(settings.get("rsi_sell_recovery_points", 35.0)),
             rsi_swing_lookback=int(settings.get("rsi_swing_lookback", 24)),
             rsi_stop_mode=str(settings.get("rsi_stop_mode", "standard_atr")),
@@ -301,6 +303,24 @@ def evaluate_exit_settings(
         profit_r = (current_price - entry) / initial_risk if current_price is not None and entry is not None and initial_risk else None
 
         entry_time = _parse_time(settings.get("entry_filled_at") or settings.get("entry_submitted_at"))
+        last_completed_bar_at = data.index[-1].isoformat() if not data.empty else None
+        highest_rsi_since_entry = current_rsi
+        if rsi_strategy and not data.empty and "Close" in data.columns:
+            rsi_values = pd.Series(
+                calc_rsi(data["Close"].to_numpy(), int(settings.get("rsi_length", 14))),
+                index=data.index,
+                dtype="float64",
+            )
+            if entry_time is not None:
+                compare_rsi_time = (
+                    entry_time.tz_convert(data.index.tz)
+                    if getattr(data.index, "tz", None)
+                    else entry_time.tz_localize(None)
+                )
+                rsi_values = rsi_values.loc[rsi_values.index >= compare_rsi_time]
+            rsi_values = rsi_values.dropna()
+            if not rsi_values.empty:
+                highest_rsi_since_entry = float(rsi_values.max())
         high_data = data.tail(1) if entry_time is None else data.iloc[0:0]
         bars_since_entry = 0
         has_complete_post_entry_bar = False
@@ -433,6 +453,7 @@ def evaluate_exit_settings(
             "highest_profit_r": highest_profit_r,
             "current_atr": current_atr,
             "current_rsi": current_rsi,
+            "highest_rsi_since_entry": highest_rsi_since_entry if rsi_strategy else None,
             "rsi_sell_level": rsi_sell_level,
             "rsi_exit_signal_ready": rsi_exit_signal_ready,
             "rsi_profit_only_exit": rsi_profit_only_exit if rsi_strategy else None,
@@ -445,6 +466,7 @@ def evaluate_exit_settings(
             "max_holding_bars": max_holding_bars if rsi_strategy and max_holding_enabled else None,
             "time_exit_ready": time_exit_ready,
             "interval": interval,
+            "last_completed_bar_at": last_completed_bar_at,
             "exit_window": int(settings.get("exit_window", 10)),
             "atr_multiplier": atr_mult,
             "trailing_atr_multiplier": trail_mult,

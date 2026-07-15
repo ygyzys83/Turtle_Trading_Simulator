@@ -482,6 +482,7 @@ def position_exit_plan_records(
         rows.extend([
             {"Field": "RSI Length", "Value": _bars(settings.get("rsi_length"))},
             {"Field": "RSI Setup Low At Entry", "Value": str(settings.get("entry_rsi_setup_low", "Not recorded"))},
+            {"Field": "Maximum RSI Rebound Allowed For Buy", "Value": f"{settings.get('rsi_max_rebound_points', 12)} points"},
             {"Field": "Sell After RSI Recovery", "Value": f"{settings.get('rsi_sell_recovery_points', 35)} points"},
             {"Field": "RSI Sell Cap", "Value": str(settings.get("rsi_overbought", 70))},
             {"Field": "Stop Protection", "Value": str(settings.get("rsi_stop_mode", "standard_atr")).replace("_", " ").title()},

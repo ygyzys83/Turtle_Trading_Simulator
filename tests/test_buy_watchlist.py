@@ -134,7 +134,6 @@ def test_saved_setup_can_restore_matching_sidebar_inputs():
             "auto_cancel_stale_limit_orders": True,
             "stale_limit_order_minutes": 120,
             "allow_limit_buys_outside_market_hours": True,
-            "max_auto_buys_per_session": 4,
             "reentry_cooldown_minutes": 120,
         },
         risk_limits={

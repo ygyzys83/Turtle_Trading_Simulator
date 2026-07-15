@@ -158,6 +158,17 @@ def test_sidebar_risk_ranges_allow_smaller_limits_without_changing_defaults():
     assert 'max(0.25, min(3.0, round(optimizer_risk_pct * 4) / 4))' in text
 
 
+def test_daily_loss_replaces_automatic_buy_count_cap():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+    worker = (ROOT / "agentloop_trader" / "worker.py").read_text(encoding="utf-8")
+
+    assert "Max automatic buys this session" not in text
+    assert "max_auto_buys_per_session" not in text
+    assert "max_auto_buys_per_session" not in worker
+    assert "Stops new BUY orders when today's Alpaca account loss reaches this percentage" in text
+    assert "It does not turn on the Kill Switch" in text
+
+
 def test_buy_watchlist_readiness_distinguishes_worker_state_from_market_hours():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 

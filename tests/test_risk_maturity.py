@@ -58,7 +58,7 @@ def test_risk_rejects_session_loss_breach():
     assert any("Daily loss" in reason for reason in result.rejected_reasons)
 
 
-def test_daily_loss_limit_uses_prior_day_equity_not_reduced_current_equity():
+def test_daily_loss_limit_stops_new_buys_at_exact_prior_day_equity_threshold():
     result = check_trade_intent(
         _intent(),
         account_equity=98_000,
@@ -66,8 +66,9 @@ def test_daily_loss_limit_uses_prior_day_equity_not_reduced_current_equity():
         session_pnl=-2_000,
     )
 
-    assert result.approved
-    assert result.checks["session_loss_within_limit"]
+    assert not result.approved
+    assert not result.checks["session_loss_within_limit"]
+    assert any("reached max $2,000.00" in reason for reason in result.rejected_reasons)
 
 
 def test_preflight_reports_ready_when_risk_execution_broker_and_audit_pass():

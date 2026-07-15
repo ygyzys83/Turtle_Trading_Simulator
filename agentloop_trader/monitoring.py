@@ -34,10 +34,10 @@ def monitor_paper_session(
     if limits.kill_switch_enabled:
         status = "BREACH"
         alerts.append("Kill Switch is on.")
-    if session_loss_pct > limits.max_session_loss_pct:
+    if session_loss_pct >= limits.max_session_loss_pct:
         status = "BREACH"
         alerts.append(
-            f"Daily loss {session_loss_pct:.2f}% exceeds max {limits.max_session_loss_pct:.2f}%."
+            f"Daily loss {session_loss_pct:.2f}% reached max {limits.max_session_loss_pct:.2f}%."
         )
     if exposure_pct > limits.max_portfolio_exposure_pct:
         status = "BREACH"

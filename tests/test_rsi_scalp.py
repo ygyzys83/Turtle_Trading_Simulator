@@ -1,7 +1,7 @@
 import numpy as np
 import pandas as pd
 
-from agentloop_trader.backtest import simulate_rsi_mean_reversion_strategy
+from agentloop_trader.backtest import _rsi_scalp_live_setup, simulate_rsi_mean_reversion_strategy
 from agentloop_trader.buy_watchlist import BuyWatchPlan, buy_watch_plan_detail_records
 from agentloop_trader.models import RiskLimits
 from agentloop_trader.parameter_loop import generate_optimizer_settings
@@ -33,6 +33,7 @@ def rsi_settings() -> dict:
         "rsi_overbought": 70.0,
         "rsi_decline_points": 25.0,
         "rsi_rebound_points": 3.0,
+        "rsi_max_rebound_points": 12.0,
         "rsi_sell_recovery_points": 30.0,
         "rsi_swing_lookback": 24,
         "rsi_stop_mode": "standard_atr",
@@ -51,6 +52,25 @@ def test_rsi_scalp_is_a_first_class_strategy_and_backtests():
     assert result["live"]["rsi_sell_level"] is not None
     assert result["stats"]["total_trades"] > 0
     assert all("entry_rsi_setup_low" in trade for trade in result["trade_log"])
+
+
+def test_rsi_scalp_rejects_a_completed_bar_that_rebounded_too_far():
+    ready, armed, setup_low, _, _, rebound, too_large = _rsi_scalp_live_setup(
+        prices=[100.0, 90.0, 89.0, 95.0],
+        rsis=[60.0, 20.0, 23.0, 35.0],
+        index=3,
+        oversold=30.0,
+        decline_points=40.0,
+        rebound_points=3.0,
+        max_rebound_points=12.0,
+        swing_lookback=24,
+    )
+
+    assert ready is False
+    assert armed is False
+    assert setup_low == 20.0
+    assert rebound == 15.0
+    assert too_large is True
 
 
 def test_rsi_scalp_uses_rsi_recovery_or_time_exit_with_atr_protection():
@@ -188,3 +208,4 @@ def test_optimizer_excludes_rsi_while_buy_watchlist_preserves_rsi_inputs():
     assert "RSI swing lookback" in labels
     assert "Stop protection" in labels
     assert "Maximum holding period" in labels
+    assert "Maximum RSI rebound allowed for buy" in labels

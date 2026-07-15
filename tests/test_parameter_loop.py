@@ -39,7 +39,10 @@ from agentloop_trader.parameter_loop import (
     strategy_search_interval_records,
     strategy_search_ranking_records,
     strategy_search_settings_records,
+    strategy_input_search_identity,
     validate_settings_across_tickers,
+    _attach_plateau_scores,
+    _parameter_plateau_range,
 )
 
 
@@ -195,6 +198,84 @@ def test_optimizer_candidate_subset_varies_more_than_one_input_dimension():
     assert len({row["moving_average_window"] for row in breakout}) > 1
 
 
+def test_optimizer_sampling_is_independent_of_displayed_strategy_inputs():
+    first = generate_optimizer_settings(
+        CURRENT_SETTINGS,
+        max_candidates_per_strategy=8,
+    )
+    second = generate_optimizer_settings(
+        {
+            **CURRENT_SETTINGS,
+            "strategy_type": "pullback",
+            "strategy_label": "Trend pullback continuation",
+            "entry_window": 5,
+            "exit_window": 30,
+            "atr_stop_multiplier": 5.0,
+            "moving_average_window": 200,
+            "pullback_average_length": 150,
+            "momentum_turn_length": 20,
+            "rsi_entry_filter_enabled": True,
+            "rsi_length": 7,
+        },
+        max_candidates_per_strategy=8,
+    )
+
+    assert first == second
+
+
+def test_real_price_search_identity_ignores_display_interval_history_and_refresh():
+    common = {
+        "ticker": "TSLA",
+        "data_source": "Ticker (Alpaca)",
+        "risk_per_trade_pct": 0.5,
+        "risk_limits": {"max_symbol_concentration_pct": 5.0},
+        "settings_per_strategy": 64,
+    }
+
+    first = strategy_input_search_identity(
+        **common,
+        display_interval="15m",
+        display_history="3mo",
+        market_fingerprint="first-price-snapshot",
+    )
+    second = strategy_input_search_identity(
+        **common,
+        display_interval="1d",
+        display_history="10y",
+        market_fingerprint="later-price-snapshot",
+    )
+
+    assert first == second
+
+
+def test_search_identity_changes_for_material_assumptions_and_synthetic_data():
+    common = {
+        "ticker": "TSLA",
+        "data_source": "Ticker (Alpaca)",
+        "risk_per_trade_pct": 0.5,
+        "risk_limits": {"max_symbol_concentration_pct": 5.0},
+        "settings_per_strategy": 64,
+    }
+    original = strategy_input_search_identity(**common)
+
+    assert original != strategy_input_search_identity(**{**common, "ticker": "NVDA"})
+    assert original != strategy_input_search_identity(**{**common, "risk_per_trade_pct": 0.25})
+    assert original != strategy_input_search_identity(
+        **{**common, "risk_limits": {"max_symbol_concentration_pct": 2.0}}
+    )
+    assert strategy_input_search_identity(
+        **{**common, "data_source": "Synthetic"},
+        display_interval="1h",
+        display_history="1y",
+        market_fingerprint="one",
+    ) != strategy_input_search_identity(
+        **{**common, "data_source": "Synthetic"},
+        display_interval="1h",
+        display_history="1y",
+        market_fingerprint="two",
+    )
+
+
 def test_optimizer_excludes_all_rsi_rules_and_rsi_strategy():
     rows = generate_optimizer_settings(CURRENT_SETTINGS, max_candidates_per_strategy=2)
 
@@ -292,8 +373,8 @@ def test_multi_strategy_search_returns_one_ranked_result_for_each_strategy():
         assert setting_rows
         assert next(
             row["Value"] for row in setting_rows
-            if row["Item"] == "Other settings with similar results"
-        ) == "No stable nearby range found"
+            if row["Item"] == "Input stability"
+        ) == "Isolated result"
         assert strategy_result.best_result.best.confidence == "Low"
         assert strategy_search_interval_records(strategy_result)
 
@@ -468,6 +549,10 @@ def _verdict_result(**overrides):
         excess_return_percent=overrides.get("validation_excess", 5.0),
         plateau_profitable_percent=overrides.get("nearby_percent", 80.0),
         plateau_neighbors=5,
+        nearby_top_count=overrides.get("nearby_top_count", 4),
+        nearby_top_percent=overrides.get("nearby_percent", 80.0),
+        nearby_varied_inputs=overrides.get("nearby_varied_inputs", 2),
+        nearby_stability=overrides.get("nearby_stability", "Broad stable region"),
         test_trades=overrides.get("validation_trades", 30),
         rolling_profitable_windows=overrides.get("rolling_profitable", 3),
         rolling_windows=4,
@@ -539,3 +624,100 @@ def test_candidate_verdict_keeps_thin_trade_evidence_in_research_only():
 
     assert candidate_verdict(result, "1h").tier == "Research Only"
     assert candidate_verdict(result, "1d").tier == "Research Only"
+
+
+def test_relative_input_stability_rewards_a_cluster_near_the_top():
+    seed = _verdict_result().best
+    near_settings = [
+        {"entry_window": 20, "exit_window": 10, "atr_stop_multiplier": 2.0, "moving_average_window": 50},
+        {"entry_window": 10, "exit_window": 10, "atr_stop_multiplier": 2.0, "moving_average_window": 50},
+        {"entry_window": 20, "exit_window": 15, "atr_stop_multiplier": 2.0, "moving_average_window": 50},
+        {"entry_window": 20, "exit_window": 10, "atr_stop_multiplier": 1.5, "moving_average_window": 50},
+        {"entry_window": 20, "exit_window": 10, "atr_stop_multiplier": 2.0, "moving_average_window": 100},
+    ]
+    candidates = [
+        replace(
+            seed,
+            strategy_type="breakout",
+            strategy_label="Breakout continuation",
+            settings={**seed.settings, **settings, "strategy_type": "breakout"},
+            train_excess_return_percent=20.0 - index,
+            excess_return_percent=15.0 - index,
+        )
+        for index, settings in enumerate(near_settings)
+    ]
+    candidates.extend(
+        replace(
+            seed,
+            strategy_type="breakout",
+            strategy_label="Breakout continuation",
+            settings={
+                **seed.settings,
+                "strategy_type": "breakout",
+                "entry_window": 100 + index,
+                "exit_window": 30,
+                "atr_stop_multiplier": 5.0,
+                "moving_average_window": 200,
+            },
+            train_excess_return_percent=5.0 - index,
+            excess_return_percent=0.0 - index,
+        )
+        for index in range(10)
+    )
+
+    scored = _attach_plateau_scores(candidates)
+    best = scored[0]
+
+    assert best.nearby_stability == "Broad stable region"
+    assert best.nearby_top_count == 5
+    assert best.plateau_neighbors == 5
+    assert best.nearby_varied_inputs >= 2
+    assert _parameter_plateau_range(best, scored)
+
+
+def test_relative_input_stability_can_report_a_partial_one_input_range():
+    seed = _verdict_result().best
+    candidates = [
+        replace(
+            seed,
+            strategy_type="breakout",
+            strategy_label="Breakout continuation",
+            settings={
+                **seed.settings,
+                "strategy_type": "breakout",
+                "entry_window": 20,
+                "exit_window": exit_window,
+                "atr_stop_multiplier": 2.0,
+                "moving_average_window": 50,
+            },
+            train_excess_return_percent=10.0 - index,
+            excess_return_percent=8.0 - index,
+        )
+        for index, exit_window in enumerate((5, 10, 15))
+    ]
+    candidates.extend(
+        replace(
+            seed,
+            strategy_type="breakout",
+            strategy_label="Breakout continuation",
+            settings={
+                **seed.settings,
+                "strategy_type": "breakout",
+                "entry_window": 100 + index,
+                "exit_window": 30,
+                "atr_stop_multiplier": 5.0,
+                "moving_average_window": 200,
+            },
+            train_excess_return_percent=-index,
+            excess_return_percent=-index,
+        )
+        for index in range(6)
+    )
+
+    scored = _attach_plateau_scores(candidates)
+    best = scored[0]
+
+    assert best.nearby_stability == "Partial stable region"
+    assert best.nearby_top_count == 3
+    assert best.nearby_varied_inputs == 1
+    assert set(_parameter_plateau_range(best, scored)) == {"exit_window"}

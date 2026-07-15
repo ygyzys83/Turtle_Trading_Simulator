@@ -161,6 +161,7 @@ from agentloop_trader.parameter_loop import (
     strategy_search_interval_records,
     strategy_search_ranking_records,
     strategy_search_settings_records,
+    strategy_input_search_identity,
     validate_settings_across_tickers,
 )
 from agentloop_trader.performance import ticker_allocated_capital
@@ -292,6 +293,7 @@ def run_strategy_suite(
     rsi_overbought,
     rsi_decline_points,
     rsi_rebound_points,
+    rsi_max_rebound_points,
     rsi_sell_recovery_points,
     rsi_swing_lookback,
     rsi_stop_mode,
@@ -361,6 +363,7 @@ def run_strategy_suite(
         rsi_overbought=rsi_overbought,
         rsi_decline_points=rsi_decline_points,
         rsi_rebound_points=rsi_rebound_points,
+        rsi_max_rebound_points=rsi_max_rebound_points,
         rsi_sell_recovery_points=rsi_sell_recovery_points,
         rsi_swing_lookback=rsi_swing_lookback,
         rsi_stop_mode=rsi_stop_mode,
@@ -389,6 +392,7 @@ def run_rsi_stop_mode_comparison(
     rsi_overbought,
     rsi_decline_points,
     rsi_rebound_points,
+    rsi_max_rebound_points,
     rsi_sell_recovery_points,
     rsi_swing_lookback,
     rsi_max_holding_enabled,
@@ -413,6 +417,7 @@ def run_rsi_stop_mode_comparison(
             rsi_overbought=rsi_overbought,
             rsi_decline_points=rsi_decline_points,
             rsi_rebound_points=rsi_rebound_points,
+            rsi_max_rebound_points=rsi_max_rebound_points,
             rsi_sell_recovery_points=rsi_sell_recovery_points,
             rsi_swing_lookback=rsi_swing_lookback,
             rsi_stop_mode=mode,
@@ -823,6 +828,16 @@ def pct_or_missing(value) -> str:
     return f"{number:.2f}%" if number is not None else "Not recorded"
 
 
+def number_or_missing(value, decimals: int = 2) -> str:
+    number = optional_float(value)
+    return f"{number:.{decimals}f}" if number is not None else "Not recorded"
+
+
+def time_or_missing(value) -> str:
+    timestamp = parse_order_timestamp(value)
+    return timestamp.strftime("%Y-%m-%d %I:%M:%S %p %Z") if timestamp is not None else "Not recorded"
+
+
 def bars_or_missing(value) -> str:
     try:
         if value is None or value == "":
@@ -890,9 +905,19 @@ def entry_snapshot_records(settings: dict | None) -> list[dict]:
             {"Field": "Arm buy setup at or below RSI", "Value": str(settings.get("rsi_oversold", "Not recorded"))},
             {"Field": "Arm after RSI decline", "Value": f"{settings.get('rsi_decline_points', 'Not recorded')} points"},
             {"Field": "Buy after RSI rebound", "Value": f"{settings.get('rsi_rebound_points', 'Not recorded')} points"},
-            {"Field": "RSI at entry", "Value": str(settings.get("entry_rsi", "Not recorded"))},
-            {"Field": "RSI setup low at entry", "Value": str(settings.get("entry_rsi_setup_low", "Not recorded"))},
-            {"Field": "RSI exit level saved at entry", "Value": str(settings.get("entry_rsi_sell_level", "Not recorded"))},
+            {"Field": "Maximum RSI rebound allowed for buy", "Value": f"{settings.get('rsi_max_rebound_points', 12.0)} points"},
+            {"Field": "RSI at entry", "Value": number_or_missing(settings.get("entry_rsi"))},
+            {"Field": "RSI setup low at entry", "Value": number_or_missing(settings.get("entry_rsi_setup_low"))},
+            {
+                "Field": "RSI rebound at entry",
+                "Value": number_or_missing(
+                    optional_float(settings.get("entry_rsi")) - optional_float(settings.get("entry_rsi_setup_low"))
+                    if optional_float(settings.get("entry_rsi")) is not None
+                    and optional_float(settings.get("entry_rsi_setup_low")) is not None
+                    else None
+                ) + (" points" if optional_float(settings.get("entry_rsi")) is not None and optional_float(settings.get("entry_rsi_setup_low")) is not None else ""),
+            },
+            {"Field": "RSI exit level saved at entry", "Value": number_or_missing(settings.get("entry_rsi_sell_level"))},
             {
                 "Field": "Require profit for RSI exit",
                 "Value": "On" if settings.get("rsi_profit_only_exit", False) else "Off",
@@ -1040,10 +1065,21 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
             "Momentum turn length", "Strategy exit",
         }
         rows = [row for row in rows if row["Item"] not in irrelevant]
+        data_source = str(settings.get("price_data_source", "Not recorded"))
+        feed_label = "Alpaca IEX" if data_source == "Ticker (Alpaca)" else "Alpaca crypto" if data_source == "Crypto (Alpaca)" else data_source
+        entry_rsi = optional_float(settings.get("entry_rsi"))
+        setup_low = optional_float(settings.get("entry_rsi_setup_low"))
+        entry_rebound = entry_rsi - setup_low if entry_rsi is not None and setup_low is not None else None
         rsi_rows = [
-            {"Area": "RSI exit", "Item": "Current RSI", "Status / Value": str(exit_details.get("current_rsi", "Not available")), "Plain English": "Current RSI calculated from the saved price interval and RSI length."},
-            {"Area": "RSI exit", "Item": "RSI setup low at entry", "Status / Value": str(settings.get("entry_rsi_setup_low", "Not recorded")), "Plain English": "Lowest RSI reached while the saved buy setup was armed."},
-            {"Area": "RSI exit", "Item": "RSI sell level", "Status / Value": str(exit_details.get("rsi_sell_level", "Not available")), "Plain English": "Sell when current RSI reaches this level or higher."},
+            {"Area": "RSI exit", "Item": "Price feed", "Status / Value": feed_label, "Plain English": "The exact price-bar source used by the worker. RSI can differ from TradingView when its feed or session settings differ."},
+            {"Area": "RSI exit", "Item": "Latest completed bar used", "Status / Value": time_or_missing(exit_details.get("last_completed_bar_at")), "Plain English": f"RSI decisions use completed {settings.get('interval', 'saved interval')} bars, never an unfinished bar."},
+            {"Area": "RSI exit", "Item": "Current completed-bar RSI", "Status / Value": number_or_missing(exit_details.get("current_rsi")), "Plain English": "Latest completed-bar RSI calculated from the saved price feed, interval, and RSI length."},
+            {"Area": "RSI exit", "Item": "Highest RSI since entry", "Status / Value": number_or_missing(exit_details.get("highest_rsi_since_entry")), "Plain English": "Highest completed-bar RSI the app has calculated since this position filled."},
+            {"Area": "RSI exit", "Item": "RSI setup low at entry", "Status / Value": number_or_missing(setup_low), "Plain English": "Lowest RSI reached while this specific buy setup was armed."},
+            {"Area": "RSI exit", "Item": "RSI at entry", "Status / Value": number_or_missing(entry_rsi), "Plain English": "Completed-bar RSI that confirmed the buy setup."},
+            {"Area": "RSI exit", "Item": "RSI rebound at entry", "Status / Value": f"{number_or_missing(entry_rebound)} points" if entry_rebound is not None else "Not recorded", "Plain English": "RSI at entry minus the saved setup low."},
+            {"Area": "RSI exit", "Item": "Maximum rebound allowed for buy", "Status / Value": f"{number_or_missing(settings.get('rsi_max_rebound_points', 12.0))} points", "Plain English": "Future RSI buys are rejected if the completed-bar rebound exceeds this amount. It does not change an existing position's exit."},
+            {"Area": "RSI exit", "Item": "RSI sell level", "Status / Value": number_or_missing(exit_details.get("rsi_sell_level")), "Plain English": "Sell when completed-bar RSI reaches this level or higher."},
             {
                 "Area": "RSI exit",
                 "Item": "Require profit for RSI exit",
@@ -2090,15 +2126,6 @@ with st.sidebar.expander("Advanced safety", expanded=False):
             "Risk limits, cash, concentration, and open-order checks still apply."
         ),
     )
-    max_auto_buys_per_session = st.number_input(
-        "Max automatic buys this session",
-        min_value=1,
-        max_value=20,
-        value=3,
-        step=1,
-        key="max_auto_buys_per_session_input",
-        help="Caps BUY orders sent from the Buy watchlist during one worker session.",
-    )
     reentry_cooldown_minutes = st.selectbox(
         "Wait after an exit before re-buying",
         [0, 15, 30, 60, 120, 240],
@@ -2280,6 +2307,7 @@ if optimizer_apply_settings:
     st.session_state["rsi_overbought_input"] = float(optimizer_apply_settings.get("rsi_overbought", 70.0))
     st.session_state["rsi_decline_points_input"] = float(optimizer_apply_settings.get("rsi_decline_points", 40.0))
     st.session_state["rsi_rebound_points_input"] = float(optimizer_apply_settings.get("rsi_rebound_points", 3.0))
+    st.session_state["rsi_max_rebound_points_input"] = float(optimizer_apply_settings.get("rsi_max_rebound_points", 12.0))
     st.session_state["rsi_sell_recovery_points_input"] = float(optimizer_apply_settings.get("rsi_sell_recovery_points", 35.0))
     st.session_state["rsi_swing_lookback_input"] = int(optimizer_apply_settings.get("rsi_swing_lookback", 24))
     stop_mode_labels = {
@@ -2532,6 +2560,18 @@ rsi_rebound_points = st.sidebar.slider(
     disabled=strategy_type != "rsi_scalp",
     help="Used by RSI mean-reversion scalp. After a setup is armed, RSI must rise this many points from the lowest RSI reached during that setup and price must close above the prior completed bar.",
 )
+rsi_max_rebound_points = st.sidebar.slider(
+    "Maximum RSI rebound allowed for BUY (points)", 5.0, 30.0, 12.0, step=1.0,
+    key="rsi_max_rebound_points_input",
+    disabled=strategy_type != "rsi_scalp",
+    help=(
+        "Used by RSI mean-reversion scalp. This prevents a late BUY after RSI has already rebounded too far from the setup low. "
+        "For example, with a setup low of RSI 14 and a maximum of 12 points, the app may buy only while RSI is at or below 26. "
+        "If a completed bar closes above that maximum before the order fills, the setup expires and any unfilled RSI limit buy is canceled."
+    ),
+)
+if strategy_type == "rsi_scalp" and rsi_max_rebound_points <= rsi_rebound_points:
+    st.sidebar.error("Maximum RSI rebound must be greater than the minimum rebound required to buy.")
 rsi_sell_recovery_points = st.sidebar.slider(
     "Sell after RSI recovers (points)", 15.0, 50.0, 35.0, step=5.0, key="rsi_sell_recovery_points_input",
     disabled=strategy_type != "rsi_scalp",
@@ -2619,7 +2659,10 @@ max_session_loss = st.sidebar.slider(
     2.0,
     step=0.25,
     key="max_session_loss_input",
-    help="Hard cap on today's account loss. For Alpaca this compares current equity with Alpaca's prior-day equity; new buys are blocked after the limit is reached.",
+    help=(
+        "Stops new BUY orders when today's Alpaca account loss reaches this percentage of prior-day equity. "
+        "It does not turn on the Kill Switch, so automatic exits can keep protecting open positions."
+    ),
 )
 max_open_positions = st.sidebar.slider(
     "Max open positions",
@@ -2917,6 +2960,7 @@ try:
         rsi_overbought,
         rsi_decline_points,
         rsi_rebound_points,
+        rsi_max_rebound_points,
         rsi_sell_recovery_points,
         rsi_swing_lookback,
         rsi_stop_mode,
@@ -3074,6 +3118,7 @@ if run_walk_forward:
             rsi_overbought=rsi_overbought,
             rsi_decline_points=rsi_decline_points,
             rsi_rebound_points=rsi_rebound_points,
+            rsi_max_rebound_points=rsi_max_rebound_points,
             rsi_sell_recovery_points=rsi_sell_recovery_points,
             rsi_swing_lookback=rsi_swing_lookback,
             rsi_stop_mode=rsi_stop_mode,
@@ -3115,6 +3160,7 @@ current_strategy_settings = {
     "rsi_overbought": rsi_overbought,
     "rsi_decline_points": rsi_decline_points,
     "rsi_rebound_points": rsi_rebound_points,
+    "rsi_max_rebound_points": rsi_max_rebound_points,
     "rsi_sell_recovery_points": rsi_sell_recovery_points,
     "rsi_swing_lookback": rsi_swing_lookback,
     "rsi_stop_mode": rsi_stop_mode,
@@ -3130,7 +3176,6 @@ current_strategy_settings = {
     "allow_limit_buys_outside_market_hours": allow_limit_buys_outside_market_hours,
     "automation_refresh_seconds": automation_refresh_seconds,
     "allow_add_to_existing_position": allow_add_to_existing_position,
-    "max_auto_buys_per_session": max_auto_buys_per_session,
     "reentry_cooldown_minutes": reentry_cooldown_minutes,
     "profit_protection_enabled": True,
     "breakeven_after_r": 1.0,
@@ -3268,6 +3313,7 @@ def _legacy_evaluate_exit_rule_details_from_settings(settings: dict | None) -> d
                 rsi_overbought=float(settings.get("rsi_overbought", 70.0)),
                 rsi_decline_points=float(settings.get("rsi_decline_points", 40.0)),
                 rsi_rebound_points=float(settings.get("rsi_rebound_points", 3.0)),
+                rsi_max_rebound_points=float(settings.get("rsi_max_rebound_points", 12.0)),
                 rsi_sell_recovery_points=float(settings.get("rsi_sell_recovery_points", 35.0)),
                 rsi_swing_lookback=int(settings.get("rsi_swing_lookback", 24)),
                 rsi_stop_mode=str(settings.get("rsi_stop_mode", "standard_atr")),
@@ -3587,32 +3633,8 @@ def refresh_trailing_state_for_open_positions() -> bool:
     return changed
 
 
-optimizer_setting_keys = (
-    "strategy_type",
-    "strategy_label",
-    "entry_window",
-    "exit_window",
-    "atr_stop_multiplier",
-    "risk_per_trade_pct",
-    "moving_average_window",
-    "pullback_average_length",
-    "momentum_turn_length",
-    "rsi_entry_filter_enabled",
-    "rsi_length",
-    "rsi_oversold",
-    "rsi_overbought",
-    "rsi_decline_points",
-    "rsi_rebound_points",
-    "rsi_sell_recovery_points",
-    "rsi_swing_lookback",
-    "rsi_stop_mode",
-    "rsi_emergency_atr_multiplier",
-    "rsi_max_holding_enabled",
-    "rsi_max_holding_bars",
-    "rsi_profit_only_exit",
-)
 optimizer_market_fingerprint = "synthetic-default"
-if market_data is not None:
+if data_source == "Synthetic" and market_data is not None:
     fingerprint_columns = [
         column for column in ("Open", "High", "Low", "Close", "Volume")
         if column in market_data.columns
@@ -3621,30 +3643,16 @@ if market_data is not None:
         market_data[fingerprint_columns], index=True
     ).values.tobytes()
     optimizer_market_fingerprint = hashlib.sha256(hashed_market_data).hexdigest()
-optimizer_equity = float(paper_order_risk_equity)
-optimizer_equity_rounding_digits = max(
-    0,
-    len(str(max(1, int(abs(optimizer_equity))))) - 3,
+optimizer_signature = strategy_input_search_identity(
+    ticker=ticker,
+    data_source=data_source,
+    risk_per_trade_pct=float(current_strategy_settings["risk_per_trade_pct"]),
+    risk_limits=asdict(risk_limits),
+    settings_per_strategy=max_parameter_candidates,
+    display_interval=interval,
+    display_history=period,
+    market_fingerprint=optimizer_market_fingerprint,
 )
-optimizer_equity_bucket = round(optimizer_equity, -optimizer_equity_rounding_digits)
-optimizer_signature_payload = {
-    "ticker": ticker,
-    "source": data_source,
-    "interval": interval,
-    "history": period,
-    "market_data": optimizer_market_fingerprint,
-    "strategy_settings": {
-        key: current_strategy_settings[key] for key in optimizer_setting_keys
-    },
-    "account_equity_bucket": optimizer_equity_bucket,
-    "risk_limits": asdict(risk_limits),
-    "older_data_fraction": 0.55,
-    "settings_per_strategy": max_parameter_candidates,
-    "search_version": "four-trend-strategies-local-stability-v2",
-}
-optimizer_signature = hashlib.sha256(
-    json.dumps(optimizer_signature_payload, sort_keys=True, default=str).encode("utf-8")
-).hexdigest()
 optimizer_search_completed = False
 if run_strategy_input_search:
     try:
@@ -5807,7 +5815,7 @@ if command_center_view == "New Trade":
             stop_comparison_key = (
                 ticker, data_source, interval, period, atr_mult, rsi_emergency_atr_multiplier,
                 risk_pct, rsi_length, rsi_oversold, rsi_overbought, rsi_decline_points,
-                rsi_rebound_points, rsi_sell_recovery_points, rsi_swing_lookback,
+                rsi_rebound_points, rsi_max_rebound_points, rsi_sell_recovery_points, rsi_swing_lookback,
                 rsi_max_holding_enabled, rsi_max_holding_bars, rsi_profit_only_exit,
             )
             if st.button("Compare Stop Protection Modes", key="compare_rsi_stop_modes"):
@@ -5827,6 +5835,7 @@ if command_center_view == "New Trade":
                             rsi_overbought,
                             rsi_decline_points,
                             rsi_rebound_points,
+                            rsi_max_rebound_points,
                             rsi_sell_recovery_points,
                             rsi_swing_lookback,
                             rsi_max_holding_enabled,
@@ -5895,7 +5904,9 @@ if command_center_view == "New Trade":
             help=(
                 "Searches broad input ranges for the four trend strategies, then deliberately tests neighboring numeric settings. "
                 "The older 55% of prices finds useful regions, the newer 25% chooses among those regions, and the latest 20% "
-                "only reports what happened afterward. RSI rules are not part of this search."
+                "only reports what happened afterward. Input stability is a relative comparison: nearby settings are ranked using "
+                "40% of their older-data rank and 60% of their newer-data rank. It does not require nearby settings to beat buy-and-hold. "
+                "RSI rules are not part of this search."
             ),
         )
         if optimizer_search_state is None:

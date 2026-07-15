@@ -89,6 +89,7 @@ def strategy_settings_match(current: dict | None, entry: dict | None) -> bool:
         "rsi_overbought",
         "rsi_decline_points",
         "rsi_rebound_points",
+        "rsi_max_rebound_points",
         "rsi_sell_recovery_points",
         "rsi_swing_lookback",
         "rsi_stop_mode",

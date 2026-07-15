@@ -739,6 +739,50 @@ Queued setups now persist their exact active Alpaca order ID and tag worker-crea
 
 Legacy records are migrated by matching the saved order-sent time to the corresponding non-manual tracked order. A read-only check matched HOOD to worker order `906e2327-76b7-4587-9bd7-9ff4d7b76a3c`, status canceled, filled quantity zero. The completed checkpoint passed 354 tests. Updating the worker source correctly stopped the old detached process with `Restart required`; the user must click `Start Worker` to load this fix. No broker order was submitted during development or verification.
 
+## RSI Late-Entry Protection And Diagnostics (July 15, 2026)
+
+The RSI mean-reversion scalp now has a saved `Maximum RSI rebound allowed for BUY` input, defaulting to 12 RSI points. A setup still arms from its local completed-bar RSI low and requires the configured minimum rebound plus a higher completed-bar close. If the rebound grows beyond the saved maximum before entry, that setup expires and must re-arm from a later decline. Historical tests, the current New Trade result, queued setups, and the background worker all use the same saved rule.
+
+If an RSI limit buy is waiting at Alpaca and the latest completed-bar RSI rises more than the saved maximum above that order's saved setup low, the worker cancels the unfilled paper order and writes `worker_rsi_late_buy_cancelled` with the setup low, current RSI, rebound, maximum, symbol, and broker order ID. Automated RSI decisions remain completed-bar only; intrabar RSI was intentionally not adopted because it would require a separate streaming state engine and would make backtests less comparable to execution.
+
+The position-management table now identifies the saved price feed, latest completed bar used, current RSI, highest completed-bar RSI since entry, setup low, entry RSI, entry rebound, maximum permitted buy rebound, and saved sell level. This makes feed differences explicit: Alpaca equity automation uses the free IEX feed, which can differ from TradingView consolidated/session data. The CAG investigation showed a saved setup low of 13.57 and a completed 6:30-6:45 AM PT signal-bar RSI of 39.90; the worker submitted after that bar completed at 6:46 AM PT. The new 12-point rule would reject that late rebound.
+
+The completed checkpoint passed 356 tests. No Streamlit server was started and no broker order was submitted during development or verification.
+
+## Sidebar-Independent Strategy Input Search (July 15, 2026)
+
+The strategy input search was found to have two unintended couplings. Its broad sample always included a combination near the currently displayed sidebar settings, and its saved-result signature included the displayed strategy, interval, history, full current price frame, and RSI controls. Consequently, an automatic price refresh could immediately mark a freshly completed result as changed and disable `Use These Inputs`, even when the user had changed nothing.
+
+The four-trend-strategy search now samples from one fixed neutral baseline plus deterministic coverage of the complete configured ranges. Displayed strategy inputs and all RSI controls no longer influence which combinations are tested. The current Strategy risk per trade remains a search assumption because it affects historical position sizing.
+
+For real Alpaca or yfinance prices, saved results now become outdated only when a material assumption changes: ticker, price source, Strategy risk per trade, risk limits, search breadth, or search implementation version. The displayed interval, displayed history, automatic latest-price refreshes, selected strategy, and unrelated strategy inputs do not disable the saved result. Synthetic searches still track their interval, history, and generated data because the displayed synthetic frame is the complete dataset used by that search.
+
+The completed checkpoint passed 359 tests. No Streamlit server was started and no broker order was submitted during development or verification.
+
+## Relative Input-Stability Ranking (July 15, 2026)
+
+The nearby-range test no longer requires nearby settings to beat buy-and-hold or retain nearly the same excess return as the single winner. Those requirements conflated two separate questions: whether a strategy is attractive and whether its input region is stable.
+
+Every tested combination is now ranked twice within the same strategy and interval: once on the older 55% and once on the newer 25%. Its combined relative score gives 40% weight to the older rank and 60% to the newer rank. The latest 20% remains reporting-only. A nearby combination is considered near the top when its combined score ranks in the top third of all combinations tested, regardless of whether its absolute result beat buy-and-hold.
+
+Input stability now has three plain-language levels. `Broad stable region` requires at least five nearby top-third combinations, at least half of all nearby combinations in the top third, and variation across at least two inputs. `Partial stable region` requires at least three nearby top-third combinations, at least half in the top third, and variation across at least one input. Everything else is an `Isolated result`. Buy-and-hold comparison remains a separate output so a region can be relatively stable while still being unattractive to trade.
+
+The daily strategy-search report now shows only the exact settings, input-stability level and count, strong nearby input ranges, and the separate newer-data result versus buy-and-hold. Detailed cost and robustness records remain elsewhere. The completed checkpoint passed 361 tests. No Streamlit server was started and no broker order was submitted during development or verification.
+
+## Watchlist Lifecycle Refresh After Session Buy Cap (July 15, 2026)
+
+HOOD exposed a worker lifecycle defect after its queued limit order filled. The worker had reached its saved limit of three automatic buys for the session, and `run_once` consequently skipped the entire buy-watchlist loop. This correctly blocked another submission but incorrectly also skipped order/position reconciliation, leaving HOOD displayed as `Buy order sent` even though Alpaca reported the order filled and the position open.
+
+The session cap now blocks only new buy submissions. The worker continues through every enabled queued setup to refresh completed-bar requirements, latest displayed values, owned-order status, and open-position lifecycle. A filled worker-owned order now changes the queue row to `Position open` even when no further automatic buys may be sent that session. Regression tests verify both the filled HOOD scenario and that waiting setups still refresh without calling the order-submission path. The completed checkpoint passed 363 tests. No Streamlit server was started and no broker order was submitted during development or verification.
+
+## Daily-Loss-Only Automatic Buy Stop (July 15, 2026)
+
+The user removed the worker-session limit on the number of automatic queued buys. `Max automatic buys this session` no longer appears in Advanced safety, is no longer saved with queued setups, and is not evaluated by the worker. The worker's cumulative order count remains status information only and never blocks a submission.
+
+New queued buys remain governed by the deterministic account and order controls: Alpaca cash, per-trade risk, new-order size, symbol concentration, portfolio exposure, maximum open positions, duplicate order/position rules, allowed tickers when configured, and Max daily loss. The daily-loss boundary now blocks a new buy as soon as the loss reaches the configured percentage of Alpaca prior-day equity rather than waiting until it moves beyond that amount.
+
+Max daily loss is intentionally separate from the Kill Switch. It blocks new buys but does not turn on the Kill Switch, allowing automatic exits to continue protecting open positions. The Kill Switch remains a deliberate manual emergency control that blocks both entries and automatic exits. The sidebar helper now explains this distinction directly.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

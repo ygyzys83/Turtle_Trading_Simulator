@@ -35,7 +35,7 @@ def constrain_trade_intent_to_limits(
 
     session_start_equity = max(0.0, account_equity - session_pnl)
     max_daily_loss = session_start_equity * limits.max_session_loss_pct / 100
-    if session_pnl < -max_daily_loss:
+    if session_pnl <= -max_daily_loss:
         return replace(
             intent,
             quantity=0,
@@ -232,10 +232,10 @@ def check_trade_intent(
     # starting value so the daily loss limit does not shrink as losses accrue.
     session_start_equity = max(0.0, account_equity - session_pnl)
     max_session_loss = session_start_equity * limits.max_session_loss_pct / 100
-    checks["session_loss_within_limit"] = session_pnl >= -max_session_loss
+    checks["session_loss_within_limit"] = session_pnl > -max_session_loss
     if not checks["session_loss_within_limit"]:
         rejected.append(
-            f"Daily loss ${abs(session_pnl):,.2f} exceeds max ${max_session_loss:,.2f}."
+            f"Daily loss ${abs(session_pnl):,.2f} reached max ${max_session_loss:,.2f}."
         )
 
     if available_cash is not None:

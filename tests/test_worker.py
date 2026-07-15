@@ -4,7 +4,7 @@ from agentloop_trader.automation_runtime import AutomationControl, WorkerStatus
 from agentloop_trader.buy_watchlist import BuyWatchPlan, BuyWatchlistStore, buy_watch_plan_id
 from agentloop_trader.brokers import AlpacaConfig
 from agentloop_trader.models import TradeIntent
-from agentloop_trader.worker import _BAR_CACHE, _fetcher, _open_buy_order_notional, _send_entry, _send_exits, _send_watchlist_entries, _stop_requested_during_wait, run_once, sleep_resume_detected
+from agentloop_trader.worker import _BAR_CACHE, _cancel_late_rsi_limit_buys, _fetcher, _open_buy_order_notional, _send_entry, _send_exits, _send_watchlist_entries, _stop_requested_during_wait, run_once, sleep_resume_detected
 
 
 def test_worker_disabled_only_records_heartbeat():
@@ -140,7 +140,7 @@ def test_worker_blocks_new_entry_after_alpaca_daily_loss_limit(monkeypatch):
     adapter = SimpleNamespace(
         config=AlpacaConfig(api_key="key", api_secret="secret", paper=True),
         account_records=lambda: [
-            {"Field": "Portfolio Value", "Value": "97000"},
+            {"Field": "Portfolio Value", "Value": "98000"},
             {"Field": "Cash", "Value": "90000"},
             {"Field": "Last Equity", "Value": "100000"},
         ],
@@ -174,6 +174,59 @@ def test_worker_counts_only_unfilled_open_buy_order_notional():
     assert _open_buy_order_notional(orders, "AAPL") == 600
 
 
+def test_worker_cancels_unfilled_rsi_buy_after_maximum_rebound(monkeypatch):
+    canceled = []
+    events = []
+    adapter = SimpleNamespace(
+        config=AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        cancel_order=lambda order_id, expected_cancel_hash: canceled.append((order_id, expected_cancel_hash)),
+    )
+    orders = [{
+        "Alpaca Order ID": "rsi-order-1",
+        "Symbol": "CAG",
+        "Side": "buy",
+        "Status": "accepted",
+        "Order Type": "limit",
+    }]
+    tracked = [{
+        "broker_order_id": "rsi-order-1",
+        "strategy_settings": {
+            "symbol": "CAG",
+            "strategy_type": "rsi_scalp",
+            "entry_rsi_setup_low": 13.5,
+            "rsi_max_rebound_points": 12.0,
+            "account_size": 100_000,
+        },
+    }]
+    monkeypatch.setattr(
+        "agentloop_trader.worker.selected_strategy_result",
+        lambda *args, **kwargs: {"live": {"rsi": 26.0}},
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker.build_alpaca_cancel_preview",
+        lambda *args, **kwargs: SimpleNamespace(valid=True, preview_hash="cancel-hash"),
+    )
+
+    count, message = _cancel_late_rsi_limit_buys(
+        AutomationControl(
+            mode="Auto entries and exits",
+            full_automation_enabled=True,
+            paper_orders_enabled=True,
+        ),
+        adapter,
+        orders,
+        tracked,
+        lambda *_: object(),
+        SimpleNamespace(append=events.append),
+    )
+
+    assert count == 1
+    assert "late RSI" in message
+    assert canceled == [("rsi-order-1", "cancel-hash")]
+    assert events[0].event_type == "worker_rsi_late_buy_cancelled"
+    assert events[0].payload["rebound_points"] == 12.5
+
+
 def test_worker_updates_watchlist_status_when_buy_rules_are_waiting(monkeypatch, tmp_path):
     store = BuyWatchlistStore(tmp_path / "watchlist.json")
     plan = BuyWatchPlan(
@@ -200,7 +253,6 @@ def test_worker_updates_watchlist_status_when_buy_rules_are_waiting(monkeypatch,
         SimpleNamespace(append=lambda event: None),
         store,
         latest_prices={"TSLA": 250.0},
-        max_to_send=1,
     )
 
     updated = store.read()[0]
@@ -236,7 +288,6 @@ def test_worker_disables_watchlist_setup_after_order_is_sent(monkeypatch, tmp_pa
         SimpleNamespace(append=lambda event: None),
         store,
         latest_prices={"TSLA": 250.0},
-        max_to_send=1,
     )
 
     updated = store.read()[0]
@@ -273,7 +324,6 @@ def test_worker_keeps_repeating_setup_enabled_after_order_is_sent(monkeypatch, t
         SimpleNamespace(append=lambda event: None),
         store,
         latest_prices={"TSLA": 250.0},
-        max_to_send=1,
     )
 
     updated = store.read()[0]
@@ -282,6 +332,56 @@ def test_worker_keeps_repeating_setup_enabled_after_order_is_sent(monkeypatch, t
     assert updated.repeat_after_exit is True
     assert updated.cycle_state == "order_pending"
     assert updated.status == "Buy order sent"
+
+
+def test_worker_reconciles_filled_watchlist_order_with_open_position(monkeypatch, tmp_path):
+    store = BuyWatchlistStore(tmp_path / "watchlist.json")
+    plan = BuyWatchPlan(
+        plan_id=buy_watch_plan_id("HOOD", "4h", "Trend pullback continuation"),
+        symbol="HOOD",
+        interval="4h",
+        history="5y",
+        price_data_source="Ticker (Alpaca)",
+        strategy_label="Trend pullback continuation",
+        repeat_after_exit=True,
+        cycle_state="order_pending",
+        active_order_id="queued-order-filled",
+        status="Buy order sent",
+    )
+    store.upsert(plan)
+    filled_order = {
+        "Alpaca Order ID": "queued-order-filled",
+        "Symbol": "HOOD",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 43,
+    }
+    position = {"Symbol": "HOOD", "Quantity": 43}
+    monkeypatch.setattr(
+        "agentloop_trader.worker._send_entry",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("Open position must block a new submission")),
+    )
+
+    sent, _, message = _send_watchlist_entries(
+        AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
+        SimpleNamespace(),
+        [position],
+        [filled_order],
+        [],
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+        store,
+        latest_prices={"HOOD": 114.75},
+    )
+
+    updated = store.read()[0]
+    assert sent == 0
+    assert updated.cycle_state == "position_open"
+    assert updated.cycle_had_filled_position is True
+    assert updated.active_order_id == "queued-order-filled"
+    assert updated.status == "Position open"
+    assert "queued order filled" in updated.detail.lower()
+    assert "still being refreshed" not in message
 
 
 def test_repeating_setup_waits_for_prior_buy_signal_to_clear(monkeypatch, tmp_path):
@@ -310,16 +410,16 @@ def test_repeating_setup_waits_for_prior_buy_signal_to_clear(monkeypatch, tmp_pa
         store,
     )
 
-    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0}, max_to_send=1)
+    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0})
     assert store.read()[0].cycle_state == "waiting_for_signal_reset"
 
     monkeypatch.setattr("agentloop_trader.worker._repeat_signal_state", lambda *args: (True, ""))
-    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0}, max_to_send=1)
+    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0})
     assert store.read()[0].cycle_state == "waiting_for_signal_reset"
     assert store.read()[0].status == "Waiting for a new BUY"
 
     monkeypatch.setattr("agentloop_trader.worker._repeat_signal_state", lambda *args: (False, ""))
-    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0}, max_to_send=1)
+    _send_watchlist_entries(*common_args, latest_prices={"TSLA": 250.0})
     assert store.read()[0].cycle_state == "waiting_for_buy"
     assert store.read()[0].enabled is True
 
@@ -370,14 +470,14 @@ def test_repeating_setup_retries_an_unfilled_canceled_order_without_signal_reset
     _send_watchlist_entries(
         control, adapter, [], [canceled_order], [], lambda *_: None,
         SimpleNamespace(append=lambda event: None), store,
-        latest_prices={"HOOD": 115.0}, max_to_send=1,
+        latest_prices={"HOOD": 115.0},
     )
     assert store.read()[0].cycle_state == "waiting_for_retry"
 
-    _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0}, max_to_send=1)
+    _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0})
     assert store.read()[0].cycle_state == "waiting_for_buy"
 
-    sent, _, _ = _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0}, max_to_send=1)
+    sent, _, _ = _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0})
     updated = store.read()[0]
     assert sent == 1
     assert updated.cycle_state == "order_pending"
@@ -420,13 +520,13 @@ def test_manual_buy_order_does_not_become_the_queued_setups_cycle(monkeypatch, t
 
     _send_watchlist_entries(
         common[0], common[1], [], [manual_order], [], common[5], common[6], store,
-        latest_prices={"HOOD": 115.0}, max_to_send=1,
+        latest_prices={"HOOD": 115.0},
     )
     blocked = store.read()[0]
     assert blocked.cycle_state == "blocked_by_order"
     assert blocked.active_order_id == ""
 
-    _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0}, max_to_send=1)
+    _send_watchlist_entries(*common, latest_prices={"HOOD": 115.0})
     resumed = store.read()[0]
     assert resumed.cycle_state == "waiting_for_buy"
     assert resumed.cycle_had_filled_position is False
@@ -461,7 +561,7 @@ def test_legacy_canceled_order_is_migrated_out_of_signal_reset(monkeypatch, tmp_
         AutomationControl(mode="Auto entries and exits", full_automation_enabled=True),
         SimpleNamespace(), [], [], tracked, lambda *_: None,
         SimpleNamespace(append=lambda event: None), store,
-        latest_prices={"HOOD": 115.0}, max_to_send=1,
+        latest_prices={"HOOD": 115.0},
     )
 
     updated = store.read()[0]

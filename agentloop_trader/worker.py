@@ -307,6 +307,76 @@ def _cancel_stale_limit_buys(
     return sent, f"Canceled {sent} stale limit buy order(s)." if sent else "No stale limit buy orders were ready to cancel."
 
 
+def _cancel_late_rsi_limit_buys(
+    control: AutomationControl,
+    adapter: AlpacaBrokerAdapterStub,
+    orders: list[dict],
+    tracked_orders: list[dict],
+    fetch_bars: Callable[[str, str, str, str], Any],
+    audit_store: JsonlAuditStore,
+) -> tuple[int, str]:
+    """Cancel an unfilled RSI buy after its completed-bar rebound becomes too large."""
+    if control.mode != "Auto entries and exits" or not control.full_automation_enabled:
+        return 0, "RSI late-entry protection is watching only."
+    if not control.paper_orders_enabled or control.kill_switch_enabled or not adapter.config.paper:
+        return 0, "RSI late-entry protection is blocked."
+
+    tracked_by_id = {
+        _broker_order_id(row): row
+        for row in tracked_orders
+        if _broker_order_id(row)
+    }
+    sent = 0
+    for order in orders:
+        side = _enum_value(order.get("Side"))
+        status = _enum_value(order.get("Status"))
+        order_type = _enum_value(order.get("Order Type"))
+        broker_order_id = _broker_order_id(order)
+        if side != "buy" or order_type != "limit" or status not in OPEN_ORDER_STATUSES or not broker_order_id:
+            continue
+        tracked = tracked_by_id.get(broker_order_id, {})
+        settings = dict(tracked.get("exit_settings") or tracked.get("strategy_settings") or {})
+        if str(settings.get("strategy_type", "")) != "rsi_scalp":
+            continue
+        setup_low = _number(settings.get("entry_rsi_setup_low"), -1.0)
+        max_rebound = _number(settings.get("rsi_max_rebound_points"), 12.0)
+        if setup_low < 0 or max_rebound <= 0:
+            continue
+        symbol = str(order.get("Symbol") or settings.get("symbol") or "").strip().upper()
+        if not symbol:
+            continue
+        data = fetch_bars(
+            symbol,
+            str(settings.get("history", control.history)),
+            str(settings.get("interval", control.interval)),
+            str(settings.get("price_data_source", control.price_data_source)),
+        )
+        result = selected_strategy_result(data, settings, _number(settings.get("account_size"), control.account_size))
+        current_rsi = _number(result.get("live", {}).get("rsi"), -1.0)
+        rebound = current_rsi - setup_low if current_rsi >= 0 else -1.0
+        if rebound <= max_rebound:
+            continue
+        preview = build_alpaca_cancel_preview(order, adapter.config)
+        if not preview.valid:
+            continue
+        adapter.cancel_order(broker_order_id, expected_cancel_hash=preview.preview_hash)
+        sent += 1
+        audit_store.append(AuditEvent(
+            event_type="worker_rsi_late_buy_cancelled",
+            message="Background worker canceled an unfilled RSI paper buy after the rebound became too large.",
+            payload={
+                "symbol": symbol,
+                "broker_order_id": broker_order_id,
+                "review_id": preview.preview_hash,
+                "setup_low_rsi": setup_low,
+                "current_rsi": current_rsi,
+                "rebound_points": rebound,
+                "maximum_rebound_points": max_rebound,
+            },
+        ))
+    return sent, f"Canceled {sent} late RSI limit buy order(s)." if sent else "No RSI limit buys became too late."
+
+
 def _send_exits(
     control: AutomationControl,
     adapter: AlpacaBrokerAdapterStub,
@@ -415,9 +485,10 @@ def _send_entry(
 
     data = fetch_bars(control.symbol, control.history, control.interval, control.price_data_source)
     result = selected_strategy_result(data, control.strategy_settings, account_equity, limits)
-    intent = result.get("live", {}).get("trade_intent")
+    live = result.get("live", {})
+    intent = live.get("trade_intent")
     if intent is None:
-        return 0, tracked_orders, "No BUY setup right now."
+        return 0, tracked_orders, str(live.get("no_trade_reason") or "No BUY setup right now.")
     data_attrs = getattr(data, "attrs", {})
     pricing_price = _number(latest_price, 0.0)
     if require_latest_price and pricing_price <= 0:
@@ -564,8 +635,6 @@ def _send_watchlist_entries(
     store: BuyWatchlistStore,
     latest_prices: dict[str, float] | None = None,
     latest_price_error: str = "",
-    *,
-    max_to_send: int,
 ) -> tuple[int, list[dict], str]:
     plans = store.read()
     enabled = [plan for plan in plans if plan.enabled]
@@ -588,8 +657,6 @@ def _send_watchlist_entries(
     current_orders = list(orders)
     tracked = list(tracked_orders)
     for plan in enabled:
-        if sent >= max(0, max_to_send):
-            break
         checked_at = datetime.now(PACIFIC_TIME).isoformat()
         plan_control = _control_for_watch_plan(control, plan)
         try:
@@ -862,12 +929,14 @@ def _send_watchlist_entries(
             current_positions = _strict_broker_records(adapter, "position_records")
             current_orders = _strict_broker_records(adapter, "order_records")
         else:
-            waiting = message == "No BUY setup right now."
+            waiting = message.startswith("No BUY")
             store.update(
                 plan.plan_id,
                 status="Waiting for BUY" if waiting else "Blocked",
                 detail=(
-                    "The saved strategy's required BUY rules have not passed yet."
+                    message
+                    if waiting and message != "No BUY setup right now."
+                    else "The saved strategy's required BUY rules have not passed yet."
                     if waiting
                     else message
                 ),
@@ -900,10 +969,18 @@ def run_once(
         tracked = refresh_tracked_alpaca_orders(broker_store.read(), orders)
         tracked = _reconcile_positions(positions, tracked)
 
-        cancel_count, cancel_action = _cancel_stale_limit_buys(control, adapter, orders, audit_store)
+        fetch_bars = _fetcher(control, adapter.config)
+        rsi_cancel_count, rsi_cancel_action = _cancel_late_rsi_limit_buys(
+            control, adapter, orders, tracked, fetch_bars, audit_store
+        )
+        if rsi_cancel_count:
+            stale_cancel_count, stale_cancel_action = 0, "Stale-limit checks continue on the next worker cycle."
+        else:
+            stale_cancel_count, stale_cancel_action = _cancel_stale_limit_buys(control, adapter, orders, audit_store)
+        cancel_count = rsi_cancel_count + stale_cancel_count
+        cancel_action = "; ".join(text for text in (rsi_cancel_action, stale_cancel_action) if text)
         orders = _strict_broker_records(adapter, "order_records")
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
-        fetch_bars = _fetcher(control, adapter.config)
         exit_count, tracked, exit_action = _send_exits(control, adapter, positions, orders, tracked, fetch_bars, audit_store)
         broker_store.replace_all(refresh_tracked_alpaca_orders(tracked, _strict_broker_records(adapter, "order_records")))
         positions = _strict_broker_records(adapter, "position_records")
@@ -911,11 +988,7 @@ def run_once(
         tracked = refresh_tracked_alpaca_orders(tracked, orders)
         watchlist_store = BuyWatchlistStore(control.buy_watchlist_path)
         watchlist_plans = watchlist_store.read()
-        max_session_buys = max(1, int(_number(control.strategy_settings.get("max_auto_buys_per_session"), 3)))
-        remaining_buys = max(0, max_session_buys - previous.orders_sent)
-        if remaining_buys <= 0:
-            buy_count, buy_action = 0, f"Automatic buys reached the session limit of {max_session_buys}."
-        elif watchlist_plans:
+        if watchlist_plans:
             latest_prices: dict[str, float] = {}
             latest_price_error = ""
             if control.mode == "Auto entries and exits" and control.full_automation_enabled:
@@ -951,7 +1024,6 @@ def run_once(
                 watchlist_store,
                 latest_prices=latest_prices,
                 latest_price_error=latest_price_error,
-                max_to_send=remaining_buys,
             )
         else:
             buy_count = 0

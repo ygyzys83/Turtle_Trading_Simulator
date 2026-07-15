@@ -164,7 +164,7 @@ def _backtest_limited_quantity(
         return 0
     session_start_equity = max(0.0, account_equity - session_pnl)
     max_session_loss = session_start_equity * limits.max_session_loss_pct / 100
-    if session_pnl < -max_session_loss:
+    if session_pnl <= -max_session_loss:
         return 0
     if entry_price <= 0:
         return 0
@@ -219,7 +219,7 @@ def _backtest_fixed_notional_quantity(
             return 0
         session_start_equity = max(0.0, account_equity - session_pnl)
         max_session_loss = session_start_equity * limits.max_session_loss_pct / 100
-        if session_pnl < -max_session_loss:
+        if session_pnl <= -max_session_loss:
             return 0
         allocation_pct = min(
             limits.max_position_notional_pct,
@@ -592,8 +592,9 @@ def _rsi_scalp_live_setup(
     oversold: float,
     decline_points: float,
     rebound_points: float,
+    max_rebound_points: float,
     swing_lookback: int,
-) -> tuple[bool, bool, float | None, float | None, float | None, float | None]:
+) -> tuple[bool, bool, float | None, float | None, float | None, float | None, bool]:
     """Rebuild the current RSI setup from completed bars without carrying hidden state."""
     start = max(1, index - max(2, swing_lookback) + 1)
     armed = False
@@ -602,6 +603,9 @@ def _rsi_scalp_live_setup(
     decline: float | None = None
     rebound: float | None = None
     ready = False
+    rebound_too_large = False
+    expired_setup_low: float | None = None
+    expired_rebound: float | None = None
     for i in range(start, index + 1):
         value = rsis[i]
         if value is None:
@@ -624,6 +628,15 @@ def _rsi_scalp_live_setup(
             continue
         setup_low = min(setup_low, value)
         rebound = value - setup_low
+        if rebound > max_rebound_points:
+            rebound_too_large = i == index
+            if rebound_too_large:
+                expired_setup_low = setup_low
+                expired_rebound = rebound
+            armed = False
+            setup_low = None
+            rebound = None
+            continue
         confirmation = rebound >= rebound_points and float(prices[i]) > float(prices[i - 1])
         if confirmation:
             if i == index:
@@ -632,7 +645,15 @@ def _rsi_scalp_live_setup(
                 armed = False
                 setup_low = None
                 rebound = None
-    return ready, armed, setup_low, recent_high, decline, rebound
+    return (
+        ready,
+        armed,
+        expired_setup_low if rebound_too_large else setup_low,
+        recent_high,
+        decline,
+        expired_rebound if rebound_too_large else rebound,
+        rebound_too_large,
+    )
 
 
 def simulate_turtle_strategy(
@@ -1756,6 +1777,7 @@ def simulate_rsi_mean_reversion_strategy(
     rsi_overbought: float = 70.0,
     rsi_decline_points: float = 40.0,
     rsi_rebound_points: float = 3.0,
+    rsi_max_rebound_points: float = 12.0,
     rsi_sell_recovery_points: float = 35.0,
     rsi_swing_lookback: int = 24,
     rsi_stop_mode: str = "standard_atr",
@@ -1770,6 +1792,8 @@ def simulate_rsi_mean_reversion_strategy(
     """Long-only RSI mean-reversion scalp with selectable price protection."""
     if rsi_stop_mode not in {"standard_atr", "emergency_atr", "no_price_stop"}:
         raise ValueError(f"Unknown RSI stop mode: {rsi_stop_mode}")
+    if rsi_max_rebound_points <= rsi_rebound_points:
+        raise ValueError("Maximum RSI rebound must be greater than the minimum RSI rebound.")
     active_stop_multiplier = (
         atr_mult if rsi_stop_mode == "standard_atr"
         else rsi_emergency_atr_multiplier if rsi_stop_mode == "emergency_atr"
@@ -1836,7 +1860,10 @@ def simulate_rsi_mean_reversion_strategy(
                 setup_low = min(setup_low, rsi)
                 rebound = rsi - setup_low
                 price_turned_up = price > float(prices[i - 1])
-                if rebound >= rsi_rebound_points and price_turned_up:
+                if rebound > rsi_max_rebound_points:
+                    armed = False
+                    setup_low = None
+                elif rebound >= rsi_rebound_points and price_turned_up:
                     stop = (
                         round(price - active_stop_multiplier * float(atr), 2)
                         if active_stop_multiplier is not None
@@ -1953,11 +1980,12 @@ def simulate_rsi_mean_reversion_strategy(
     last_price = float(prices[live_bar])
     last_atr = atrs[live_bar]
     last_rsi = float(rsis[live_bar]) if rsis[live_bar] is not None else None
-    setup_ready, setup_armed, live_setup_low, recent_high, decline, rebound = _rsi_scalp_live_setup(
+    setup_ready, setup_armed, live_setup_low, recent_high, decline, rebound, rebound_too_large = _rsi_scalp_live_setup(
         prices, rsis, live_bar,
         oversold=rsi_oversold,
         decline_points=rsi_decline_points,
         rebound_points=rsi_rebound_points,
+        max_rebound_points=rsi_max_rebound_points,
         swing_lookback=rsi_swing_lookback,
     )
     open_value = (last_price - entry_price) * shares if in_trade else 0.0
@@ -2058,6 +2086,8 @@ def simulate_rsi_mean_reversion_strategy(
         "rsi_decline_points": decline,
         "rsi_rebound_points": rebound,
         "required_rsi_rebound_points": rsi_rebound_points,
+        "rsi_max_rebound_points": rsi_max_rebound_points,
+        "rsi_rebound_too_large": rebound_too_large,
         "prior_p": float(prices[live_bar - 1]),
         "rsi_sell_level": min(rsi_overbought, float(live_setup_low or rsi_oversold) + rsi_sell_recovery_points),
         "rsi_length": rsi_length,
@@ -2071,6 +2101,9 @@ def simulate_rsi_mean_reversion_strategy(
         "buy_requirements": {
             f"RSI({rsi_length}) reached {rsi_oversold:g} or fell {rsi_decline_points:g} points": setup_armed or setup_ready,
             f"RSI rebounded {rsi_rebound_points:g} points from the setup low": bool(rebound is not None and rebound >= rsi_rebound_points),
+            f"RSI rebound stayed at or below {rsi_max_rebound_points:g} points": bool(
+                rebound is not None and rebound <= rsi_max_rebound_points
+            ),
             "Price closed above the prior completed bar": last_price > float(prices[live_bar - 1]),
             "Position size above zero": pos_size > 0,
         },
@@ -2103,6 +2136,11 @@ def simulate_rsi_mean_reversion_strategy(
         "no_trade_reason": (
             "BUY intent is present."
             if proposed_trade_intent is not None
+            else (
+                f"No BUY because RSI rebounded more than the {rsi_max_rebound_points:g}-point maximum. "
+                "That setup expired; wait for RSI to fall and arm a new setup."
+            )
+            if rebound_too_large
             else f"No BUY because RSI has not rebounded {rsi_rebound_points:g} points from an armed setup low with price turning up."
         ),
     })

@@ -102,9 +102,17 @@ def build_buy_level_snapshot(
         low = _number(live.get("rsi_setup_low"))
         rebound = _number(live.get("rsi_rebound_points"))
         required_rebound = _number(live.get("required_rsi_rebound_points"))
+        maximum_rebound = _number(live.get("rsi_max_rebound_points"))
         prior = _number(live.get("prior_p"))
         add("Arm RSI setup", f"RSI {rsi:.1f}" if rsi is not None else "RSI unavailable", f"RSI reaches {live.get('rsi_oversold', 30)} or falls {live.get('required_rsi_decline_points', 40)} points", _status(requirements, "RSI("), "This setup is driven by RSI, not one fixed stock price.")
         add("RSI rebound", f"{rebound:.1f} points from {low:.1f}" if rebound is not None and low is not None else "Not armed", f"At least {required_rebound:g} points" if required_rebound is not None else "Saved rebound", _status(requirements, "RSI rebounded"), "RSI must recover from the setup low.")
+        add(
+            "Maximum RSI rebound",
+            f"{rebound:.1f} points" if rebound is not None else "Waiting for setup",
+            f"No more than {maximum_rebound:g} points" if maximum_rebound is not None else "Saved maximum",
+            _status(requirements, "stayed at or below"),
+            "If completed-bar RSI rebounds farther than this before the buy, the setup expires so the app does not chase a late entry.",
+        )
         add("Price confirmation", _money(current), f"Completed {timeframe} bar above prior close {_money(prior)}", _status(requirements, "prior completed bar"), "Price must also turn upward.", prior)
 
     generic_requirements = not rows and bool(requirements)

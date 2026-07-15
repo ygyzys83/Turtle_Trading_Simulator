@@ -183,6 +183,7 @@ def buy_watch_plan_sidebar_inputs(plan: BuyWatchPlan) -> dict[str, Any]:
         "rsi_overbought_input": float(settings.get("rsi_overbought", 70.0)),
         "rsi_decline_points_input": float(settings.get("rsi_decline_points", 40.0)),
         "rsi_rebound_points_input": float(settings.get("rsi_rebound_points", 3.0)),
+        "rsi_max_rebound_points_input": float(settings.get("rsi_max_rebound_points", 12.0)),
         "rsi_sell_recovery_points_input": float(settings.get("rsi_sell_recovery_points", 35.0)),
         "rsi_swing_lookback_input": int(settings.get("rsi_swing_lookback", 24)),
         "rsi_stop_mode_input": stop_mode_labels.get(
@@ -201,7 +202,6 @@ def buy_watch_plan_sidebar_inputs(plan: BuyWatchPlan) -> dict[str, Any]:
         ),
         "allowed_symbols_input": ", ".join(limits.get("allowed_symbols") or ()),
         "allow_add_to_existing_position_input": bool(limits.get("allow_add_to_existing_position", False)),
-        "max_auto_buys_per_session_input": int(settings.get("max_auto_buys_per_session", 3)),
         "reentry_cooldown_minutes_input": int(settings.get("reentry_cooldown_minutes", 60)),
         "paper_buy_limit_adjustment_pct_input": float(plan.limit_adjustment_pct),
         "paper_buy_custom_limit_price_input": float(plan.custom_limit_price),
@@ -252,6 +252,7 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
         {"Area": "RSI scalp", "Input": "Arm at or below RSI", "Saved Value": number("rsi_oversold")},
         {"Area": "RSI scalp", "Input": "Arm after RSI decline", "Saved Value": number("rsi_decline_points", " points")},
         {"Area": "RSI scalp", "Input": "Buy after RSI rebound", "Saved Value": number("rsi_rebound_points", " points")},
+        {"Area": "RSI scalp", "Input": "Maximum RSI rebound allowed for buy", "Saved Value": number("rsi_max_rebound_points", " points")},
         {"Area": "RSI scalp", "Input": "Sell after RSI recovery", "Saved Value": number("rsi_sell_recovery_points", " points")},
         {"Area": "RSI scalp", "Input": "RSI sell cap", "Saved Value": number("rsi_overbought")},
         {
@@ -303,7 +304,6 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
         {"Area": "Order", "Input": "Allow limit buys outside market hours", "Saved Value": yes_no(settings.get("allow_limit_buys_outside_market_hours", False))},
         {"Area": "Automation", "Input": "Check automation every", "Saved Value": number("automation_refresh_seconds", " seconds")},
         {"Area": "Automation", "Input": "Repeat after exit", "Saved Value": yes_no(plan.repeat_after_exit)},
-        {"Area": "Automation", "Input": "Max automatic buys this session", "Saved Value": number("max_auto_buys_per_session")},
         {"Area": "Automation", "Input": "Wait after an exit before re-buying", "Saved Value": number("reentry_cooldown_minutes", " minutes")},
         {"Area": "Automation", "Input": "Order sizing account", "Saved Value": "Current Alpaca paper account at execution"},
         {"Area": "Automation", "Input": "Order reference price", "Saved Value": "Latest available Alpaca IEX trade at execution"},

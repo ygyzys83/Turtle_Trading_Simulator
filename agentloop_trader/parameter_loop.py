@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from hashlib import sha256
 from itertools import product
+import json
 from math import e, sqrt
 from statistics import NormalDist, median
 from typing import Any, Callable
@@ -57,6 +58,11 @@ class OptimizerCandidate:
     plateau_neighbors: int = 1
     plateau_median_return_percent: float = 0.0
     plateau_profitable_percent: float = 0.0
+    combined_rank_percentile: float = 0.0
+    nearby_top_count: int = 0
+    nearby_top_percent: float = 0.0
+    nearby_varied_inputs: int = 0
+    nearby_stability: str = "Isolated result"
     rolling_profitable_windows: int = 0
     rolling_windows: int = 0
     rolling_median_return_percent: float = 0.0
@@ -583,10 +589,23 @@ def optimize_strategy_inputs(
             stress_rows,
             trial_adjustment,
         )
-        if not parameter_range:
+        if best.nearby_stability == "Isolated result":
             final_confidence = "Low"
             final_stability = (
-                "No stable nearby numeric range was found. Treat this as an isolated historical result, not a durable setting recommendation."
+                f"Isolated result: only {best.nearby_top_count} of {best.plateau_neighbors} nearby settings "
+                "ranked in the top third of the combinations tested."
+            )
+        elif best.nearby_stability == "Partial stable region":
+            if final_confidence == "High":
+                final_confidence = "Medium"
+            final_stability = (
+                f"Partial stable region: {best.nearby_top_count} of {best.plateau_neighbors} nearby settings "
+                "ranked in the top third, with one or more inputs varying."
+            )
+        else:
+            final_stability = (
+                f"Broad stable region: {best.nearby_top_count} of {best.plateau_neighbors} nearby settings "
+                "ranked in the top third, with multiple inputs varying."
             )
         updated_best = replace(best, confidence=final_confidence, stability=final_stability)
         ranked = [updated_best if row is best else row for row in ranked]
@@ -737,15 +756,24 @@ def candidate_verdict(
     else:
         add("After-cost expectancy", "uncertain", f"Positive after costs, but resampled profit probability was only {positive_probability:.1f}%.")
 
-    nearby = candidate.plateau_profitable_percent
-    if nearby >= 70:
-        add("Nearby settings", "strong", f"{nearby:.0f}% of nearby settings were profitable.")
-    elif nearby >= 50:
-        add("Nearby settings", "promising", f"{nearby:.0f}% of nearby settings were profitable.")
-    elif nearby < 25 and candidate.plateau_neighbors >= 3:
-        add("Nearby settings", "failed", f"Only {nearby:.0f}% of nearby settings were profitable.")
+    if candidate.nearby_stability == "Broad stable region":
+        add(
+            "Nearby settings",
+            "strong",
+            f"{candidate.nearby_top_count} of {candidate.plateau_neighbors} nearby settings ranked in the top third.",
+        )
+    elif candidate.nearby_stability == "Partial stable region":
+        add(
+            "Nearby settings",
+            "promising",
+            f"{candidate.nearby_top_count} of {candidate.plateau_neighbors} nearby settings ranked in the top third.",
+        )
     else:
-        add("Nearby settings", "uncertain", f"{nearby:.0f}% of nearby settings were profitable.")
+        add(
+            "Nearby settings",
+            "uncertain",
+            f"Only {candidate.nearby_top_count} of {candidate.plateau_neighbors} nearby settings ranked in the top third.",
+        )
 
     slippage_bps = 0 if diagnostics is None else diagnostics.slippage_survival_bps
     if slippage_bps >= 20:
@@ -1236,7 +1264,13 @@ def generate_optimizer_settings(
     max_candidates_per_strategy: int = 18,
     strategy_types: set[str] | None = None,
 ) -> list[tuple[str, str, dict[str, Any]]]:
-    base = _normal_settings(current_settings)
+    # Strategy inputs shown elsewhere in the UI must not steer which optimizer
+    # combinations are sampled. Preserve only the sizing assumption that the
+    # backtest actually uses; all searched and informational inputs start from
+    # one stable baseline.
+    base = _normal_settings({
+        "risk_per_trade_pct": current_settings.get("risk_per_trade_pct", 1.0),
+    })
     rows: list[tuple[str, str, dict[str, Any]]] = []
     for strategy_label, strategy_type in OPTIMIZER_STRATEGY_TYPES.items():
         if strategy_types is not None and strategy_type not in strategy_types:
@@ -1411,7 +1445,7 @@ def _broad_optimizer_sample(
     *,
     max_candidates: int,
 ) -> list[dict[str, Any]]:
-    """Return one current-like setup plus deterministic coverage of the full range."""
+    """Return one neutral baseline plus deterministic coverage of the full range."""
     if not rows or max_candidates <= 0:
         return []
     nearest = min(rows, key=lambda row: _settings_distance(base, row))
@@ -1440,6 +1474,36 @@ def _broad_optimizer_sample(
         covered.update((key, str(best.get(key))) for key in varying_keys)
         remaining.remove(best)
     return selected
+
+
+def strategy_input_search_identity(
+    *,
+    ticker: str,
+    data_source: str,
+    risk_per_trade_pct: float,
+    risk_limits: dict[str, Any],
+    settings_per_strategy: int,
+    display_interval: str = "",
+    display_history: str = "",
+    market_fingerprint: str = "",
+) -> str:
+    """Identify material search assumptions without coupling to displayed inputs."""
+    payload: dict[str, Any] = {
+        "ticker": str(ticker).strip().upper(),
+        "source": str(data_source),
+        "strategy_risk_per_trade_pct": float(risk_per_trade_pct),
+        "risk_limits": risk_limits,
+        "older_data_fraction": 0.55,
+        "settings_per_strategy": int(settings_per_strategy),
+        "search_version": "four-trend-strategies-relative-stability-v4",
+    }
+    if str(data_source) == "Synthetic":
+        payload.update({
+            "interval": str(display_interval),
+            "history": str(display_history),
+            "market_data": str(market_fingerprint),
+        })
+    return sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
 
 
 def optimizer_summary(candidate: OptimizerCandidate | None) -> str:
@@ -1490,7 +1554,19 @@ def optimizer_recommendation_records(
             "Value": _annualized_text(candidate.test_annualized_return_percent),
             "Plain English": "Shown only when the middle validation period is longer than one year.",
         },
-        {"Item": "Strong nearby range", "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}), "Plain English": "Nearby profitable settings. A useful result should not depend on one exact number."},
+        {
+            "Item": "Input stability",
+            "Value": candidate.nearby_stability,
+            "Plain English": (
+                f"{candidate.nearby_top_count} of {candidate.plateau_neighbors} nearby settings ranked in the top third. "
+                "The ranking gives 40% weight to the older results and 60% to the newer results."
+            ),
+        },
+        {
+            "Item": "Strong nearby input ranges",
+            "Value": _parameter_range_text(candidate.strategy_type, evidence.parameter_range if evidence else {}),
+            "Plain English": "Inputs that varied while nearby settings remained near the top of all combinations tested.",
+        },
         {"Item": "Validation and final-period comparison", "Value": benchmark_read, "Plain English": f"Middle validation advantage {candidate.excess_return_percent:+.2f}%; untouched final-period advantage {locked.excess_return_percent:+.2f}%" if locked else "Untouched final-period comparison is unavailable."},
         {
             "Item": "Annualized buy-and-hold return",
@@ -1527,7 +1603,11 @@ def optimizer_robustness_records(result: StrategyInputRecommendation) -> list[di
     bootstrap = evidence.bootstrap
     trial = evidence.trial_adjustment
     return [
-        {"Check": "Nearby settings", "Result": f"{candidate.plateau_profitable_percent:.0f}% profitable across {candidate.plateau_neighbors} nearby settings", "Why it matters": "Avoids choosing an isolated lucky setting."},
+        {
+            "Check": "Nearby settings",
+            "Result": f"{candidate.nearby_stability}; {candidate.nearby_top_count} of {candidate.plateau_neighbors} ranked in the top third",
+            "Why it matters": "Shows whether strong performance persisted when nearby inputs changed.",
+        },
         {"Check": "Rolling periods", "Result": f"{candidate.rolling_profitable_windows}/{candidate.rolling_windows} profitable; median {candidate.rolling_median_return_percent:.2f}%", "Why it matters": "Checks different chronological periods."},
         {"Check": "Locked final period", "Result": _locked_text(locked), "Why it matters": locked.detail if locked else "Not available."},
         {"Check": "Resampled trade results", "Result": _bootstrap_text(bootstrap), "Why it matters": "Estimates how sensitive results are to a different ordering and mix of trades."},
@@ -1567,7 +1647,8 @@ def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int
             "Allocated Worst Drop %": candidate.test_max_drawdown_percent,
             "Profitable Periods": f"{candidate.profitable_test_periods}/{candidate.tested_periods}",
             "Nearby Settings": candidate.plateau_neighbors,
-            "Nearby Profitable %": candidate.plateau_profitable_percent,
+            "Nearby Top-Third %": candidate.nearby_top_percent,
+            "Input Stability": candidate.nearby_stability,
             "Rolling Periods": f"{candidate.rolling_profitable_windows}/{candidate.rolling_windows}",
             "Plain English": candidate.reason,
         }
@@ -1696,7 +1777,6 @@ def strategy_search_settings_records(strategy_result: StrategySearchResult) -> l
         return []
     evidence = recommendation.robustness
     settings_range = evidence.parameter_range if evidence else {}
-    stable_range = bool(settings_range)
     _, newer_percent, _ = _optimizer_split_percentages(recommendation)
     return [
         {
@@ -1705,28 +1785,24 @@ def strategy_search_settings_records(strategy_result: StrategySearchResult) -> l
             "Plain English": f"These exact settings produced this strategy's best result in the newer {newer_percent}% of prices.",
         },
         {
-            "Item": "Other settings with similar results",
-            "Value": (
-                _parameter_range_text(candidate.strategy_type, settings_range)
-                if stable_range else "No stable nearby range found"
-            ),
+            "Item": "Input stability",
+            "Value": candidate.nearby_stability,
             "Plain English": (
-                "Several distinct numeric combinations produced similar results across at least two inputs."
-                if stable_range else
-                "The surrounding numeric settings did not confirm this result. It may depend on one lucky combination."
+                f"{candidate.nearby_top_count} of {candidate.plateau_neighbors} nearby settings ranked in the top third. "
+                "This combines the older results at 40% and the newer results at 60%."
             ),
         },
         {
-            "Item": "Nearby settings that beat buy-and-hold",
-            "Value": f"{candidate.plateau_profitable_percent:.0f}% of {candidate.plateau_neighbors}",
+            "Item": "Strong nearby input ranges",
+            "Value": _parameter_range_text(candidate.strategy_type, settings_range),
             "Plain English": (
-                "A broader area that repeatedly beats buy-and-hold is more useful than one isolated winning setup."
+                "These inputs changed while nearby combinations remained near the top. Exact values are omitted when no dependable range appeared."
             ),
         },
         {
-            "Item": "Estimated trading friction",
-            "Value": "Included in the detailed cost checks",
-            "Plain English": "The strategy result includes Alpaca fees; the detailed test also shows added price slippage.",
+            "Item": "Newer-data result versus buy-and-hold",
+            "Value": f"{candidate.excess_return_percent:+.2f}%",
+            "Plain English": "This is a separate performance comparison. It does not determine whether the input range is stable.",
         },
     ]
 
@@ -1771,7 +1847,7 @@ def _settings_text(settings: dict[str, Any]) -> str:
 
 def _parameter_range_text(strategy_type: str, ranges: dict[str, tuple[float, float]]) -> str:
     if not ranges:
-        return "Not available"
+        return "No dependable range found"
     labels = {
         "entry_window": "buy lookback",
         "exit_window": "sell exit",
@@ -2023,19 +2099,56 @@ def _evaluate_range(
 
 
 def _attach_plateau_scores(candidates: list[OptimizerCandidate]) -> list[OptimizerCandidate]:
+    combined_scores: dict[int, float] = {}
+    for strategy_type in {row.strategy_type for row in candidates}:
+        strategy_rows = [row for row in candidates if row.strategy_type == strategy_type]
+        older_values = [row.train_excess_return_percent for row in strategy_rows]
+        newer_values = [row.excess_return_percent for row in strategy_rows]
+        for row in strategy_rows:
+            older_rank = _relative_rank_percentile(older_values, row.train_excess_return_percent)
+            newer_rank = _relative_rank_percentile(newer_values, row.excess_return_percent)
+            combined_scores[id(row)] = 0.40 * older_rank + 0.60 * newer_rank
+
     updated = []
     for candidate in candidates:
         neighbors = _distinct_numeric_neighbors(candidate, candidates)
         returns = [row.excess_return_percent for row in neighbors]
         median_return = float(median(returns)) if returns else candidate.excess_return_percent
         profitable_percent = sum(value > 0 for value in returns) / len(returns) * 100 if returns else 0.0
+        top_neighbors = [row for row in neighbors if combined_scores.get(id(row), 0.0) >= (200.0 / 3.0)]
+        top_percent = len(top_neighbors) / len(neighbors) * 100 if neighbors else 0.0
+        keys = _optimizer_numeric_keys(candidate.strategy_type)
+        varied_inputs = sum(
+            len({row.settings[key] for row in top_neighbors}) > 1
+            for key in keys
+        )
+        if len(top_neighbors) >= 5 and top_percent >= 50.0 and varied_inputs >= 2:
+            stability = "Broad stable region"
+        elif len(top_neighbors) >= 3 and top_percent >= 50.0 and varied_inputs >= 1:
+            stability = "Partial stable region"
+        else:
+            stability = "Isolated result"
         updated.append(replace(
             candidate,
             plateau_neighbors=len(neighbors),
             plateau_median_return_percent=round(median_return, 2),
             plateau_profitable_percent=round(profitable_percent, 1),
+            combined_rank_percentile=round(combined_scores.get(id(candidate), 0.0), 1),
+            nearby_top_count=len(top_neighbors),
+            nearby_top_percent=round(top_percent, 1),
+            nearby_varied_inputs=varied_inputs,
+            nearby_stability=stability,
         ))
     return updated
+
+
+def _relative_rank_percentile(values: list[float], value: float) -> float:
+    """Return 100 for the strongest relative result and 0 for the weakest."""
+    if len(values) <= 1:
+        return 100.0
+    lower = sum(item < value for item in values)
+    equal = sum(item == value for item in values)
+    return (lower + (equal - 1) / 2) / (len(values) - 1) * 100.0
 
 
 def _distinct_numeric_neighbors(
@@ -2055,17 +2168,13 @@ def _distinct_numeric_neighbors(
     return list(neighbors.values())
 
 
-def _similar_profitable_neighbors(
+def _relative_top_neighbors(
     best: OptimizerCandidate,
     candidates: list[OptimizerCandidate],
 ) -> list[OptimizerCandidate]:
-    if best.excess_return_percent <= 0:
-        return []
-    tolerance = max(1.0, abs(best.excess_return_percent) * 0.20)
     return [
         row for row in _distinct_numeric_neighbors(best, candidates)
-        if row.excess_return_percent > 0
-        and row.excess_return_percent >= best.excess_return_percent - tolerance
+        if row.combined_rank_percentile >= (200.0 / 3.0)
     ]
 
 
@@ -2109,20 +2218,17 @@ def _parameter_plateau_range(
     best: OptimizerCandidate,
     candidates: list[OptimizerCandidate],
 ) -> dict[str, tuple[float, float]]:
-    neighbors = _similar_profitable_neighbors(best, candidates)
-    keys = _optimizer_numeric_keys(best.strategy_type)
-    varied_keys = sum(
-        len({row.settings[key] for row in neighbors}) > 1
-        for key in keys
-    )
-    if len(neighbors) < 4 or varied_keys < 2:
+    if best.nearby_stability == "Isolated result":
         return {}
+    neighbors = _relative_top_neighbors(best, candidates)
+    keys = _optimizer_numeric_keys(best.strategy_type)
     return {
         key: (
             min(float(row.settings[key]) for row in neighbors),
             max(float(row.settings[key]) for row in neighbors),
         )
         for key in keys
+        if len({row.settings[key] for row in neighbors}) > 1
     }
 
 
