@@ -121,6 +121,14 @@ from agentloop_trader.market_data import (
     fetch_yfinance_bars,
 )
 from agentloop_trader.manual_order import build_manual_buy_intent
+from agentloop_trader.management_chart import (
+    build_management_chart,
+    management_chart_history,
+    position_level_explanation,
+    position_price_levels,
+    queued_price_levels,
+    trim_management_data,
+)
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
 from agentloop_trader.position_lifecycle import (
     initialize_exit_settings_for_position,
@@ -1146,10 +1154,47 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
             {"Area": "Automation", "Item": "Current action", "Status / Value": "Not managed", "Plain English": "Choose exit settings below and save them only if you want the app to manage this position."},
         ]
     trigger = optional_float(exit_details.get("trigger_price"))
-    distance_to_exit = ((current_price - trigger) / current_price * 100) if current_price and trigger is not None else None
     profit_r = optional_float(exit_details.get("profit_r"))
     highest_profit_r = optional_float(exit_details.get("highest_profit_r"))
     exit_mode = exit_mode_for_settings(settings)
+    price_trigger = optional_float(exit_details.get("price_trigger_price"))
+    if price_trigger is None:
+        price_trigger = optional_float(exit_details.get("trigger_price"))
+    distance_to_exit = (
+        ((current_price - price_trigger) / current_price * 100)
+        if current_price and price_trigger is not None
+        else None
+    )
+    price_trigger_source = str(
+        exit_details.get("price_trigger_source")
+        or exit_details.get("trigger_source")
+        or "Not calculated"
+    )
+    protection_levels = [
+        ("fill-adjusted initial stop", optional_float(exit_details.get("original_stop_price"))),
+        ("strategy exit", optional_float(exit_details.get("strategy_exit_price"))),
+        ("break-even stop", optional_float(exit_details.get("breakeven_stop_price"))),
+        ("ATR trail", optional_float(exit_details.get("trailing_stop_price"))),
+    ]
+    active_protection_levels = [
+        (label, price)
+        for label, price in protection_levels
+        if price is not None
+    ]
+    if active_protection_levels:
+        protection_summary = "; ".join(
+            f"{label} ${price:,.2f}"
+            for label, price in active_protection_levels
+        )
+        governing_explanation = (
+            f"For a long position, the highest active protection level controls. "
+            f"Current levels: {protection_summary}. "
+            f"The current price stop is the {price_trigger_source} at ${price_trigger:,.2f}."
+            if price_trigger is not None
+            else f"For a long position, the highest active protection level controls. Current levels: {protection_summary}."
+        )
+    else:
+        governing_explanation = "No current sell level has been calculated."
     rows = position_rows + [
         {"Area": "Exit plan", "Item": "Current position cycle", "Status / Value": str(settings.get("position_cycle_id", "Not recorded")), "Plain English": "The Alpaca fill cycle this plan belongs to. A full exit ends this cycle; a later re-entry gets a new one."},
         {"Area": "Exit plan", "Item": "Plan anchored to fill", "Status / Value": str(settings.get("position_basis_order_id", settings.get("entry_broker_order_id", "Not recorded"))), "Plain English": "The latest filled BUY that currently establishes this plan's average entry and profit-protection starting point."},
@@ -1168,8 +1213,9 @@ def position_management_summary_records(position: dict, settings: dict, exit_det
         {"Area": "Profit protection", "Item": "Highest profit reached in R", "Status / Value": f"{highest_profit_r:.2f}R" if highest_profit_r is not None else "Not available", "Plain English": "Highest price reached since entry compared with original trade risk. This turns profit protection on permanently."},
         {"Area": "Profit protection", "Item": "ATR trail", "Status / Value": money_or_missing(exit_details.get("trailing_stop_price")), "Plain English": "Highest high since entry minus the trailing ATR distance."},
         {"Area": "Profit protection", "Item": "Break-even stop", "Status / Value": money_or_missing(exit_details.get("breakeven_stop_price")), "Plain English": "Turns on after the saved profit threshold."},
-        {"Area": "Automation", "Item": "Active sell trigger", "Status / Value": money_or_missing(trigger), "Plain English": f"Sell if price reaches this level or lower. Source: {exit_details.get('trigger_source', 'exit rule')}."},
-        {"Area": "Automation", "Item": "Room before exit", "Status / Value": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not available", "Plain English": "How far current price is above the active sell trigger."},
+        {"Area": "Automation", "Item": "Why this sell price controls", "Status / Value": price_trigger_source.title(), "Plain English": governing_explanation},
+        {"Area": "Automation", "Item": "Active price stop", "Status / Value": money_or_missing(price_trigger), "Plain English": f"Sell if price reaches this level or lower. Source: {price_trigger_source}."},
+        {"Area": "Automation", "Item": "Room before price stop", "Status / Value": pct_or_missing(distance_to_exit) if distance_to_exit is not None else "Not available", "Plain English": "How far current price is above the active price stop."},
         {"Area": "Automation", "Item": "Current action", "Status / Value": "Exit now" if exit_details.get("ready") else "Hold", "Plain English": str(exit_details.get("reason", ""))},
     ]
     if exit_mode == "atr_only":
@@ -1884,6 +1930,128 @@ def build_chart(
         hovermode="x unified",
     )
     return fig
+
+
+def render_saved_strategy_chart(
+    *,
+    symbol: str,
+    settings: dict,
+    context: str,
+    current_price: float | None,
+    entry_price: float | None = None,
+    entry_time=None,
+    exit_details: dict | None = None,
+    next_buy_level: float | None = None,
+    requirement_rows: list[dict] | None = None,
+    last_checked_at: str = "",
+) -> None:
+    """Load one selected chart on demand; no orders or saved settings are changed."""
+    chart_settings = {
+        **settings,
+        "symbol": symbol,
+    }
+    interval_value = str(chart_settings.get("interval") or "1h")
+    saved_history_value = str(
+        chart_settings.get("history")
+        or exit_plan_history_for_interval(interval_value)
+    )
+    history_value = management_chart_history(interval_value, saved_history_value)
+    asset_class = normalize_asset_class(
+        str(chart_settings.get("asset_class") or ""),
+        symbol,
+    )
+    price_source = str(chart_settings.get("price_data_source") or "Ticker (Alpaca)")
+    if asset_class == "crypto":
+        price_source = "Crypto (Alpaca)"
+    chart_settings.update({
+        "history": history_value,
+        "interval": interval_value,
+        "price_data_source": price_source,
+        "asset_class": asset_class,
+    })
+    chart_label = "position" if context == "position" else "queued setup"
+    with st.spinner(f"Loading {symbol} {chart_label} chart from completed {interval_value} bars..."):
+        chart_data = fetch_price_data_for_source(
+            symbol,
+            history_value,
+            interval_value,
+            price_source,
+        )
+        chart_data = trim_management_data(chart_data, chart_settings, visible_bars=90)
+        atr_only_position = context == "position" and exit_mode_for_settings(chart_settings) == "atr_only"
+        chart_result = (
+            {
+                "prices": chart_data["Close"].to_numpy(dtype=float),
+                "smas": [],
+                "live": {},
+            }
+            if atr_only_position
+            else calculate_selected_strategy_result(
+                chart_data,
+                chart_settings,
+                float(chart_settings.get("account_size", 100_000)),
+            )
+        )
+    if context == "position":
+        current_exit_details = dict(exit_details or {})
+        levels = position_price_levels(
+            entry_price=entry_price,
+            current_price=current_price,
+            settings=chart_settings,
+            exit_details=current_exit_details,
+        )
+        explanation = position_level_explanation(current_exit_details)
+        chart_settings["_position_current_rsi"] = current_exit_details.get("current_rsi")
+        chart_settings["_position_rsi_sell_level"] = current_exit_details.get("rsi_sell_level")
+    else:
+        live = dict(chart_result.get("live") or {})
+        levels = queued_price_levels(
+            current_price=current_price,
+            settings=chart_settings,
+            live=live,
+            next_buy_level=next_buy_level,
+        )
+        rows = list(requirement_rows or [])
+        passed = sum(str(row.get("Status", "")).strip().lower() == "pass" for row in rows)
+        if next_buy_level is not None:
+            explanation = (
+                f"Next numeric BUY level: ${next_buy_level:,.2f}. "
+                f"{passed} of {len(rows)} displayed BUY requirements currently pass."
+            )
+        else:
+            explanation = (
+                f"This setup does not have one exact BUY price. "
+                f"{passed} of {len(rows)} displayed pattern and indicator requirements currently pass."
+            )
+    chart_display_settings = dict(chart_settings)
+    if context == "position" and exit_mode_for_settings(chart_settings) == "atr_only":
+        chart_display_settings.update({
+            "strategy_type": "atr_only",
+            "strategy_label": "ATR protection only",
+        })
+    chart_title = f"{symbol} | {interval_value} | {chart_display_settings.get('strategy_label', 'Saved setup')}"
+    st.markdown(f"**{chart_title}**")
+    figure = build_management_chart(
+        chart_data,
+        chart_display_settings,
+        chart_result,
+        title=chart_title,
+        static_levels=levels,
+        entry_time=entry_time,
+        entry_price=entry_price,
+    )
+    st.plotly_chart(
+        figure,
+        width="stretch",
+        config={"displaylogo": False, "scrollZoom": True},
+        key=f"{context}_level_chart_{symbol}_{interval_value}_{chart_display_settings.get('strategy_type', '')}",
+    )
+    st.info(explanation)
+    st.caption(
+        f"Strategy lines use completed {interval_value} bars. The Current quote line may move between completed bars. "
+        f"This chart loads shorter chart-only history; the saved {saved_history_value} history is unchanged. "
+        f"Last worker calculation: {time_or_missing(last_checked_at)}. This chart does not change automation or send an order."
+    )
 
 
 alpaca_config = AlpacaConfig.from_env()
@@ -4089,6 +4257,40 @@ def render_buy_watchlist_manager() -> None:
                 st.caption(
                     "Current levels have not been calculated for this setup yet. If the Background Worker is running, this panel will update automatically after its first pass."
                 )
+        watch_chart_open = st.session_state.get("visible_buy_watch_chart") == selected_watch_plan.plan_id
+        watch_chart_label = "Hide Setup Chart" if watch_chart_open else "View Setup Chart"
+        if st.button(
+            watch_chart_label,
+            key=f"toggle_buy_watch_chart_{selected_watch_plan.plan_id}",
+            help=(
+                "Loads an actual chart for only this queued setup and draws its saved BUY requirements. "
+                "It does not change the setup or send an order."
+            ),
+        ):
+            watch_chart_open = not watch_chart_open
+            st.session_state["visible_buy_watch_chart"] = (
+                selected_watch_plan.plan_id if watch_chart_open else ""
+            )
+        if watch_chart_open:
+            try:
+                render_saved_strategy_chart(
+                    symbol=selected_watch_plan.symbol,
+                    settings={
+                        **selected_watch_plan.strategy_settings,
+                        "interval": selected_watch_plan.interval,
+                        "history": selected_watch_plan.history,
+                        "price_data_source": selected_watch_plan.price_data_source,
+                        "strategy_label": selected_watch_plan.strategy_label,
+                        "asset_class": selected_watch_plan.asset_class,
+                    },
+                    context="queue",
+                    current_price=selected_watch_plan.latest_price,
+                    next_buy_level=selected_watch_plan.next_buy_level,
+                    requirement_rows=selected_watch_plan.buy_requirement_levels,
+                    last_checked_at=selected_watch_plan.last_checked_at,
+                )
+            except Exception as exc:
+                st.error(f"Could not load the saved setup chart: {exc}")
         with st.expander("Saved setup details", expanded=True):
             st.dataframe(
                 pd.DataFrame(buy_watch_plan_detail_records(selected_watch_plan)),
@@ -4320,6 +4522,39 @@ def render_open_positions_panel() -> None:
         st.info(f"Auto exit: sell {selected_position_symbol} if price is at or below ${float(selected_exit_trigger_price):,.2f}.")
     if has_saved_exit_plan and selected_exit_ready:
         st.warning(selected_exit_reason)
+    position_chart_open = st.session_state.get("visible_position_chart") == selected_position_symbol
+    position_chart_label = "Hide Position Chart" if position_chart_open else "View Position Chart"
+    if st.button(
+        position_chart_label,
+        key=f"toggle_position_chart_{selected_position_symbol}",
+        disabled=not has_saved_exit_plan,
+        help=(
+            "Loads an actual chart for this position using its saved interval, strategy, and exit settings. "
+            "It does not change the exit plan or send an order."
+        ),
+    ):
+        position_chart_open = not position_chart_open
+        st.session_state["visible_position_chart"] = (
+            selected_position_symbol if position_chart_open else ""
+        )
+    if position_chart_open and has_saved_exit_plan:
+        try:
+            render_saved_strategy_chart(
+                symbol=selected_position_symbol,
+                settings=selected_exit_settings,
+                context="position",
+                current_price=selected_current_price,
+                entry_price=selected_avg_entry,
+                entry_time=selected_exit_settings.get("entry_filled_at"),
+                exit_details=selected_exit_details,
+                last_checked_at=str(
+                    selected_exit_details.get("snapshot_checked_at")
+                    or selected_exit_settings.get("last_exit_checked_at")
+                    or ""
+                ),
+            )
+        except Exception as exc:
+            st.error(f"Could not load the position chart: {exc}")
     with st.expander("Position plan", expanded=False):
         st.dataframe(
             pd.DataFrame(

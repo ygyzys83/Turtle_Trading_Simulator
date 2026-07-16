@@ -242,6 +242,16 @@ def test_buy_watchlist_creation_and_management_are_on_their_intended_pages():
     assert "Open position automation status" not in positions_panel
 
 
+def test_position_and_queue_charts_are_explicitly_on_demand_and_non_operational():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert '"View Position Chart"' in text
+    assert '"View Setup Chart"' in text
+    assert "This chart does not change automation or send an order." in text
+    assert "Strategy lines use completed" in text
+    assert "render_saved_strategy_chart(" in text
+
+
 def test_position_stop_labels_distinguish_planned_price_from_fill_adjusted_stop():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 

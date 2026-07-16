@@ -276,6 +276,83 @@ def test_saved_exit_settings_without_worker_snapshot_still_show_initial_stop():
     assert "Start the Background Worker" in details["reason"]
 
 
+def test_saved_trigger_without_source_cannot_override_initial_stop():
+    settings = {
+        "auto_exit_enabled": True,
+        "exit_mode": "strategy_and_atr",
+        "entry_stop_distance": 5934.63,
+        "last_exit_trigger_price": 63873.23,
+        "interval": "4h",
+    }
+    position = {
+        "Symbol": "BTC/USD",
+        "Quantity": "0.076884498",
+        "Market Value": str(0.076884498 * 64162.99),
+        "Average Entry": "64172.62",
+    }
+
+    details = exit_details_from_snapshot(settings, position)
+
+    assert details["snapshot_available"] is False
+    assert details["original_stop_price"] == pytest.approx(58237.99)
+    assert details["trigger_price"] == pytest.approx(58237.99)
+    assert details["trigger_source"] == "fill-adjusted initial stop"
+    assert details.get("strategy_exit_price") is None
+
+
+def test_saved_strategy_trigger_without_snapshot_remains_explicit():
+    settings = {
+        "auto_exit_enabled": True,
+        "exit_mode": "strategy_and_atr",
+        "entry_stop_distance": 5934.63,
+        "last_exit_trigger_price": 63873.23,
+        "last_exit_trigger_source": "strategy exit",
+        "interval": "4h",
+    }
+    position = {
+        "Symbol": "BTC/USD",
+        "Quantity": "0.076884498",
+        "Market Value": str(0.076884498 * 64162.99),
+        "Average Entry": "64172.62",
+    }
+
+    details = exit_details_from_snapshot(settings, position)
+
+    assert details["snapshot_available"] is False
+    assert details["original_stop_price"] == pytest.approx(58237.99)
+    assert details["strategy_exit_price"] == pytest.approx(63873.23)
+    assert details["trigger_price"] == pytest.approx(63873.23)
+    assert details["trigger_source"] == "strategy exit"
+
+
+def test_snapshot_keeps_price_protection_separate_from_non_price_exit():
+    settings = {
+        "auto_exit_enabled": True,
+        "entry_stop_distance": 5.0,
+        "last_exit_snapshot": {
+            "ready": True,
+            "trigger_price": 95.0,
+            "trigger_source": "RSI recovery exit",
+            "price_trigger_price": 95.0,
+            "price_trigger_source": "fill-adjusted initial stop",
+            "original_stop_price": 95.0,
+        },
+    }
+    position = {
+        "Symbol": "TEST",
+        "Quantity": "10",
+        "Market Value": "1050",
+        "Average Entry": "100",
+    }
+
+    details = exit_details_from_snapshot(settings, position)
+
+    assert details["ready"] is True
+    assert details["trigger_source"] == "RSI recovery exit"
+    assert details["price_trigger_price"] == 95.0
+    assert details["price_trigger_source"] == "fill-adjusted initial stop"
+
+
 def test_exit_settings_high_water_mark_starts_at_entry_time(monkeypatch):
     index = pd.date_range("2026-07-09 15:00", periods=4, freq="h", tz="UTC")
     data = pd.DataFrame(

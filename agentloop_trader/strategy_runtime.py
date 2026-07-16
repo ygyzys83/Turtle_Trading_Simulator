@@ -35,6 +35,8 @@ EXIT_SNAPSHOT_FIELDS = (
     "current_price_source",
     "trigger_price",
     "trigger_source",
+    "price_trigger_price",
+    "price_trigger_source",
     "exit_mode",
     "strategy_exit_price",
     "original_stop_price",
@@ -170,17 +172,45 @@ def exit_details_from_snapshot(
     entry = _number(position.get("Average Entry"), _number(settings.get("entry_reference_price")))
     initial_risk = _number(settings.get("entry_stop_distance"))
     original_stop = entry - initial_risk if entry is not None and initial_risk and initial_risk > 0 else None
+    saved_trigger = _number(settings.get("last_exit_trigger_price"))
+    saved_trigger_source = str(settings.get("last_exit_trigger_source") or "").strip()
+    fallback_trigger = saved_trigger if saved_trigger_source else original_stop
     trigger = _number(
         details.get("trigger_price"),
-        _number(settings.get("last_exit_trigger_price"), original_stop),
+        fallback_trigger,
     )
     trigger_source = str(
         details.get("trigger_source")
-        or settings.get("last_exit_trigger_source")
+        or saved_trigger_source
         or ("fill-adjusted initial stop" if original_stop is not None else "exit rule")
     )
+    normalized_source = trigger_source.strip().lower()
+    non_price_trigger = normalized_source in {"rsi recovery exit", "maximum holding period"}
+    price_trigger = _number(details.get("price_trigger_price"), trigger)
+    price_trigger_source = str(details.get("price_trigger_source") or "").strip()
+    if not price_trigger_source and not non_price_trigger:
+        price_trigger_source = trigger_source
+    if not price_trigger_source and price_trigger is not None:
+        price_candidates = [
+            ("strategy exit", _number(details.get("strategy_exit_price"))),
+            ("fill-adjusted initial stop", _number(details.get("original_stop_price"), original_stop)),
+            ("break-even stop", _number(details.get("breakeven_stop_price"))),
+            ("ATR trail", _number(details.get("trailing_stop_price"))),
+        ]
+        matching = [
+            label
+            for label, value in price_candidates
+            if value is not None and abs(value - price_trigger) <= max(0.000001, abs(price_trigger) * 0.00000001)
+        ]
+        price_trigger_source = matching[0] if matching else "saved price protection"
+    if trigger is not None:
+        if normalized_source == "strategy exit" and details.get("strategy_exit_price") is None:
+            details["strategy_exit_price"] = trigger
+        elif normalized_source == "break-even stop" and details.get("breakeven_stop_price") is None:
+            details["breakeven_stop_price"] = trigger
+        elif normalized_source == "atr trail" and details.get("trailing_stop_price") is None:
+            details["trailing_stop_price"] = trigger
     snapshot_ready = bool(details.get("ready", False))
-    non_price_trigger = trigger_source in {"RSI recovery exit", "maximum holding period"}
     price_ready = bool(live_price is not None and trigger is not None and live_price <= trigger)
     ready = snapshot_ready if non_price_trigger else price_ready
 
@@ -194,6 +224,8 @@ def exit_details_from_snapshot(
         ),
         "trigger_price": trigger,
         "trigger_source": trigger_source,
+        "price_trigger_price": price_trigger,
+        "price_trigger_source": price_trigger_source,
         "exit_mode": details.get("exit_mode") or exit_mode_for_settings(settings),
         "original_stop_price": _number(details.get("original_stop_price"), original_stop),
         "interval": details.get("interval") or str(settings.get("interval", "1h")),
@@ -488,9 +520,17 @@ def evaluate_exit_settings(
             saved_trigger = None
         elif saved_trigger_source == "strategy exit" and not strategy_exit_enabled:
             saved_trigger = None
-        candidates = [("strategy exit", strategy_exit), ("fill-adjusted initial stop", original_stop), ("break-even stop", breakeven), ("ATR trail", atr_trail), ("saved trigger", saved_trigger)]
+        candidates = [
+            ("strategy exit", strategy_exit),
+            ("fill-adjusted initial stop", original_stop),
+            ("break-even stop", breakeven),
+            ("ATR trail", atr_trail),
+            (saved_trigger_source or "saved price protection", saved_trigger),
+        ]
         usable = [(name, value) for name, value in candidates if value is not None]
         source_name, trigger = max(usable, key=lambda item: item[1]) if usable else ("exit rule", None)
+        price_trigger_source = source_name
+        price_trigger = trigger
         saved_setup_low = _number(settings.get("entry_rsi_setup_low"))
         rsi_sell_level = (
             min(
@@ -573,6 +613,8 @@ def evaluate_exit_settings(
             "current_price_source": current_price_source,
             "trigger_price": trigger,
             "trigger_source": source_name,
+            "price_trigger_price": price_trigger,
+            "price_trigger_source": price_trigger_source,
             "exit_mode": exit_mode,
             "strategy_exit_price": strategy_exit,
             "original_stop_price": original_stop,
