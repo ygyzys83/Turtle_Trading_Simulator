@@ -24,6 +24,35 @@ from agentloop_trader.performance import (
 from agentloop_trader.strategy_runtime import STRATEGY_TYPES, _run_one
 
 
+ALPACA_STRATEGY_SEARCH_HISTORIES = {
+    "1h": "2y",
+    "4h": "5y",
+    "1d": "10y",
+}
+ALPACA_CRYPTO_STRATEGY_SEARCH_HISTORIES = {
+    "1h": "1y",
+    "4h": "2y",
+    "1d": "5y",
+}
+YFINANCE_STRATEGY_SEARCH_HISTORIES = {
+    "1h": "1y",
+    "4h": "1y",
+    "1d": "10y",
+}
+
+
+def strategy_search_interval_histories(data_source: str) -> dict[str, str]:
+    """Return the fixed datasets used by a real-price strategy input search."""
+    source = str(data_source).strip().lower()
+    if "crypto" in source and "alpaca" in source:
+        return dict(ALPACA_CRYPTO_STRATEGY_SEARCH_HISTORIES)
+    if "alpaca" in source:
+        return dict(ALPACA_STRATEGY_SEARCH_HISTORIES)
+    if "yfinance" in source or "yahoo" in source:
+        return dict(YFINANCE_STRATEGY_SEARCH_HISTORIES)
+    return {}
+
+
 @dataclass(frozen=True)
 class ParameterCandidate:
     config: StrategyConfig
@@ -188,6 +217,8 @@ class IntervalOptimizationResult:
     older_dates: str = "Older prices"
     newer_dates: str = "Newer prices"
     latest_dates: str = "Latest prices"
+    available_dates: str = "Not recorded"
+    available_bars: int = 0
 
 
 @dataclass(frozen=True)
@@ -923,7 +954,7 @@ def optimize_strategy_intervals(
     )
     for interval, (history, market_data) in market_data_by_interval.items():
         settings = dict(current_settings)
-        settings["interval"] = interval
+        settings.update({"interval": interval, "history": history})
         comparison_data = _calendar_slice(market_data, shared_start, shared_end)
         result = optimize_strategy_inputs(
             market_data=comparison_data,
@@ -1018,6 +1049,8 @@ def optimize_strategy_intervals(
             durability_excess_return_percent=round(durability_return - durability_benchmark, 2),
             durability_max_drawdown_percent=round(durability_drawdown, 2),
             durability_trades=durability_trades,
+            available_dates=_available_date_range(market_data),
+            available_bars=len(market_data),
         ))
     if not interval_rows:
         raise ValueError("No interval data was available for the strategy input search.")
@@ -1085,7 +1118,12 @@ def optimize_strategy_families(
             if progress_callback:
                 progress_callback(completed, len(tasks), f"Testing {strategy_label} with {interval} prices")
             settings = dict(current_settings)
-            settings.update({"strategy_label": strategy_label, "strategy_type": strategy_type, "interval": interval})
+            settings.update({
+                "strategy_label": strategy_label,
+                "strategy_type": strategy_type,
+                "interval": interval,
+                "history": history,
+            })
             recommendation = optimize_strategy_inputs(
                 market_data=market_data,
                 current_settings=settings,
@@ -1096,6 +1134,18 @@ def optimize_strategy_families(
                 max_local_candidates_per_strategy=max_local_candidates_per_strategy,
                 bootstrap_samples=bootstrap_samples,
                 strategy_types={strategy_type},
+            )
+            tagged_candidates = [
+                replace(
+                    candidate,
+                    settings={**candidate.settings, "interval": interval, "history": history},
+                )
+                for candidate in recommendation.candidates
+            ]
+            recommendation = replace(
+                recommendation,
+                best=tagged_candidates[0] if recommendation.best is not None else None,
+                candidates=tagged_candidates,
             )
             completed += 1
             if progress_callback:
@@ -1148,6 +1198,8 @@ def optimize_strategy_families(
                 older_dates=older_dates,
                 newer_dates=newer_dates,
                 latest_dates=latest_dates,
+                available_dates=_available_date_range(market_data),
+                available_bars=len(market_data),
             ))
         if not interval_rows:
             continue
@@ -1216,6 +1268,14 @@ def _optimizer_date_ranges(
         return left if left == right else f"{left} to {right}"
 
     return label(0, newer_start), label(newer_start, latest_start), label(latest_start, total)
+
+
+def _available_date_range(market_data: pd.DataFrame) -> str:
+    if market_data.empty or not isinstance(market_data.index, pd.DatetimeIndex):
+        return "Dates not available"
+    first = pd.Timestamp(market_data.index[0]).strftime("%b %d, %Y")
+    last = pd.Timestamp(market_data.index[-1]).strftime("%b %d, %Y")
+    return f"{first} to {last}"
 
 
 def _optimizer_split_percentages(
@@ -1495,7 +1555,7 @@ def strategy_input_search_identity(
         "risk_limits": risk_limits,
         "older_data_fraction": 0.55,
         "settings_per_strategy": int(settings_per_strategy),
-        "search_version": "four-trend-strategies-relative-stability-v4",
+        "search_version": "four-trend-strategies-relative-stability-v5",
     }
     if str(data_source) == "Synthetic":
         payload.update({
@@ -1817,7 +1877,9 @@ def strategy_search_interval_records(strategy_result: StrategySearchResult) -> l
             continue
         rows.append({
             "Interval": interval_result.interval,
-            "History": interval_result.history,
+            "Requested History": interval_result.history,
+            "Actual Price Dates": getattr(interval_result, "available_dates", "Run search again"),
+            "Completed Bars": getattr(interval_result, "available_bars", 0),
             f"Older {older_percent}% Trades": candidate.train_trades,
             f"Older {older_percent}% vs Buy and Hold": f"{candidate.train_excess_return_percent:+.2f}%",
             f"Newer {newer_percent}% vs Buy and Hold": f"{candidate.excess_return_percent:+.2f}%",
@@ -1826,6 +1888,24 @@ def strategy_search_interval_records(strategy_result: StrategySearchResult) -> l
             "Complete History Trades": interval_result.durability_trades,
         })
     return rows
+
+
+def strategy_search_data_records(result: MultiStrategySearchResult) -> list[dict[str, Any]]:
+    """Report each independently loaded dataset once, regardless of strategy count."""
+    by_interval: dict[str, IntervalOptimizationResult] = {}
+    for strategy_result in result.strategy_results:
+        for interval_result in strategy_result.interval_results:
+            by_interval.setdefault(interval_result.interval, interval_result)
+    order = {"1h": 0, "4h": 1, "1d": 2}
+    return [
+        {
+            "Interval": row.interval,
+            "Requested History": row.history,
+            "Actual Price Dates": getattr(row, "available_dates", "Run search again"),
+            "Completed Bars": getattr(row, "available_bars", 0),
+        }
+        for row in sorted(by_interval.values(), key=lambda item: order.get(item.interval, 99))
+    ]
 
 
 def _settings_text(settings: dict[str, Any]) -> str:

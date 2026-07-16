@@ -163,9 +163,11 @@ from agentloop_trader.parameter_loop import (
     optimizer_robustness_records,
     optimizer_stress_records,
     strategy_search_detail_records,
+    strategy_search_data_records,
     strategy_search_interval_records,
     strategy_search_ranking_records,
     strategy_search_settings_records,
+    strategy_search_interval_histories,
     strategy_input_search_identity,
     validate_settings_across_tickers,
 )
@@ -3263,6 +3265,7 @@ def persist_current_position_plan(
 
 
 optimizer_market_fingerprint = "synthetic-default"
+OPTIMIZER_SEARCH_STATE_VERSION = 2
 if data_source == "Synthetic" and market_data is not None:
     fingerprint_columns = [
         column for column in ("Open", "High", "Low", "Close", "Volume")
@@ -3301,39 +3304,49 @@ if run_strategy_input_search:
                     max_candidates_per_strategy=max_parameter_candidates,
                 )
             else:
-                if data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}:
-                    interval_histories = {"15m": "3mo", "1h": "2y", "4h": "5y", "1d": "10y"}
-                else:
-                    interval_histories = {"15m": "1mo", "1h": "1y", "4h": "1y", "1d": "10y"}
+                interval_histories = strategy_search_interval_histories(data_source)
+                if not interval_histories:
+                    raise ValueError("The strategy input search requires Alpaca or yfinance price data.")
                 interval_market_data = {}
-                for search_interval, search_history in interval_histories.items():
-                    try:
-                        if search_interval == interval and search_history == period and market_data is not None:
-                            search_data = market_data
-                        else:
-                            search_data = fetch_price_data_for_source(
-                                ticker,
-                                search_history,
-                                search_interval,
-                                data_source,
-                            )
-                        interval_market_data[search_interval] = (search_history, search_data)
-                    except Exception as exc:
-                        interval_errors.append(f"{search_interval}: {exc}")
+                strategy_test_count = len(OPTIMIZER_STRATEGY_TYPES) * len(interval_histories)
+                total_progress_steps = len(interval_histories) + strategy_test_count
                 progress_bar = st.progress(0.0)
                 progress_text = st.empty()
+                for download_number, (search_interval, search_history) in enumerate(
+                    interval_histories.items(), start=1
+                ):
+                    progress_text.caption(
+                        f"Downloading {search_interval} prices ({search_history}) "
+                        f"({download_number} of {len(interval_histories)} datasets)"
+                    )
+                    try:
+                        search_data = fetch_price_data_for_source(
+                            ticker,
+                            search_history,
+                            search_interval,
+                            data_source,
+                        )
+                        interval_market_data[search_interval] = (search_history, search_data)
+                    except Exception as exc:
+                        interval_errors.append(f"{search_interval} / {search_history}: {exc}")
+                    progress_bar.progress(download_number / max(1, total_progress_steps))
+                if interval_errors:
+                    raise ValueError(
+                        "The strategy input search did not run because all three fixed datasets are required. "
+                        + "; ".join(interval_errors)
+                    )
 
                 def update_optimizer_progress(completed, total, label):
-                    progress_bar.progress(completed / max(1, total))
+                    progress_bar.progress(
+                        (len(interval_histories) + completed) / max(1, total_progress_steps)
+                    )
                     progress_text.caption(f"{label} ({completed} of {total} strategy and interval tests complete)")
 
                 family_result = optimize_strategy_families(
                     market_data_by_interval=interval_market_data,
                     strategy_intervals={
-                        "breakout": ("1h", "4h", "1d"),
-                        "pullback": ("1h", "4h", "1d"),
-                        "trendline": ("1h", "4h", "1d"),
-                        "trendline_retest": ("1h", "4h", "1d"),
+                        strategy: tuple(interval_histories)
+                        for strategy in OPTIMIZER_STRATEGY_TYPES.values()
                     },
                     current_settings=current_strategy_settings,
                     account_equity=float(paper_order_risk_equity),
@@ -3348,6 +3361,7 @@ if run_strategy_input_search:
                 raise ValueError("No strategy produced a historical result.")
             fresh_optimizer_result = family_result.best_strategy.best_result
         st.session_state["strategy_optimizer_search"] = {
+            "schema_version": OPTIMIZER_SEARCH_STATE_VERSION,
             "signature": optimizer_signature,
             "result": fresh_optimizer_result,
             "interval_result": interval_result,
@@ -3359,6 +3373,7 @@ if run_strategy_input_search:
         optimizer_search_completed = True
     except ValueError as exc:
         st.session_state["strategy_optimizer_search"] = {
+            "schema_version": OPTIMIZER_SEARCH_STATE_VERSION,
             "signature": optimizer_signature,
             "result": None,
             "interval_result": None,
@@ -3369,6 +3384,12 @@ if run_strategy_input_search:
         }
 
 optimizer_search_state = st.session_state.get("strategy_optimizer_search")
+if (
+    optimizer_search_state
+    and optimizer_search_state.get("schema_version") != OPTIMIZER_SEARCH_STATE_VERSION
+):
+    st.session_state.pop("strategy_optimizer_search", None)
+    optimizer_search_state = None
 strategy_optimizer_result = (
     optimizer_search_state.get("result") if optimizer_search_state else None
 )
@@ -5648,6 +5669,25 @@ if command_center_view == "New Trade":
             if optimizer_result_stale:
                 st.warning("Inputs changed since this search finished. Run Strategy Input Search again before using a result.")
             st.info(strategy_optimizer_family_result.summary)
+            fixed_search_windows = strategy_search_interval_histories(data_source)
+            fixed_search_description = ", ".join(
+                f"{search_interval} bars for {search_history}"
+                for search_interval, search_history in fixed_search_windows.items()
+            )
+            st.markdown(
+                "##### Price data tested",
+                help=(
+                    f"This search independently loads {fixed_search_description}. The Interval and History period "
+                    "shown in the sidebar are ignored. Actual Price Dates show what the provider returned."
+                    if fixed_search_windows else
+                    "A synthetic search uses the single synthetic dataset selected in the sidebar."
+                ),
+            )
+            st.dataframe(
+                pd.DataFrame(strategy_search_data_records(strategy_optimizer_family_result)),
+                width="stretch",
+                hide_index=True,
+            )
             st.dataframe(
                 pd.DataFrame(strategy_search_ranking_records(strategy_optimizer_family_result)),
                 width="stretch",

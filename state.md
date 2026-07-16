@@ -815,6 +815,16 @@ The editor is now a reactive settings container. Changing `Exit method` immediat
 
 Creating a plan or changing its interval downloads a bounded history appropriate for that interval, calculates ATR from the latest valid completed bar, records the ATR value and measurement timestamp, and rebuilds the initial stop from the actual Alpaca average entry. Saving is wrapped in one visible error path and produces a persistent success message containing the method, interval, and exact position cycle ID. A manually opened position remains unmanaged until this exact-cycle save succeeds.
 
+## Explicit Multi-Interval Strategy Search Data (July 15, 2026)
+
+The real-price strategy input search is now explicitly independent of the Interval and History period shown in the sidebar. Alpaca equity and crypto searches independently download exactly three datasets: 1-hour bars for 2 years, 4-hour bars for 5 years, and daily bars for 10 years. The unused 15-minute download was removed, and the displayed sidebar market-data frame is never reused by the search.
+
+Every candidate now saves the interval and requested history that actually produced it. A search fails clearly instead of ranking a partial result when any of the three required downloads fails. The result page includes a compact `Price data tested` table with each interval, requested history, actual dates returned by the provider, and completed-bar count. This distinguishes the requested window from a shorter provider-available window and makes incomplete or mislabeled BTC/USD searches visible.
+
+Optimizer session state is schema-versioned. If Streamlit hot-reloads new optimizer code while an open browser session still holds result objects from the older schema, the obsolete search is discarded and must be rerun instead of crashing the result page.
+
+Crypto uses shorter fixed search windows because it trades continuously and therefore produces far more bars per calendar year: 1-hour bars for 1 year, 4-hour bars for 2 years, and daily bars for 5 years. Equity Alpaca searches remain 1-hour/2-year, 4-hour/5-year, and daily/10-year. Alpaca's crypto endpoint returned minute-scale pagination for a direct 4-hour request, so the app now downloads supported 1-hour crypto bars and aggregates each four complete UTC-aligned bars locally into one 4-hour OHLCV bar. This avoids hundreds of API pages without reducing the intended 4-hour sample.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.

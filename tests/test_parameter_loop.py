@@ -1,4 +1,5 @@
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pandas as pd
 
@@ -36,9 +37,11 @@ from agentloop_trader.parameter_loop import (
     recommend_candidate,
     recommendation_summary,
     strategy_search_detail_records,
+    strategy_search_data_records,
     strategy_search_interval_records,
     strategy_search_ranking_records,
     strategy_search_settings_records,
+    strategy_search_interval_histories,
     strategy_input_search_identity,
     validate_settings_across_tickers,
     _attach_plateau_scores,
@@ -368,6 +371,9 @@ def test_multi_strategy_search_returns_one_ranked_result_for_each_strategy():
     assert result.best_strategy is result.strategy_results[0]
     for strategy_result in result.strategy_results:
         assert strategy_result.best_interval == "4h"
+        assert strategy_result.best_history == "500 bars"
+        assert strategy_result.best_result.best.settings["interval"] == "4h"
+        assert strategy_result.best_result.best.settings["history"] == "500 bars"
         assert strategy_search_detail_records(strategy_result)
         setting_rows = strategy_search_settings_records(strategy_result)
         assert setting_rows
@@ -377,6 +383,44 @@ def test_multi_strategy_search_returns_one_ranked_result_for_each_strategy():
         ) == "Isolated result"
         assert strategy_result.best_result.best.confidence == "Low"
         assert strategy_search_interval_records(strategy_result)
+    assert strategy_search_data_records(result) == [{
+        "Interval": "4h",
+        "Requested History": "500 bars",
+        "Actual Price Dates": "Jan 01, 2024 to Mar 24, 2024",
+        "Completed Bars": 500,
+    }]
+
+
+def test_real_price_strategy_search_uses_fixed_histories_independent_of_sidebar():
+    assert strategy_search_interval_histories("Ticker (Alpaca)") == {
+        "1h": "2y",
+        "4h": "5y",
+        "1d": "10y",
+    }
+    assert strategy_search_interval_histories("Crypto (Alpaca)") == {
+        "1h": "1y",
+        "4h": "2y",
+        "1d": "5y",
+    }
+    assert strategy_search_interval_histories("Ticker (yfinance)") == {
+        "1h": "1y",
+        "4h": "1y",
+        "1d": "10y",
+    }
+
+
+def test_search_data_records_tolerate_pre_update_session_objects():
+    legacy_interval = SimpleNamespace(interval="1h", history="2y")
+    legacy_result = SimpleNamespace(
+        strategy_results=(SimpleNamespace(interval_results=(legacy_interval,)),)
+    )
+
+    assert strategy_search_data_records(legacy_result) == [{
+        "Interval": "1h",
+        "Requested History": "2y",
+        "Actual Price Dates": "Run search again",
+        "Completed Bars": 0,
+    }]
 
 
 def test_optimizer_cost_stress_never_improves_return_and_is_deterministic():

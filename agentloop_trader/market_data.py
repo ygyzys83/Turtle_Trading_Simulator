@@ -229,11 +229,12 @@ def fetch_alpaca_crypto_bars(
     all_bars: list[dict[str, Any]] = []
     page_token = ""
     start_time = period_start_time(period).isoformat().replace("+00:00", "Z")
+    request_interval = "1h" if interval == "4h" else interval
     max_pages = 200
     for _ in range(max_pages):
         params: dict[str, Any] = {
             "symbols": clean,
-            "timeframe": alpaca_timeframe(interval),
+            "timeframe": alpaca_timeframe(request_interval),
             "start": start_time,
             "limit": 10000,
         }
@@ -268,6 +269,17 @@ def fetch_alpaca_crypto_bars(
     })
     data["Date"] = pd.to_datetime(data["Date"], utc=True)
     data = data.set_index("Date").sort_index()
+    if interval == "4h":
+        four_hour_groups = data.resample("4h", origin="start_day", label="left", closed="left")
+        completed_source_bars = four_hour_groups["Close"].count()
+        data = four_hour_groups.agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        })
+        data = data.loc[completed_source_bars >= 4].dropna(subset=["Open", "High", "Low", "Close"])
     validated = validate_price_bars(data[["Open", "Close", "High", "Low", "Volume"]], clean)
     validated.attrs["asset_class"] = "crypto"
     return completed_price_bars(validated, interval)

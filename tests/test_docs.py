@@ -57,6 +57,12 @@ def test_strategy_input_search_is_explicit_and_alpaca_intraday_history_is_bounde
     assert '["1mo", "3mo", "6mo", "1y", "2y", "5y"]' in text
     assert '["1mo", "3mo", "6mo", "1y", "2y"]' in text
     assert '"Inputs changed. Run the search again."' in text
+    assert "strategy_search_interval_histories(data_source)" in text
+    assert "search_interval == interval and search_history == period" not in text
+    assert "all three fixed datasets are required" in text
+    assert "Price data tested" in text
+    assert "OPTIMIZER_SEARCH_STATE_VERSION = 2" in text
+    assert 'optimizer_search_state.get("schema_version")' in text
 
 
 def test_ui_theme_uses_one_semantic_palette_and_streamlit_theme_file():

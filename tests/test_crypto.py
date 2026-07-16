@@ -78,6 +78,47 @@ def test_alpaca_crypto_data_uses_crypto_endpoint_and_pair(monkeypatch):
     assert bars.attrs["asset_class"] == "crypto"
 
 
+def test_four_hour_crypto_data_aggregates_supported_hourly_bars(monkeypatch):
+    captured = {}
+
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *_args): return False
+        def read(self):
+            bars = [
+                {
+                    "t": f"2026-07-10T{hour:02d}:00:00Z",
+                    "o": 100 + hour,
+                    "h": 102 + hour,
+                    "l": 99 + hour,
+                    "c": 101 + hour,
+                    "v": hour + 1,
+                }
+                for hour in range(8)
+            ]
+            return json.dumps({"bars": {"BTC/USD": bars}}).encode()
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        return Response()
+
+    monkeypatch.setattr("agentloop_trader.market_data.urlopen", fake_urlopen)
+
+    bars = fetch_alpaca_crypto_bars("BTC/USD", "2y", "4h", "key", "secret")
+
+    assert "timeframe=1Hour" in captured["url"]
+    assert "timeframe=4Hour" not in captured["url"]
+    assert len(bars) == 2
+    assert bars.iloc[0].to_dict() == {
+        "Open": 100.0,
+        "Close": 104.0,
+        "High": 105.0,
+        "Low": 99.0,
+        "Volume": 10.0,
+    }
+    assert bars.iloc[1]["Volume"] == 26
+
+
 def test_latest_crypto_trade_uses_crypto_endpoint(monkeypatch):
     captured = {}
 
