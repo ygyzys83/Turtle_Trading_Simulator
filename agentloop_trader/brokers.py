@@ -201,6 +201,7 @@ class AlpacaBrokerAdapterStub:
         self.config = config or AlpacaConfig.from_env()
         self._client = trading_client
         self._client_error: str | None = None
+        self._account = None
         self._read_errors: dict[str, str] = {}
         self.allow_order_submission = allow_order_submission
 
@@ -227,7 +228,8 @@ class AlpacaBrokerAdapterStub:
                 message=self._client_error or "Alpaca SDK client is unavailable.",
             )
         try:
-            account = client.get_account()
+            account = self._account or client.get_account()
+            self._account = account
         except Exception as exc:
             return BrokerStatus(
                 name=self.name,
@@ -311,7 +313,8 @@ class AlpacaBrokerAdapterStub:
         if client is None:
             return []
         try:
-            account = client.get_account()
+            account = self._account or client.get_account()
+            self._account = account
         except Exception:
             return []
         fields = [

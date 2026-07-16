@@ -23,6 +23,7 @@ from agentloop_trader.performance import (
 )
 from agentloop_trader.price_regime import (
     price_regime_records,
+    price_regime_sections,
     strategy_regime_rows,
     summarize_regime_dependency,
 )
@@ -291,7 +292,7 @@ OPTIMIZER_STRATEGY_TYPES = {
     for label, strategy_type in STRATEGY_TYPES.items()
     if strategy_type != "rsi_scalp"
 }
-OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY = 24
+OPTIMIZER_LOCAL_SETTINGS_PER_STRATEGY = 16
 
 
 def generate_bounded_candidates(current: StrategyConfig, max_candidates: int = 12) -> list[StrategyConfig]:
@@ -570,7 +571,7 @@ def optimize_strategy_inputs(
     for strategy_type in sorted({row.strategy_type for row in ranked}):
         strategy_rows = [row for row in ranked if row.strategy_type == strategy_type]
         strategy_rows.sort(key=_discovery_selection_key, reverse=True)
-        shortlist_size = min(10, len(strategy_rows))
+        shortlist_size = min(3, len(strategy_rows))
         for candidate in strategy_rows[:shortlist_size]:
             rolling = _rolling_evidence(
                 candidate.strategy_type,
@@ -631,6 +632,11 @@ def optimize_strategy_inputs(
             full_trades,
             ticker_allocated_capital(account_equity, risk_limits),
             period_evaluator=evaluate_price_period,
+            period_ranges=price_regime_sections(
+                data,
+                older_fraction=train_fraction,
+                latest_fraction=locked_fraction,
+            ),
         )
         regime_dependency = summarize_regime_dependency(
             data,
@@ -1583,6 +1589,7 @@ def strategy_input_search_identity(
     risk_per_trade_pct: float,
     risk_limits: dict[str, Any],
     settings_per_strategy: int,
+    search_interval: str = "",
     display_interval: str = "",
     display_history: str = "",
     market_fingerprint: str = "",
@@ -1595,7 +1602,8 @@ def strategy_input_search_identity(
         "risk_limits": risk_limits,
         "older_data_fraction": 0.55,
         "settings_per_strategy": int(settings_per_strategy),
-        "search_version": "four-trend-strategies-relative-stability-v5",
+        "search_interval": str(search_interval),
+        "search_version": "one-interval-staged-search-v6",
     }
     if str(data_source) == "Synthetic":
         payload.update({
@@ -1854,6 +1862,32 @@ def strategy_search_ranking_records(result: MultiStrategySearchResult) -> list[d
             ),
             "Complete History Trades": interval_result.durability_trades,
             "Maximum Historical Decline": f"{interval_result.durability_max_drawdown_percent:.2f}%",
+        })
+    return rows
+
+
+def strategy_search_summary_records(result: MultiStrategySearchResult) -> list[dict[str, Any]]:
+    """Return the concise decision table used by the daily strategy-search screen."""
+    rows: list[dict[str, Any]] = []
+    for rank, strategy_result in enumerate(result.strategy_results, start=1):
+        interval_result = strategy_result.interval_results[0]
+        recommendation = strategy_result.best_result
+        candidate = recommendation.best
+        locked = recommendation.robustness.locked_test if recommendation.robustness else None
+        if candidate is None:
+            continue
+        verdict = candidate_verdict(recommendation, interval_result)
+        rows.append({
+            "Rank": rank,
+            "Strategy": strategy_result.strategy_label,
+            "Inputs to test": _settings_text(candidate.settings),
+            "Older-section trades": candidate.train_trades,
+            "Newer vs buy and hold": f"{candidate.excess_return_percent:+.2f}%",
+            "Latest vs buy and hold": (
+                f"{locked.excess_return_percent:+.2f}%" if locked is not None else "Not available"
+            ),
+            "Input stability": candidate.nearby_stability,
+            "Decision": verdict.tier,
         })
     return rows
 

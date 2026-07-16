@@ -90,3 +90,26 @@ def test_research_read_distinguishes_selected_strategy_from_best_current_fit():
     best = next(row for row in records if row["Area"] == "Best current fit across all strategies")
     assert selected["Read"] == "Trendline retest continuation"
     assert best["Read"] == "Trendline breakout"
+
+
+def test_research_read_is_honest_when_only_selected_strategy_was_calculated():
+    report = build_research_agent_report(
+        ticker="IBM",
+        selected_strategy="Trend pullback continuation",
+        strategy_results={
+            "Trend pullback continuation": {
+                "live": {"signal": "flat", "buy_requirements": {"trend": True}},
+                "stats": {"return_pct": 2, "total_trades": 3, "win_rate": 50, "profit_factor": 1.2, "max_drawdown_pct": 2},
+            },
+        },
+        setup_rows=[],
+        final_read="WAIT",
+        decision_detail="The selected strategy is waiting.",
+        next_action="Wait.",
+        all_strategies_compared=False,
+    )
+
+    records = research_agent_records(report)
+    selected_read = next(row for row in records if row["Area"] == "Selected strategy read")
+    assert selected_read["Read"] == "Trend pullback continuation"
+    assert "Only the selected strategy" in selected_read["Plain English"]

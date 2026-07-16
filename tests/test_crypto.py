@@ -33,7 +33,7 @@ def approved_decision() -> ExecutionDecision:
 def test_crypto_symbols_and_quantity_precision_are_normalized():
     assert normalize_symbol("btcusd", "crypto") == "BTC/USD"
     assert normalize_symbol("ETH-USD", "crypto") == "ETH/USD"
-    assert floor_quantity(0.12345678, "crypto") == pytest.approx(0.1234)
+    assert floor_quantity(0.123456789, "crypto") == pytest.approx(0.12345678)
     assert floor_quantity(9.9, "equity") == 9
 
 

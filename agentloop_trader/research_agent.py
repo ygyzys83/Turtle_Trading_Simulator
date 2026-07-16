@@ -115,6 +115,7 @@ def build_research_agent_report(
     final_read: str,
     decision_detail: str,
     next_action: str,
+    all_strategies_compared: bool = True,
 ) -> ResearchAgentReport:
     fits = [_strategy_score(name, result) for name, result in strategy_results.items()]
     fits.sort(key=lambda fit: fit.score, reverse=True)
@@ -132,10 +133,15 @@ def build_research_agent_report(
     liquidity = _setup_status(setup_rows, "Liquidity")
     liquidity_detail = _setup_detail(setup_rows, "Liquidity", "Liquidity check is not available.")
 
-    best_reason = f"Best current fit: {best.strategy}. {best.reason}"
+    comparison_phrase = "Best current fit" if all_strategies_compared else "Selected strategy read"
+    best_reason = f"{comparison_phrase}: {best.strategy}. {best.reason}"
     thesis = (
         f"{ticker.upper()}: {final_read}. {decision_detail} "
-        f"Best current fit is {best.strategy} based on current setup, backtest performance, and risk quality."
+        + (
+            f"Best current fit is {best.strategy} based on the explicit all-strategy comparison."
+            if all_strategies_compared
+            else f"The selected strategy is {selected_strategy}; other strategies were not calculated on this refresh."
+        )
     )
     rows = [
         {"Area": "Final answer", "Read": final_read, "Plain English": decision_detail},
@@ -145,9 +151,13 @@ def build_research_agent_report(
             "Plain English": "The exact strategy selected in the sidebar and used for the TRADE or WAIT decision.",
         },
         {
-            "Area": "Best current fit across all strategies",
+            "Area": "Best current fit across all strategies" if all_strategies_compared else "Selected strategy read",
             "Read": best.strategy,
-            "Plain English": f"The app compared all five strategies using the current inputs. {best.reason}",
+            "Plain English": (
+                f"The app compared all five strategies using the current inputs. {best.reason}"
+                if all_strategies_compared
+                else f"Only the selected strategy was calculated for this refresh. {best.reason}"
+            ),
         },
         {"Area": "Trend", "Read": trend, "Plain English": trend_detail},
         {"Area": "Setup", "Read": overall, "Plain English": setup_detail},

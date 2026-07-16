@@ -215,9 +215,12 @@ def strategy_regime_rows(
     *,
     blocks: int = 6,
     period_evaluator: Callable[[int, int], dict[str, Any]] | None = None,
+    period_ranges: list[tuple[int, int, PriceRegime]] | None = None,
 ) -> list[dict[str, Any]]:
+    """Compare strategy and buy-and-hold over explicit or evenly split periods."""
     rows: list[dict[str, Any]] = []
-    for start, end, regime in rolling_price_regimes(data, blocks=blocks):
+    ranges = period_ranges if period_ranges is not None else rolling_price_regimes(data, blocks=blocks)
+    for start, end, regime in ranges:
         if period_evaluator is None:
             period_trades = [
                 row for row in trades

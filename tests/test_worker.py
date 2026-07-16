@@ -4,6 +4,7 @@ from agentloop_trader.automation_runtime import AutomationControl, WorkerStatus
 from agentloop_trader.buy_watchlist import BuyWatchPlan, BuyWatchlistStore, buy_watch_plan_id
 from agentloop_trader.brokers import AlpacaConfig
 from agentloop_trader.models import TradeIntent
+from agentloop_trader.position_lifecycle import resolve_position_plan
 from agentloop_trader.worker import _BAR_CACHE, _cancel_late_rsi_limit_buys, _fetcher, _open_buy_order_notional, _send_entry, _send_exits, _send_watchlist_entries, _stop_requested_during_wait, run_once, sleep_resume_detected
 
 
@@ -171,6 +172,67 @@ def test_worker_exit_uses_current_reentry_order_not_prior_symbol_cycle(monkeypat
     assert captured["highest_high_since_entry"] == 210.758696
 
 
+def test_worker_persists_latest_exit_calculation_for_fast_ui_startup(monkeypatch):
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(config=SimpleNamespace(paper=True))
+    orders = [{
+        "Alpaca Order ID": "buy-1",
+        "Symbol": "IBM",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 10,
+        "Avg Fill": 218.50,
+        "Filled": "2026-07-16T15:00:00+00:00",
+    }]
+    tracked = [{
+        "broker_order_id": "buy-1",
+        "symbol": "IBM",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {
+            "entry_stop_distance": 5.0,
+            "auto_exit_enabled": True,
+        },
+    }]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+    monkeypatch.setattr(
+        "agentloop_trader.worker.evaluate_exit_settings",
+        lambda *args: {
+            "ready": False,
+            "state_changed": False,
+            "reason": "Hold.",
+            "current_price": 219.25,
+            "current_price_source": "Alpaca position market value",
+            "trigger_price": 213.50,
+            "trigger_source": "fill-adjusted initial stop",
+            "original_stop_price": 213.50,
+            "profit_r": 0.15,
+            "checked_at": "2026-07-16T12:00:00-07:00",
+        },
+    )
+
+    sent, updated, _ = _send_exits(
+        control,
+        adapter,
+        [{"Symbol": "IBM", "Quantity": 10, "Market Value": 2192.50, "Average Entry": 218.50}],
+        orders,
+        tracked,
+        lambda *_: None,
+        SimpleNamespace(append=lambda event: None),
+    )
+
+    resolution = resolve_position_plan(
+        {"Symbol": "IBM", "Quantity": 10, "Market Value": 2192.50, "Average Entry": 218.50},
+        orders,
+        updated,
+    )
+    snapshot = resolution.exit_settings["last_exit_snapshot"]
+    assert sent == 0
+    assert snapshot["current_price"] == 219.25
+    assert snapshot["trigger_price"] == 213.50
+    assert snapshot["checked_at"] == "2026-07-16T12:00:00-07:00"
+
+
 def test_worker_does_not_attach_old_settings_to_new_manual_reentry(monkeypatch):
     control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
     adapter = SimpleNamespace(
@@ -267,6 +329,70 @@ def test_worker_exit_audit_identifies_exact_position_cycle(monkeypatch):
     assert events[0].payload["position_average_entry"] == 210.758696
     assert events[0].payload["entry_stop_distance"] == 6.78
     assert events[0].payload["exit_details"]["highest_profit_r"] == 0.09
+
+
+def test_worker_reports_triggered_exit_that_is_blocked_by_existing_sell_order(monkeypatch):
+    events = []
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(paper=True),
+        submit_order=lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("A blocked exit must not be submitted")
+        ),
+    )
+    orders = [{
+        "Alpaca Order ID": "buy-1",
+        "Symbol": "CRWV",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 64,
+        "Avg Fill": 77.08,
+        "Filled": "2026-07-15T19:05:42+00:00",
+    }]
+    tracked = [{
+        "broker_order_id": "buy-1",
+        "symbol": "CRWV",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {"entry_stop_distance": 1.84, "auto_exit_enabled": True},
+    }]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+    monkeypatch.setattr(
+        "agentloop_trader.worker.evaluate_exit_settings",
+        lambda *args: {
+            "ready": True,
+            "state_changed": False,
+            "reason": "CRWV reached its stop.",
+            "current_price": 73.20,
+            "current_price_source": "Alpaca position market value",
+            "trigger_price": 75.24,
+            "trigger_source": "fill-adjusted initial stop",
+        },
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker.build_alpaca_order_preview",
+        lambda *args: SimpleNamespace(valid=True, preview_hash="exit-preview", blocked_reasons=[]),
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker.open_exit_order_reasons",
+        lambda *args: ["Alpaca Orders already has an open CRWV sell order with status accepted."],
+    )
+
+    sent, _, message = _send_exits(
+        control,
+        adapter,
+        [{"Symbol": "CRWV", "Quantity": 64, "Average Entry": 77.08}],
+        orders,
+        tracked,
+        lambda *_: None,
+        SimpleNamespace(append=events.append),
+    )
+
+    assert sent == 0
+    assert "CRWV exit triggered but was not sent" in message
+    assert "open CRWV sell order" in message
+    assert events[0].event_type == "worker_paper_exit_blocked"
+    assert events[0].payload["current_price_source"] == "Alpaca position market value"
 
 
 def test_worker_stop_wait_checks_control_each_second(monkeypatch):

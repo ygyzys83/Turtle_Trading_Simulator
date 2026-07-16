@@ -18,6 +18,49 @@ NEW_YORK_TIME = ZoneInfo("America/New_York")
 INTERVAL_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240}
 
 
+def completed_bar_cache_bucket(
+    interval: str,
+    price_source: str = "Ticker (Alpaca)",
+    now: datetime | pd.Timestamp | None = None,
+) -> int:
+    """Return a cache key that changes when another requested bar can complete."""
+    seconds = {
+        "1m": 60,
+        "5m": 300,
+        "15m": 900,
+        "30m": 1800,
+        "1h": 3600,
+        "4h": 14400,
+        "1d": 86400,
+    }.get(str(interval), 3600)
+    timestamp = pd.Timestamp.now(tz="UTC") if now is None else pd.Timestamp(now)
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.tz_localize("UTC")
+    if "crypto" in str(price_source).lower():
+        return int(timestamp.timestamp() // seconds)
+
+    eastern = timestamp.tz_convert(NEW_YORK_TIME)
+    session_day = eastern.normalize()
+    if eastern.weekday() >= 5 or eastern < session_day + pd.Timedelta(hours=9, minutes=30):
+        session_day -= pd.Timedelta(days=1)
+        while session_day.weekday() >= 5:
+            session_day -= pd.Timedelta(days=1)
+    if str(interval) == "1d":
+        completed_day = session_day if eastern >= session_day + pd.Timedelta(hours=16) else session_day - pd.Timedelta(days=1)
+        while completed_day.weekday() >= 5:
+            completed_day -= pd.Timedelta(days=1)
+        return int(completed_day.timestamp() // 86400)
+
+    session_open = session_day + pd.Timedelta(hours=9, minutes=30)
+    full_session_seconds = int(6.5 * 3600)
+    elapsed_seconds = max(0.0, min((eastern - session_open).total_seconds(), full_session_seconds))
+    if elapsed_seconds >= full_session_seconds:
+        completed_slots = (full_session_seconds + seconds - 1) // seconds
+    else:
+        completed_slots = int(elapsed_seconds // seconds)
+    return int(session_day.timestamp() // 86400) * 100 + completed_slots
+
+
 def validate_price_bars(data: pd.DataFrame, symbol: str = "") -> pd.DataFrame:
     """Return sorted, numeric OHLCV bars or raise on unsafe market data."""
     if data is None or data.empty:

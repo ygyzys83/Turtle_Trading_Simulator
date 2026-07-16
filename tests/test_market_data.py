@@ -4,7 +4,37 @@ import json
 import pandas as pd
 import pytest
 
-from agentloop_trader.market_data import NewsItem, alpaca_timeframe, build_company_research_context, completed_price_bars, fetch_alpaca_bars, fetch_alpaca_latest_trades, period_start_time, validate_price_bars
+from agentloop_trader.market_data import NewsItem, alpaca_timeframe, build_company_research_context, completed_bar_cache_bucket, completed_price_bars, fetch_alpaca_bars, fetch_alpaca_latest_trades, period_start_time, validate_price_bars
+
+
+def test_equity_cache_bucket_changes_at_regular_and_shortened_bar_closes():
+    before_first_close = completed_bar_cache_bucket(
+        "4h", now=pd.Timestamp("2026-07-15 13:29:59", tz="America/New_York")
+    )
+    first_close = completed_bar_cache_bucket(
+        "4h", now=pd.Timestamp("2026-07-15 13:30:00", tz="America/New_York")
+    )
+    final_shortened_close = completed_bar_cache_bucket(
+        "4h", now=pd.Timestamp("2026-07-15 16:00:00", tz="America/New_York")
+    )
+    overnight = completed_bar_cache_bucket(
+        "4h", now=pd.Timestamp("2026-07-15 22:00:00", tz="America/New_York")
+    )
+
+    assert first_close == before_first_close + 1
+    assert final_shortened_close == first_close + 1
+    assert overnight == final_shortened_close
+
+
+def test_crypto_cache_bucket_uses_continuous_utc_boundaries():
+    before = completed_bar_cache_bucket(
+        "4h", "Crypto (Alpaca)", pd.Timestamp("2026-07-15 07:59:59", tz="UTC")
+    )
+    after = completed_bar_cache_bucket(
+        "4h", "Crypto (Alpaca)", pd.Timestamp("2026-07-15 08:00:00", tz="UTC")
+    )
+
+    assert after == before + 1
 
 
 def test_alpaca_timeframe_maps_intraday_intervals():

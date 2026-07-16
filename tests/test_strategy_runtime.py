@@ -1,18 +1,73 @@
 import pandas as pd
 import pytest
 
+from agentloop_trader.evaluation import synthetic_ohlc_frame
 from agentloop_trader.models import TradeIntent
 from agentloop_trader.strategy_runtime import (
+    STRATEGY_TYPES,
     adjust_initial_stop_settings,
     apply_buy_order_style,
+    exit_details_from_snapshot,
+    exit_snapshot_from_details,
     evaluate_exit_settings,
     exit_plan_history_for_interval,
     exit_mode_for_settings,
     latest_atr_snapshot,
     reprice_trade_intent,
+    run_strategy_suite,
+    selected_strategy_result,
     trade_intent_from_record,
     trade_intent_to_record,
 )
+
+
+def test_selected_strategy_path_matches_the_same_strategy_in_the_full_suite():
+    data = synthetic_ohlc_frame(seed=17).iloc[:360]
+    settings = {
+        "entry_window": 15,
+        "exit_window": 10,
+        "atr_stop_multiplier": 1.5,
+        "risk_per_trade_pct": 0.5,
+        "moving_average_window": 50,
+        "pullback_average_length": 20,
+        "momentum_turn_length": 10,
+    }
+    suite = run_strategy_suite(data, settings, 100_000)
+
+    for label, strategy_type in STRATEGY_TYPES.items():
+        selected = selected_strategy_result(
+            data,
+            {**settings, "strategy_type": strategy_type},
+            100_000,
+        )
+        assert selected["stats"] == suite[label]["stats"]
+        assert selected["trade_log"] == suite[label]["trade_log"]
+        assert selected["live"] == suite[label]["live"]
+
+
+def test_period_evaluation_start_bar_blocks_warmup_entries_for_every_strategy():
+    data = synthetic_ohlc_frame(n=360, seed=19)
+    data.attrs["_evaluation_start_bar"] = len(data) - 1
+    settings = {
+        "entry_window": 15,
+        "exit_window": 10,
+        "atr_stop_multiplier": 1.5,
+        "risk_per_trade_pct": 0.5,
+        "moving_average_window": 50,
+        "pullback_average_length": 20,
+        "momentum_turn_length": 10,
+        "rsi_length": 14,
+        "rsi_swing_lookback": 24,
+    }
+
+    for strategy_type in STRATEGY_TYPES.values():
+        result = selected_strategy_result(
+            data,
+            {**settings, "strategy_type": strategy_type},
+            100_000,
+        )
+        assert result["trade_log"] == []
+        assert result["stats"]["total_trades"] == 0
 
 
 def test_exit_plan_history_matches_selected_position_interval():
@@ -122,6 +177,103 @@ def test_combined_position_rebases_original_stop_using_saved_risk_distance(monke
     details = evaluate_exit_settings(settings, {"Symbol": "AAPL", "Average Entry": "110"}, lambda *_: data)
 
     assert details["original_stop_price"] == 106.0
+
+
+def test_exit_uses_live_alpaca_position_price_when_completed_bar_has_not_reached_stop(monkeypatch):
+    index = pd.date_range("2026-07-16 15:00", periods=3, freq="h", tz="UTC")
+    data = pd.DataFrame(
+        {
+            "Close": [77.50, 76.80, 76.10],
+            "High": [78.00, 77.20, 76.50],
+            "Low": [77.00, 76.40, 75.90],
+        },
+        index=index,
+    )
+    data.attrs["latest_price"] = 76.10
+    monkeypatch.setattr(
+        "agentloop_trader.strategy_runtime.selected_strategy_result",
+        lambda market_data, settings, account: {
+            "live": {"last_p": 76.10, "last_atr": 1.84, "exit_level": None}
+        },
+    )
+    settings = {
+        "exit_mode": "atr_only",
+        "entry_stop_distance": 1.8368117749680912,
+        "auto_exit_enabled": True,
+    }
+    position = {
+        "Symbol": "CRWV",
+        "Quantity": "64",
+        "Market Value": str(64 * 73.20),
+        "Average Entry": "77.08",
+    }
+
+    details = evaluate_exit_settings(settings, position, lambda *_: data)
+
+    assert details["current_price"] == pytest.approx(73.20)
+    assert details["current_price_source"] == "Alpaca position market value"
+    assert details["trigger_price"] == pytest.approx(75.2431882250319)
+    assert details["trigger_source"] == "fill-adjusted initial stop"
+    assert details["ready"] is True
+    assert "CRWV is at or below" in details["reason"]
+
+
+def test_saved_exit_snapshot_renders_with_live_position_price_without_history_download():
+    settings = {
+        "auto_exit_enabled": True,
+        "exit_mode": "atr_only",
+        "entry_stop_distance": 1.84,
+        "last_exit_trigger_price": 75.24,
+        "last_exit_trigger_source": "fill-adjusted initial stop",
+        "last_exit_snapshot": exit_snapshot_from_details({
+            "ready": False,
+            "reason": "Hold.",
+            "current_price": 76.10,
+            "current_price_source": "Alpaca position market value",
+            "trigger_price": 75.24,
+            "trigger_source": "fill-adjusted initial stop",
+            "original_stop_price": 75.24,
+            "profit_r": -0.53,
+            "checked_at": "2026-07-16T12:00:00-07:00",
+        }),
+    }
+    position = {
+        "Symbol": "CRWV",
+        "Quantity": "64",
+        "Market Value": str(64 * 73.20),
+        "Average Entry": "77.08",
+    }
+
+    details = exit_details_from_snapshot(settings, position)
+
+    assert details["snapshot_available"] is True
+    assert details["current_price"] == pytest.approx(73.20)
+    assert details["ready"] is True
+    assert details["trigger_price"] == pytest.approx(75.24)
+    assert details["snapshot_checked_at"] == "2026-07-16T12:00:00-07:00"
+
+
+def test_saved_exit_settings_without_worker_snapshot_still_show_initial_stop():
+    settings = {
+        "auto_exit_enabled": True,
+        "exit_mode": "atr_only",
+        "entry_stop_distance": 2.0,
+        "interval": "4h",
+    }
+    position = {
+        "Symbol": "IBM",
+        "Quantity": "10",
+        "Market Value": "2200",
+        "Average Entry": "218",
+    }
+
+    details = exit_details_from_snapshot(settings, position)
+
+    assert details["snapshot_available"] is False
+    assert details["original_stop_price"] == pytest.approx(216)
+    assert details["trigger_price"] == pytest.approx(216)
+    assert details["ready"] is False
+    assert "Start the Background Worker" in details["reason"]
 
 
 def test_exit_settings_high_water_mark_starts_at_entry_time(monkeypatch):

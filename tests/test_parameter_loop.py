@@ -40,6 +40,7 @@ from agentloop_trader.parameter_loop import (
     strategy_search_data_records,
     strategy_search_interval_records,
     strategy_search_ranking_records,
+    strategy_search_summary_records,
     strategy_search_settings_records,
     strategy_search_interval_histories,
     strategy_input_search_identity,
@@ -225,7 +226,6 @@ def test_optimizer_sampling_is_independent_of_displayed_strategy_inputs():
 
     assert first == second
 
-
 def test_real_price_search_identity_ignores_display_interval_history_and_refresh():
     common = {
         "ticker": "TSLA",
@@ -249,6 +249,10 @@ def test_real_price_search_identity_ignores_display_interval_history_and_refresh
     )
 
     assert first == second
+    assert first != strategy_input_search_identity(
+        **common,
+        search_interval="1d",
+    )
 
 
 def test_search_identity_changes_for_material_assumptions_and_synthetic_data():
@@ -368,6 +372,12 @@ def test_multi_strategy_search_returns_one_ranked_result_for_each_strategy():
     assert "Older 55% Trades" in ranking_rows[0]
     assert "Newer 25% vs Buy and Hold" in ranking_rows[0]
     assert "Latest 20% vs Buy and Hold" in ranking_rows[0]
+    summary_rows = strategy_search_summary_records(result)
+    assert len(summary_rows) == 4
+    assert set(summary_rows[0]) == {
+        "Rank", "Strategy", "Inputs to test", "Older-section trades",
+        "Newer vs buy and hold", "Latest vs buy and hold", "Input stability", "Decision",
+    }
     assert result.best_strategy is result.strategy_results[0]
     for strategy_result in result.strategy_results:
         assert strategy_result.best_interval == "4h"
@@ -382,6 +392,7 @@ def test_multi_strategy_search_returns_one_ranked_result_for_each_strategy():
             if row["Item"] == "Input stability"
         ) == "Isolated result"
         assert strategy_result.best_result.best.confidence == "Low"
+        assert len(strategy_result.best_result.robustness.strategy_regime_rows) == 3
         assert strategy_search_interval_records(strategy_result)
     assert strategy_search_data_records(result) == [{
         "Interval": "4h",

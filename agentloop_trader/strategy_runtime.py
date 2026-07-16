@@ -28,6 +28,46 @@ STRATEGY_TYPES = {
     "RSI mean-reversion scalp": "rsi_scalp",
 }
 
+EXIT_SNAPSHOT_FIELDS = (
+    "ready",
+    "reason",
+    "current_price",
+    "current_price_source",
+    "trigger_price",
+    "trigger_source",
+    "exit_mode",
+    "strategy_exit_price",
+    "original_stop_price",
+    "breakeven_stop_price",
+    "trailing_stop_price",
+    "highest_high_since_entry",
+    "profit_r",
+    "highest_profit_r",
+    "current_atr",
+    "current_rsi",
+    "highest_rsi_since_entry",
+    "rsi_sell_level",
+    "rsi_exit_signal_ready",
+    "rsi_profit_only_exit",
+    "rsi_fee_adjusted_break_even",
+    "rsi_completed_bar_price",
+    "rsi_profit_condition_ready",
+    "rsi_exit_ready",
+    "bars_since_entry",
+    "max_holding_enabled",
+    "max_holding_bars",
+    "time_exit_ready",
+    "interval",
+    "last_completed_bar_at",
+    "exit_window",
+    "atr_multiplier",
+    "trailing_atr_multiplier",
+    "breakeven_after_r",
+    "trail_after_r",
+    "buy_level_snapshot",
+    "checked_at",
+)
+
 EXIT_PLAN_HISTORY_BY_INTERVAL = {
     "1m": "7d",
     "5m": "1mo",
@@ -80,6 +120,101 @@ def _number(value: Any, default: float | None = None) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return default
+
+
+def _position_market_price(position: dict[str, Any]) -> float | None:
+    direct = _number(position.get("Current Price"), _number(position.get("current_price")))
+    if direct is not None and direct > 0:
+        return direct
+    quantity = _number(position.get("Quantity"))
+    market_value = _number(position.get("Market Value"))
+    if quantity is None or market_value is None or quantity == 0:
+        return None
+    derived = market_value / quantity
+    return derived if derived > 0 else None
+
+
+def exit_snapshot_from_details(details: dict[str, Any]) -> dict[str, Any]:
+    """Keep the worker's latest exit calculation small and JSON-serializable."""
+    return {
+        field: details.get(field)
+        for field in EXIT_SNAPSHOT_FIELDS
+        if field in details
+    }
+
+
+def exit_details_from_snapshot(
+    settings: dict[str, Any] | None,
+    position: dict[str, Any],
+) -> dict[str, Any]:
+    """Render a position from the worker snapshot without downloading price history."""
+    if not settings:
+        return {
+            "ready": False,
+            "reason": "No saved exit settings for this position; automatic exit is paused.",
+            "trigger_price": None,
+            "snapshot_available": False,
+        }
+    if not bool(settings.get("auto_exit_enabled", False)):
+        return {
+            "ready": False,
+            "reason": "Automatic exit is off for this position.",
+            "trigger_price": None,
+            "snapshot_available": bool(settings.get("last_exit_snapshot")),
+        }
+
+    details = dict(settings.get("last_exit_snapshot") or {})
+    snapshot_available = bool(details)
+    symbol = str(position.get("Symbol") or settings.get("symbol") or "").strip().upper()
+    live_price = _position_market_price(position)
+    entry = _number(position.get("Average Entry"), _number(settings.get("entry_reference_price")))
+    initial_risk = _number(settings.get("entry_stop_distance"))
+    original_stop = entry - initial_risk if entry is not None and initial_risk and initial_risk > 0 else None
+    trigger = _number(
+        details.get("trigger_price"),
+        _number(settings.get("last_exit_trigger_price"), original_stop),
+    )
+    trigger_source = str(
+        details.get("trigger_source")
+        or settings.get("last_exit_trigger_source")
+        or ("fill-adjusted initial stop" if original_stop is not None else "exit rule")
+    )
+    snapshot_ready = bool(details.get("ready", False))
+    non_price_trigger = trigger_source in {"RSI recovery exit", "maximum holding period"}
+    price_ready = bool(live_price is not None and trigger is not None and live_price <= trigger)
+    ready = snapshot_ready if non_price_trigger else price_ready
+
+    details.update({
+        "ready": ready,
+        "current_price": live_price if live_price is not None else _number(details.get("current_price")),
+        "current_price_source": (
+            "Alpaca position market value"
+            if live_price is not None
+            else details.get("current_price_source", "saved worker calculation")
+        ),
+        "trigger_price": trigger,
+        "trigger_source": trigger_source,
+        "exit_mode": details.get("exit_mode") or exit_mode_for_settings(settings),
+        "original_stop_price": _number(details.get("original_stop_price"), original_stop),
+        "interval": details.get("interval") or str(settings.get("interval", "1h")),
+        "exit_window": details.get("exit_window") or int(settings.get("exit_window", 10)),
+        "snapshot_available": snapshot_available,
+        "snapshot_checked_at": details.get("checked_at") or settings.get("last_exit_checked_at"),
+    })
+    if ready and not non_price_trigger and trigger is not None:
+        details["reason"] = f"Exit now because {symbol} is at or below the {trigger_source} at ${trigger:,.2f}."
+    elif not snapshot_available:
+        details["reason"] = (
+            f"Hold. The saved protective stop is ${trigger:,.2f}. "
+            "Start the Background Worker or refresh this position to calculate the complete exit plan."
+            if trigger is not None
+            else "Start the Background Worker or refresh this position to calculate its exit plan."
+        )
+    elif not ready and trigger is not None and not non_price_trigger:
+        details["reason"] = (
+            f"Hold. Automatic exit triggers at ${trigger:,.2f} or lower using the latest saved worker calculation."
+        )
+    return details
 
 
 def _run_one(
@@ -264,7 +399,16 @@ def evaluate_exit_settings(
         live = result["live"]
         exit_mode = exit_mode_for_settings(settings)
         strategy_exit_enabled = exit_mode == "strategy_and_atr"
-        current_price = _number(data.attrs.get("latest_price"), _number(live.get("last_p")))
+        position_market_price = _position_market_price(position)
+        current_price = _number(
+            position_market_price,
+            _number(data.attrs.get("latest_price"), _number(live.get("last_p"))),
+        )
+        current_price_source = (
+            "Alpaca position market value"
+            if position_market_price is not None
+            else "latest price data"
+        )
         strategy_exit = _number(live.get("exit_level")) if strategy_exit_enabled else None
         current_atr = _number(live.get("last_atr"))
         current_rsi = _number(live.get("rsi"))
@@ -426,6 +570,7 @@ def evaluate_exit_settings(
             "ready": ready,
             "reason": reason,
             "current_price": current_price,
+            "current_price_source": current_price_source,
             "trigger_price": trigger,
             "trigger_source": source_name,
             "exit_mode": exit_mode,

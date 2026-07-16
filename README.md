@@ -13,7 +13,7 @@ A governed trading simulator, paper-trading console, and research lab for testin
 - Generates a structured trade intent when the strategy produces a current entry signal.
 - Runs each trade intent through deterministic risk checks.
 - Supports explicit execution modes: backtest only, paper trading, shadow mode, live with approval, and automated live.
-- Adds an out-of-sample walk-forward evaluation panel to compare training and test-period behavior.
+- Always shows how the exact selected strategy and inputs performed in the older 55%, newer 25%, and latest 20% of the loaded price history.
 - Adds a bounded strategy-input search that favors stable nearby settings, separates older/newer/latest price sections, and includes realistic execution-cost stress.
 - Describes each winning result across deterministic price-behavior periods and reports whether performance depended on one favorable environment.
 - Adds an optional bounded analyst, skeptical-reviewer, and decision-editor loop over hashed deterministic evidence. Invalid or invented claims fall back to the built-in decision.
@@ -65,7 +65,10 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Results include unrealized profit or loss from a simulated position still open on the final bar.
 - Newer-data and optimizer comparisons use completed trades on both sides of the split so open-position P&L cannot skew one side.
 - Backtest results deduct estimated Alpaca trading fees. Stock tests use the current U.S. equity regulatory-fee model; crypto tests conservatively use Alpaca's Tier 1 taker fee on each side. Spread, market impact, taxes, and idle-cash interest are not included. The strategy-input recommendation separately shows 5, 10, and 20 basis-point-per-side stress results; paper and live fills remain the final execution test.
-- For real prices, each strategy-input search independently downloads fixed datasets rather than reusing the sidebar chart. Alpaca equity searches use 1-hour/2-year, 4-hour/5-year, and daily/10-year data. Alpaca crypto searches use 1-hour/1-year, 4-hour/2-year, and daily/5-year data because crypto trades continuously. The older 55% supplies the historical sample, the newer 25% selects among the historical finalists, and the latest 20% reports what happened without choosing replacement settings.
+- A normal trading-screen refresh calculates only the strategy selected in the sidebar. The optional all-strategy comparison runs only after `Compare All Strategies` is clicked and remains cached until a material input changes.
+- Each strategy-input search uses one interval chosen by the operator and compares the four trend strategies on that same dataset. Alpaca equity search history remains 1-hour/2-year, 4-hour/5-year, or daily/10-year; Alpaca crypto remains 1-hour/1-year, 4-hour/2-year, or daily/5-year. The older 55% supplies the historical sample, the newer 25% selects among the historical finalists, and the latest 20% reports what happened without choosing replacement settings.
+- The search samples 32 broad combinations per strategy, then up to 16 intentional nearby combinations around the strongest regions. Chronological validation is limited to three finalists per strategy, and price-behavior checks reuse the same older/newer/latest sections instead of running six extra periods.
+- Historical bars are cached until another bar can complete. A lightweight Alpaca latest-trade request updates current pricing every 15 seconds without repeatedly downloading complete history.
 - RSI remains available as current setup information and as the separate RSI mean-reversion strategy. RSI rules are intentionally excluded from the four-strategy input search so the search stays focused and less vulnerable to combinatorial overfitting.
 - Price-behavior labels describe the ticker path rather than claiming to identify an economic business cycle. Direction is classified as strong/mild uptrend, sideways, or mild/strong downtrend; path is classified as persistent, mixed, or choppy. The result also reports performance across six chronological periods and whether profits were concentrated in one type of price behavior.
 - Strategy quality is measured against a stable per-ticker capital allocation set by `Max symbol concentration`. The UI keeps whole-account return for portfolio impact, while allocated return, allocated worst drop, and equal-capital buy-and-hold are used for strategy comparison and optimizer evidence. Strategy and buy-and-hold worst drops both divide the largest peak-to-trough dollar decline by the original ticker allocation, making the displayed percentages directly comparable. Annualized allocated and buy-and-hold returns use actual timestamps and appear only when the measured period exceeds one year. Return on average capital deployed is intentionally not used.
@@ -81,7 +84,7 @@ agentloop_trader/
   brokers.py      # broker adapter contract, paper adapter, and Alpaca integration
   data.py         # synthetic data generation
   execution.py    # thin paper broker/order skeleton
-  evaluation.py   # train/test split and walk-forward evaluation
+  evaluation.py   # time-period consistency checks for exact selected settings
   parameter_loop.py # bounded parameter evaluation and recommendations
   indicators.py   # ATR and SMA calculations
   models.py       # structured trading, risk, and audit contracts

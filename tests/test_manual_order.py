@@ -18,7 +18,7 @@ def test_manual_crypto_buy_uses_fractional_quantity_gtc_and_atr_stop():
     )
 
     assert intent.symbol_clean == "BTC/USD"
-    assert intent.quantity == pytest.approx(0.084)
+    assert intent.quantity == pytest.approx(0.08403361)
     assert intent.time_in_force == "gtc"
     assert intent.limit_price == 59_500
     assert intent.stop_loss == 58_000

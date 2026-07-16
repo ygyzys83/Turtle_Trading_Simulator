@@ -50,6 +50,7 @@ from agentloop_trader.risk import check_trade_intent, constrain_trade_intent_to_
 from agentloop_trader.strategy_runtime import (
     apply_buy_order_style,
     evaluate_exit_settings,
+    exit_snapshot_from_details,
     reprice_trade_intent,
     selected_strategy_result,
 )
@@ -388,6 +389,7 @@ def _send_exits(
     if not adapter.config.paper:
         return 0, tracked_orders, "Auto exits are paper-only in this worker."
     sent = 0
+    blocked_messages: list[str] = []
     updated = list(tracked_orders)
     for position in positions:
         symbol = str(position.get("Symbol", "")).strip().upper()
@@ -401,12 +403,21 @@ def _send_exits(
         if not resolution.cycle or not resolution.cycle.reliable:
             continue
         details = evaluate_exit_settings(settings, position, fetch_bars)
-        if settings and details.get("state_changed"):
+        exit_snapshot = exit_snapshot_from_details(details)
+        snapshot_changed = bool(
+            settings
+            and exit_snapshot
+            and settings.get("last_exit_snapshot") != exit_snapshot
+        )
+        if settings and (details.get("state_changed") or snapshot_changed):
             refreshed_settings = dict(settings)
             if details.get("highest_high_since_entry") is not None:
                 refreshed_settings["highest_high_since_entry"] = details.get("highest_high_since_entry")
             if details.get("trigger_price") is not None:
                 refreshed_settings["last_exit_trigger_price"] = details.get("trigger_price")
+            if details.get("trigger_source"):
+                refreshed_settings["last_exit_trigger_source"] = details.get("trigger_source")
+            refreshed_settings["last_exit_snapshot"] = exit_snapshot
             refreshed_settings["last_exit_checked_at"] = datetime.now(PACIFIC_TIME).isoformat()
             updated = upsert_position_plan(
                 position,
@@ -425,6 +436,27 @@ def _send_exits(
         preview = build_alpaca_order_preview(intent, decision, adapter.config)
         blockers = open_exit_order_reasons(preview, orders)
         if not preview.valid or blockers:
+            reasons = list(getattr(preview, "blocked_reasons", []) or []) + list(blockers)
+            detail = "; ".join(dict.fromkeys(str(reason) for reason in reasons if str(reason).strip()))
+            blocked_message = f"{symbol} exit triggered but was not sent"
+            if detail:
+                blocked_message += f": {detail}"
+            blocked_messages.append(blocked_message + ".")
+            audit_store.append(AuditEvent(
+                event_type="worker_paper_exit_blocked",
+                message="Background worker found a triggered exit but did not send it.",
+                payload={
+                    "symbol": symbol,
+                    "quantity": intent.quantity,
+                    "reason": details.get("reason"),
+                    "blocked_reasons": reasons,
+                    "position_cycle_id": resolution.cycle.cycle_id,
+                    "current_price": details.get("current_price"),
+                    "current_price_source": details.get("current_price_source"),
+                    "trigger_price": details.get("trigger_price"),
+                    "trigger_source": details.get("trigger_source"),
+                },
+            ))
             continue
         order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
         tracked_exit = _track_broker_order(order, preview.preview_hash, settings)
@@ -468,7 +500,11 @@ def _send_exits(
                 },
             },
         ))
-    return sent, updated, f"Sent {sent} auto exit order(s)." if sent else "No auto exits were ready."
+    messages = []
+    if sent:
+        messages.append(f"Sent {sent} auto exit order(s).")
+    messages.extend(blocked_messages)
+    return sent, updated, " ".join(messages) if messages else "No auto exits were ready."
 
 
 def _send_entry(

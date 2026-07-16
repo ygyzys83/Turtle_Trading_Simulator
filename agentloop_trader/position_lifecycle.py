@@ -4,11 +4,17 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+# Alpaca deducts a crypto BUY fee from the crypto received. Order history
+# therefore reports the gross fill while the position reports the net quantity.
+_MAX_ALPACA_CRYPTO_BUY_FEE_RATE = 0.0025
+_CRYPTO_QUANTITY_TOLERANCE = 1e-8
+
 
 _DYNAMIC_EXIT_FIELDS = {
     "highest_high_since_entry",
     "highest_rsi_since_entry",
     "last_exit_checked_at",
+    "last_exit_snapshot",
     "last_exit_trigger_price",
     "last_exit_trigger_source",
 }
@@ -196,7 +202,10 @@ def current_position_cycle(
     if not symbol or broker_quantity <= 0:
         return None
 
+    asset_class = str(position.get("Asset Type") or "equity").strip().lower()
+    is_crypto = asset_class == "crypto" or "/" in symbol
     net_quantity = 0.0
+    cycle_gross_buy_quantity = 0.0
     cycle_buys: list[dict[str, Any]] = []
     for order in _filled_orders_for_symbol(symbol, alpaca_orders):
         quantity = _filled_quantity(order)
@@ -204,17 +213,26 @@ def current_position_cycle(
             if net_quantity <= 1e-8:
                 cycle_buys = []
                 net_quantity = 0.0
+                cycle_gross_buy_quantity = 0.0
             net_quantity += quantity
+            cycle_gross_buy_quantity += quantity
             cycle_buys.append(order)
         elif net_quantity > 0:
             net_quantity = max(0.0, net_quantity - quantity)
-            if net_quantity <= 1e-8:
+            crypto_fee_residual = (
+                cycle_gross_buy_quantity * _MAX_ALPACA_CRYPTO_BUY_FEE_RATE
+                if is_crypto
+                else 0.0
+            )
+            if net_quantity <= max(1e-8, crypto_fee_residual + _CRYPTO_QUANTITY_TOLERANCE):
+                net_quantity = 0.0
+                cycle_gross_buy_quantity = 0.0
                 cycle_buys = []
 
     if not cycle_buys:
         return PositionCycle(
             symbol=symbol,
-            asset_class=str(position.get("Asset Type") or "equity").strip().lower(),
+            asset_class=asset_class,
             cycle_id="",
             basis_order_id="",
             buy_order_ids=(),
@@ -233,11 +251,26 @@ def current_position_cycle(
     first_buy = cycle_buys[0]
     basis_buy = cycle_buys[-1]
     buy_ids = tuple(_order_id(order) for order in cycle_buys)
-    tolerance = max(1e-6, broker_quantity * 1e-6)
-    quantity_matches = abs(net_quantity - broker_quantity) <= tolerance
+    tolerance = (
+        _CRYPTO_QUANTITY_TOLERANCE
+        if is_crypto
+        else max(1e-6, broker_quantity * 1e-6)
+    )
+    quantity_difference = net_quantity - broker_quantity
+    maximum_crypto_buy_fees = (
+        cycle_gross_buy_quantity * _MAX_ALPACA_CRYPTO_BUY_FEE_RATE
+        if is_crypto
+        else 0.0
+    )
+    exact_quantity_match = abs(quantity_difference) <= tolerance
+    crypto_fee_adjusted_match = (
+        is_crypto
+        and -tolerance <= quantity_difference <= maximum_crypto_buy_fees + tolerance
+    )
+    quantity_matches = exact_quantity_match or crypto_fee_adjusted_match
     return PositionCycle(
         symbol=symbol,
-        asset_class=str(position.get("Asset Type") or "equity").strip().lower(),
+        asset_class=asset_class,
         cycle_id=_order_id(first_buy),
         basis_order_id=_order_id(basis_buy),
         buy_order_ids=buy_ids,
@@ -254,7 +287,9 @@ def current_position_cycle(
         average_entry=_number(position.get("Average Entry")),
         reliable=quantity_matches,
         reason=(
-            "Current Alpaca position matched to its filled BUY and SELL history."
+            "Current Alpaca crypto position matched after accounting for BUY fees deducted from the crypto received."
+            if crypto_fee_adjusted_match and not exact_quantity_match
+            else "Current Alpaca position matched to its filled BUY and SELL history."
             if quantity_matches
             else (
                 f"Alpaca position quantity is {broker_quantity:g}, but the available order history reconstructs "

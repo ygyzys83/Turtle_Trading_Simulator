@@ -130,6 +130,14 @@ def _backtest_session_keys(market_data, labels: list[str], asset_class: str) -> 
         return [label[:10] if len(label) >= 10 and label[4:5] == "-" else label for label in labels]
 
 
+def _evaluation_start_bar(market_data) -> int:
+    """Use earlier bars for indicators without allowing earlier simulated entries."""
+    try:
+        return max(0, int(getattr(market_data, "attrs", {}).get("_evaluation_start_bar", 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
 @dataclass
 class _BacktestSessionRisk:
     session_keys: list[str]
@@ -701,7 +709,7 @@ def simulate_turtle_strategy(
     exit_rule = "Exit rule"
     balance = float(account)
     open_entry_fee = 0.0
-    start = max(entry_w, exit_w, ma_w)
+    start = max(entry_w, exit_w, ma_w, _evaluation_start_bar(market_data))
 
     live_bar = n_bars - 1
     for i in range(start, live_bar):
@@ -968,7 +976,14 @@ def simulate_trend_pullback_strategy(
     exit_rule = "Exit rule"
     balance = float(account)
     open_entry_fee = 0.0
-    start = max(pullback_w, exit_w, trend_w, momentum_w, config.atr_window)
+    start = max(
+        pullback_w,
+        exit_w,
+        trend_w,
+        momentum_w,
+        config.atr_window,
+        _evaluation_start_bar(market_data),
+    )
     live_bar = n_bars - 1
 
     def setup_at(i: int) -> tuple[bool, float | None, bool, bool, bool, bool]:
@@ -1249,7 +1264,7 @@ def simulate_trendline_breakout_strategy(
     exit_rule = "Exit rule"
     balance = float(account)
     open_entry_fee = 0.0
-    start = max(trendline_w, exit_w, ma_w, 14)
+    start = max(trendline_w, exit_w, ma_w, 14, _evaluation_start_bar(market_data))
     live_bar = n_bars - 1
 
     for i in range(start, live_bar):
@@ -1431,7 +1446,14 @@ def simulate_trendline_retest_strategy(
     exit_rule = "Exit rule"
     balance = float(account)
     open_entry_fee = 0.0
-    start = max(trendline_w, exit_w, ma_w, momentum_w, 14)
+    start = max(
+        trendline_w,
+        exit_w,
+        ma_w,
+        momentum_w,
+        14,
+        _evaluation_start_bar(market_data),
+    )
     live_bar = n_bars - 1
 
     for i in range(start, live_bar):
@@ -1824,7 +1846,7 @@ def simulate_rsi_mean_reversion_strategy(
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
     high_since_entry = low_since_entry = 0.0
     exit_rule = "Exit rule"
-    start = max(14, rsi_length, rsi_swing_lookback)
+    start = max(14, rsi_length, rsi_swing_lookback, _evaluation_start_bar(market_data))
     live_bar = n_bars - 1
 
     for i in range(start, live_bar):

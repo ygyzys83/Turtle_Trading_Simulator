@@ -29,6 +29,7 @@ from agentloop_trader.automation import (
     paper_automation_candidate_records,
     evidence_dashboard_records,
     paper_automation_dry_run,
+    position_management_status_message,
 )
 from agentloop_trader.automation_runtime import (
     AutomationControl,
@@ -92,7 +93,7 @@ from agentloop_trader.broker_governance import (
     exit_position_reasons,
     refresh_tracked_alpaca_orders,
 )
-from agentloop_trader.evaluation import evaluate_walk_forward, walk_forward_records
+from agentloop_trader.evaluation import evaluate_period_performance, period_performance_records
 from agentloop_trader.evidence import (
     approval_ledger_records,
     approval_ledger_summary_records,
@@ -112,26 +113,31 @@ from agentloop_trader.execution import PaperBroker
 from agentloop_trader.llm_research import LLMResearchConfig, LLMResearchResult, analyze_candidate, llm_research_records
 from agentloop_trader.market_data import (
     build_company_research_context,
+    completed_bar_cache_bucket,
     fetch_alpaca_bars,
     fetch_alpaca_crypto_bars,
+    fetch_alpaca_latest_crypto_trades,
+    fetch_alpaca_latest_trades,
     fetch_yfinance_bars,
 )
 from agentloop_trader.manual_order import build_manual_buy_intent
 from agentloop_trader.models import AuditEvent, ExecutionDecision, RiskCheckResult, RiskLimits, StrategyConfig, TradeIntent
 from agentloop_trader.position_lifecycle import (
     initialize_exit_settings_for_position,
-    replace_exit_rules,
     resolve_position_plan,
     synchronize_position_plans,
     upsert_position_plan,
 )
 from agentloop_trader.strategy_runtime import (
     adjust_initial_stop_settings,
+    exit_details_from_snapshot,
+    exit_snapshot_from_details,
     evaluate_exit_settings as evaluate_saved_exit_settings,
     exit_plan_history_for_interval,
     exit_mode_for_settings,
     latest_atr_snapshot,
     reprice_trade_intent,
+    selected_strategy_result as calculate_selected_strategy_result,
 )
 from agentloop_trader.monitoring import (
     broker_heartbeat_records,
@@ -169,6 +175,7 @@ from agentloop_trader.parameter_loop import (
     strategy_search_data_records,
     strategy_search_interval_records,
     strategy_search_ranking_records,
+    strategy_search_summary_records,
     strategy_search_settings_records,
     strategy_search_interval_histories,
     strategy_input_search_identity,
@@ -178,7 +185,6 @@ from agentloop_trader.performance import ticker_allocated_capital
 from agentloop_trader.research_agent import (
     build_research_agent_report,
     research_agent_records,
-    strategy_fit_records,
 )
 from agentloop_trader.research_memory import (
     ResearchSnapshotStore,
@@ -265,30 +271,53 @@ st.dataframe = safe_streamlit_dataframe
 
 st.markdown(TRADING_CONSOLE_CSS, unsafe_allow_html=True)
 
+active_page_for_startup = st.session_state.get(
+    "command_center_page_input",
+    "Positions & Queue",
+)
+load_sidebar_ticker_history = active_page_for_startup in {
+    "Ideas",
+    "New Trade",
+    "Alpaca",
+}
 
-@st.cache_data(ttl=300, show_spinner=False)
-def fetch_stock_data(ticker, period, interval):
+
+@st.cache_data(ttl=86400, max_entries=64, show_spinner=False)
+def fetch_stock_data(ticker, period, interval, bar_bucket: int):
+    _ = bar_bucket
     return fetch_yfinance_bars(ticker, period, interval)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_alpaca_stock_data(ticker: str, period: str, interval: str, api_key: str | None, api_secret: str | None) -> pd.DataFrame:
+@st.cache_data(ttl=86400, max_entries=64, show_spinner=False)
+def fetch_alpaca_stock_data(ticker: str, period: str, interval: str, api_key: str | None, api_secret: str | None, bar_bucket: int) -> pd.DataFrame:
+    _ = bar_bucket
     return fetch_alpaca_bars(ticker, period, interval, api_key, api_secret)
 
 
-@st.cache_data(ttl=60, show_spinner=False)
-def fetch_alpaca_crypto_data(ticker: str, period: str, interval: str, api_key: str | None, api_secret: str | None) -> pd.DataFrame:
+@st.cache_data(ttl=86400, max_entries=64, show_spinner=False)
+def fetch_alpaca_crypto_data(ticker: str, period: str, interval: str, api_key: str | None, api_secret: str | None, bar_bucket: int) -> pd.DataFrame:
+    _ = bar_bucket
     return fetch_alpaca_crypto_bars(ticker, period, interval, api_key, api_secret)
 
 
+@st.cache_data(ttl=15, max_entries=64, show_spinner=False)
+def fetch_latest_alpaca_price(ticker: str, asset_class: str, api_key: str | None, api_secret: str | None) -> float | None:
+    if str(asset_class).lower() == "crypto":
+        prices = fetch_alpaca_latest_crypto_trades([ticker], api_key, api_secret)
+    else:
+        prices = fetch_alpaca_latest_trades([ticker], api_key, api_secret)
+    return prices.get(str(ticker).strip().upper())
+
+
 def fetch_price_data_for_source(symbol: str, history: str, interval_value: str, price_source: str) -> pd.DataFrame:
+    bar_bucket = completed_bar_cache_bucket(interval_value, price_source)
     if price_source == "Crypto (Alpaca)":
         market_data_config = AlpacaConfig.from_env()
-        return fetch_alpaca_crypto_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret)
+        return fetch_alpaca_crypto_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret, bar_bucket)
     if price_source == "Ticker (Alpaca)":
         market_data_config = AlpacaConfig.from_env()
-        return fetch_alpaca_stock_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret)
-    return fetch_stock_data(symbol, history, interval_value)
+        return fetch_alpaca_stock_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret, bar_bucket)
+    return fetch_stock_data(symbol, history, interval_value, bar_bucket)
 
 
 @st.cache_data(ttl=3600, max_entries=24, show_spinner=False)
@@ -394,6 +423,58 @@ def run_strategy_suite(
         risk_limits=risk_limits,
     )
     return breakout, pullback, trendline, retest, rsi_scalp
+
+
+@st.cache_data(ttl=3600, max_entries=48, show_spinner=False)
+def run_selected_strategy_backtest(
+    account: float,
+    settings: dict,
+    market_data: pd.DataFrame,
+    risk_limits: RiskLimits,
+    data_identity: tuple,
+) -> dict:
+    """Calculate only the strategy currently selected in the sidebar."""
+    _ = data_identity
+    return calculate_selected_strategy_result(market_data, settings, account, risk_limits)
+
+
+@st.cache_data(ttl=3600, max_entries=48, show_spinner=False)
+def run_selected_strategy_period_performance(
+    account: float,
+    settings: dict,
+    market_data: pd.DataFrame,
+    risk_limits: RiskLimits,
+    data_identity: tuple,
+):
+    """Compare the exact selected settings across fixed historical price sections."""
+    _ = data_identity
+    return evaluate_period_performance(
+        account=account,
+        entry_w=int(settings["entry_window"]),
+        exit_w=int(settings["exit_window"]),
+        atr_mult=float(settings["atr_stop_multiplier"]),
+        risk_pct_dec=float(settings["risk_per_trade_pct"]) / 100.0,
+        ma_w=int(settings["moving_average_window"]),
+        market_data=market_data,
+        risk_limits=risk_limits,
+        strategy_type=str(settings["strategy_type"]),
+        pullback_w=int(settings["pullback_average_length"]),
+        momentum_w=int(settings["momentum_turn_length"]),
+        rsi_entry_filter_enabled=bool(settings.get("rsi_entry_filter_enabled", False)),
+        rsi_length=int(settings.get("rsi_length", 14)),
+        rsi_oversold=float(settings.get("rsi_oversold", 30.0)),
+        rsi_overbought=float(settings.get("rsi_overbought", 70.0)),
+        rsi_decline_points=float(settings.get("rsi_decline_points", 40.0)),
+        rsi_rebound_points=float(settings.get("rsi_rebound_points", 3.0)),
+        rsi_max_rebound_points=float(settings.get("rsi_max_rebound_points", 12.0)),
+        rsi_sell_recovery_points=float(settings.get("rsi_sell_recovery_points", 35.0)),
+        rsi_swing_lookback=int(settings.get("rsi_swing_lookback", 24)),
+        rsi_stop_mode=str(settings.get("rsi_stop_mode", "standard_atr")),
+        rsi_emergency_atr_multiplier=float(settings.get("rsi_emergency_atr_multiplier", 5.0)),
+        rsi_max_holding_enabled=bool(settings.get("rsi_max_holding_enabled", True)),
+        rsi_max_holding_bars=int(settings.get("rsi_max_holding_bars", 100)),
+        rsi_profit_only_exit=bool(settings.get("rsi_profit_only_exit", False)),
+    )
 
 
 @st.cache_data(ttl=3600, max_entries=12, show_spinner=False)
@@ -1240,22 +1321,19 @@ def daily_automation_readiness_records(context: str) -> list[dict]:
 
 
 def open_positions_next_step(position_settings_by_symbol: dict[str, dict]) -> str:
-    if not alpaca_positions:
-        return "No open Alpaca positions. Use New Trade when you want to research the next setup."
-    unmanaged = [
+    position_symbols = [
         str(position.get("Symbol", "")).strip().upper()
         for position in alpaca_positions
-        if not position_settings_by_symbol.get(str(position.get("Symbol", "")).strip().upper())
     ]
-    if auto_exit_status.ready:
-        return f"Ready to sell {auto_exit_status.quantity} {auto_exit_status.symbol} if automation is enabled."
-    if unmanaged:
-        return f"Save exit settings for {', '.join(unmanaged)}."
-    if count_waiting_alpaca_orders(alpaca_orders):
-        return "Review waiting Alpaca orders before adding new exposure."
-    if active_automation_level == "Auto exits only":
-        return "Auto exits are watching saved position exit rules."
-    return "Positions have saved exit settings. Turn on Auto exits if you want the app to manage sells."
+    return position_management_status_message(
+        position_symbols,
+        position_settings_by_symbol,
+        active_automation_level,
+        sidebar_worker_active,
+        exit_ready=auto_exit_status.ready,
+        exit_symbol=auto_exit_status.symbol,
+        exit_quantity=auto_exit_status.quantity,
+    )
 
 
 def live_trading_setup_records() -> list[dict]:
@@ -2195,7 +2273,7 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
         fetch_stock_data.clear()
     if not ticker:
         st.sidebar.caption("Enter a ticker or crypto pair to load price data.")
-    else:
+    elif load_sidebar_ticker_history:
         load_progress_slot = st.empty()
         with load_progress_slot.container():
             load_progress_status = st.status(
@@ -2217,17 +2295,15 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
             )
         try:
             if data_source == "Crypto (Alpaca)":
-                market_data_config = AlpacaConfig.from_env()
-                market_data = fetch_alpaca_crypto_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
+                market_data = fetch_price_data_for_source(ticker, period, interval, data_source)
                 source_caption = f"{ticker} via Alpaca crypto ({period}, {interval}); latest completed bar {market_data.index[-1]}"
                 st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca crypto bars.")
             elif data_source == "Ticker (Alpaca)":
-                market_data_config = AlpacaConfig.from_env()
-                market_data = fetch_alpaca_stock_data(ticker, period, interval, market_data_config.api_key, market_data_config.api_secret)
+                market_data = fetch_price_data_for_source(ticker, period, interval, data_source)
                 source_caption = f"{ticker} via Alpaca IEX ({period}, {interval}); latest completed bar {market_data.index[-1]}"
                 st.sidebar.caption(f"Loaded {len(market_data):,} completed Alpaca bars. Free IEX data can be delayed.")
             else:
-                market_data = fetch_stock_data(ticker, period, interval)
+                market_data = fetch_price_data_for_source(ticker, period, interval, data_source)
                 source_caption = f"{ticker} via yfinance ({period}, {interval}); latest completed bar {market_data.index[-1]}"
                 st.sidebar.caption(f"Loaded {len(market_data):,} completed yfinance bars. Yahoo intraday data may be delayed or limited.")
             load_progress_status.write(f"Downloaded **{len(market_data):,} completed bars** for {ticker}.")
@@ -2243,6 +2319,11 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
             )
             st.error(f"Could not load {data_source} price data: {exc}")
             st.stop()
+    else:
+        source_caption = (
+            f"{ticker} is selected; historical bars are deferred until Ideas, New Trade, or Alpaca is opened."
+        )
+        st.sidebar.caption("Historical ticker data is paused on this page for faster startup.")
 st.session_state["last_loaded_symbol"] = ticker
 
 optimizer_apply_settings = st.session_state.pop("optimizer_apply_settings", None)
@@ -2629,29 +2710,35 @@ max_open_positions = st.sidebar.slider(
     help="Maximum number of positions the app can have open or tracked at the same time.",
 )
 st.sidebar.markdown("### :material/query_stats: Research options")
-run_walk_forward = st.sidebar.checkbox(
-    "Test on newer price data",
-    value=True,
-    help="Splits the price history into older data and newer data. The app checks whether the selected strategy still works on the newer bars instead of only fitting the older bars.",
-)
-train_fraction = st.sidebar.slider("Older data used first (%)", 55, 80, 65, step=5) / 100
 max_parameter_candidates = st.sidebar.slider(
     "Settings to compare per strategy",
     8,
-    64,
+    32,
     64,
     step=8,
     help=(
         "How many distinct combinations to sample across each trend strategy's full input ranges. After this broad "
-        "search, the app tests up to 24 deliberate neighboring combinations around the two strongest regions. "
+        "search, the app tests up to 16 deliberate neighboring combinations around the two strongest regions. "
         "RSI rules are not included in this search."
+    ),
+)
+search_interval_options = ["1h", "4h", "1d"]
+search_interval_default = interval if interval in search_interval_options else "4h"
+strategy_search_interval = st.sidebar.selectbox(
+    "Strategy search interval",
+    search_interval_options,
+    index=search_interval_options.index(search_interval_default),
+    key="strategy_search_interval_input",
+    help=(
+        "The input search now evaluates one interval at a time. Choose 1-hour, 4-hour, or daily prices here. "
+        "The app still compares all four trend strategies on that same interval."
     ),
 )
 run_strategy_input_search = st.sidebar.button(
     "Run Strategy Input Search",
     help=(
         "Searches Breakout continuation, Trend pullback continuation, Trendline breakout, and Trendline retest continuation. "
-        "Each strategy compares 1-hour, 4-hour, and daily prices. RSI rules are excluded. "
+        "All four strategies use the single Strategy search interval selected above. RSI rules are excluded. "
         "Ordinary page refreshes do not rerun it."
     ),
 )
@@ -2731,7 +2818,7 @@ if data_source == "Synthetic" and st.sidebar.button("Simulate new run", type="pr
     st.session_state["seed"] = np.random.randint(0, 100_000)
     st.session_state["selected_trade_idx"] = None
 
-if data_source != "Synthetic" and not ticker:
+if data_source != "Synthetic" and not ticker and load_sidebar_ticker_history:
     st.info("Enter a ticker or crypto pair in the sidebar to load price data.")
     st.stop()
 
@@ -2882,6 +2969,43 @@ if market_data is not None:
         if key not in {"latest_price", "latest_high", "latest_low", "latest_bar_time"}
     }
 
+selected_backtest_settings = {
+    "strategy_type": strategy_type,
+    "strategy_label": strategy_label,
+    "entry_window": entry_w,
+    "exit_window": exit_w,
+    "atr_stop_multiplier": atr_mult,
+    "risk_per_trade_pct": risk_pct,
+    "moving_average_window": ma_w,
+    "pullback_average_length": pullback_w,
+    "momentum_turn_length": momentum_w,
+    "rsi_entry_filter_enabled": rsi_entry_filter_enabled,
+    "rsi_length": rsi_length,
+    "rsi_oversold": rsi_oversold,
+    "rsi_overbought": rsi_overbought,
+    "rsi_decline_points": rsi_decline_points,
+    "rsi_rebound_points": rsi_rebound_points,
+    "rsi_max_rebound_points": rsi_max_rebound_points,
+    "rsi_sell_recovery_points": rsi_sell_recovery_points,
+    "rsi_swing_lookback": rsi_swing_lookback,
+    "rsi_stop_mode": rsi_stop_mode,
+    "rsi_emergency_atr_multiplier": rsi_emergency_atr_multiplier,
+    "rsi_max_holding_enabled": rsi_max_holding_enabled,
+    "rsi_max_holding_bars": rsi_max_holding_bars,
+    "rsi_profit_only_exit": rsi_profit_only_exit,
+}
+strategy_comparison_signature = hashlib.sha256(json.dumps({
+    "ticker": ticker,
+    "source": data_source,
+    "interval": interval,
+    "history": period,
+    "settings": selected_backtest_settings,
+    "risk_limits": asdict(risk_limits),
+}, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+all_strategy_comparison_requested = (
+    st.session_state.get("all_strategy_comparison_signature") == strategy_comparison_signature
+)
+
 if load_progress_status is not None:
     load_progress_status.update(
         label=f"Loading {ticker}: running strategy calculations...",
@@ -2889,49 +3013,50 @@ if load_progress_status is not None:
         expanded=True,
     )
     load_progress_status.write(
-        f"**Step 2 of 3 - Run backtests.** Testing all five strategies across {len(strategy_market_data):,} completed bars."
+        f"**Step 2 of 3 - Run backtest.** Testing {'all five strategies' if all_strategy_comparison_requested else strategy_label} "
+        f"across {len(strategy_market_data):,} completed bars."
     )
     load_progress_bar.progress(
         0.48,
-        text=f"Running five backtests across {len(strategy_market_data):,} bars (step 2 of 3)",
+        text=f"Running {'five backtests' if all_strategy_comparison_requested else 'the selected backtest'} across "
+        f"{len(strategy_market_data):,} bars (step 2 of 3)",
     )
 
 try:
-    breakout_result, pullback_result, trendline_result, retest_result, rsi_scalp_result = run_strategy_suite(
-        account,
-        entry_w,
-        exit_w,
-        atr_mult,
-        risk_dec,
-        ma_w,
-        pullback_w,
-        momentum_w,
-        seed,
-        strategy_market_data,
-        risk_limits,
-        (ticker, data_source, interval, period),
-        rsi_entry_filter_enabled,
-        rsi_length,
-        rsi_oversold,
-        rsi_overbought,
-        rsi_decline_points,
-        rsi_rebound_points,
-        rsi_max_rebound_points,
-        rsi_sell_recovery_points,
-        rsi_swing_lookback,
-        rsi_stop_mode,
-        rsi_emergency_atr_multiplier,
-        rsi_max_holding_enabled,
-        rsi_max_holding_bars,
-        rsi_profit_only_exit,
-    )
-    breakout_prices, breakout_smas, breakout_atrs, breakout_trade_log, breakout_live, breakout_stats, breakout_labels = breakout_result
-    pullback_prices, pullback_smas, pullback_atrs, pullback_trade_log, pullback_live, pullback_stats, pullback_labels = pullback_result
-    trendline_prices, trendline_smas, trendline_atrs, trendline_trade_log, trendline_live, trendline_stats, trendline_labels = trendline_result
-    retest_prices, retest_smas, retest_atrs, retest_trade_log, retest_live, retest_stats, retest_labels = retest_result
-    rsi_scalp_prices, rsi_scalp_smas, rsi_scalp_atrs, rsi_scalp_trade_log, rsi_scalp_live, rsi_scalp_stats, rsi_scalp_labels = rsi_scalp_result
+    if all_strategy_comparison_requested:
+        suite_values = run_strategy_suite(
+            account, entry_w, exit_w, atr_mult, risk_dec, ma_w, pullback_w, momentum_w, seed,
+            strategy_market_data, risk_limits, (ticker, data_source, interval, period),
+            rsi_entry_filter_enabled, rsi_length, rsi_oversold, rsi_overbought,
+            rsi_decline_points, rsi_rebound_points, rsi_max_rebound_points,
+            rsi_sell_recovery_points, rsi_swing_lookback, rsi_stop_mode,
+            rsi_emergency_atr_multiplier, rsi_max_holding_enabled,
+            rsi_max_holding_bars, rsi_profit_only_exit,
+        )
+        strategy_results = {
+            label: dict(zip(
+                ("prices", "smas", "atrs", "trade_log", "live", "stats", "labels"),
+                result,
+            ))
+            for label, result in zip(
+                (
+                    "Breakout continuation", "Trend pullback continuation", "Trendline breakout",
+                    "Trendline retest continuation", "RSI mean-reversion scalp",
+                ),
+                suite_values,
+            )
+        }
+    else:
+        selected_result = run_selected_strategy_backtest(
+            float(account),
+            selected_backtest_settings,
+            strategy_market_data,
+            risk_limits,
+            (ticker, data_source, interval, period),
+        )
+        strategy_results = {strategy_label: selected_result}
     if load_progress_bar is not None:
-        load_progress_bar.progress(0.82, text="Backtests finished; preparing the trading screen")
+        load_progress_bar.progress(0.82, text="Backtest finished; preparing the trading screen")
 except ValueError as exc:
     if load_progress_status is not None:
         load_progress_status.update(
@@ -2953,53 +3078,6 @@ if load_progress_status is not None:
     )
     load_progress_bar.progress(0.88, text="Building decisions, tables, and charts (step 3 of 3)")
 
-strategy_results = {
-    "Breakout continuation": {
-        "prices": breakout_prices,
-        "smas": breakout_smas,
-        "atrs": breakout_atrs,
-        "trade_log": breakout_trade_log,
-        "live": breakout_live,
-        "stats": breakout_stats,
-        "labels": breakout_labels,
-    },
-    "Trend pullback continuation": {
-        "prices": pullback_prices,
-        "smas": pullback_smas,
-        "atrs": pullback_atrs,
-        "trade_log": pullback_trade_log,
-        "live": pullback_live,
-        "stats": pullback_stats,
-        "labels": pullback_labels,
-    },
-    "Trendline breakout": {
-        "prices": trendline_prices,
-        "smas": trendline_smas,
-        "atrs": trendline_atrs,
-        "trade_log": trendline_trade_log,
-        "live": trendline_live,
-        "stats": trendline_stats,
-        "labels": trendline_labels,
-    },
-    "Trendline retest continuation": {
-        "prices": retest_prices,
-        "smas": retest_smas,
-        "atrs": retest_atrs,
-        "trade_log": retest_trade_log,
-        "live": retest_live,
-        "stats": retest_stats,
-        "labels": retest_labels,
-    },
-    "RSI mean-reversion scalp": {
-        "prices": rsi_scalp_prices,
-        "smas": rsi_scalp_smas,
-        "atrs": rsi_scalp_atrs,
-        "trade_log": rsi_scalp_trade_log,
-        "live": rsi_scalp_live,
-        "stats": rsi_scalp_stats,
-        "labels": rsi_scalp_labels,
-    },
-}
 selected_strategy_result = strategy_results[strategy_label]
 prices = selected_strategy_result["prices"]
 smas = selected_strategy_result["smas"]
@@ -3007,6 +3085,18 @@ atrs = selected_strategy_result["atrs"]
 trade_log = selected_strategy_result["trade_log"]
 live = selected_strategy_result["live"]
 latest_market_price = optional_float(market_data.attrs.get("latest_price")) if market_data is not None else None
+if (
+    load_sidebar_ticker_history
+    and data_source in {"Ticker (Alpaca)", "Crypto (Alpaca)"}
+    and ticker
+):
+    try:
+        latest_config = AlpacaConfig.from_env()
+        latest_market_price = fetch_latest_alpaca_price(
+            ticker, asset_class, latest_config.api_key, latest_config.api_secret
+        ) or latest_market_price
+    except Exception:
+        pass
 if latest_market_price is not None:
     live["signal_bar_price"] = live.get("last_p")
     live["latest_price"] = latest_market_price
@@ -3015,12 +3105,8 @@ if latest_market_price is not None:
 stats = selected_strategy_result["stats"]
 labels = selected_strategy_result["labels"]
 comparison_rows = strategy_comparison_records({
-    "Breakout continuation": breakout_stats,
-    "Trend pullback continuation": pullback_stats,
-    "Trendline breakout": trendline_stats,
-    "Trendline retest continuation": retest_stats,
-    "RSI mean-reversion scalp": rsi_scalp_stats,
-})
+    label: result["stats"] for label, result in strategy_results.items()
+}) if all_strategy_comparison_requested else []
 for row in comparison_rows:
     row["Exit Style"] = (
         "RSI recovery + maximum hold + ATR protection"
@@ -3034,7 +3120,8 @@ if market_data is not None:
         float(account),
         allocated_capital=ticker_allocated_capital(float(account), risk_limits),
     )
-    comparison_rows.append({
+    if all_strategy_comparison_requested:
+        comparison_rows.append({
         "Strategy": "Buy and hold benchmark",
         "Allocated Return": f"{benchmark.return_percent:.2f}%",
         "Annualized Return": (
@@ -3048,43 +3135,22 @@ if market_data is not None:
         "Allocated Worst Drop": f"{benchmark.max_drawdown_percent:.2f}%",
         "Profit Factor": "Not applicable",
         "Exit Style": "Held from first adjusted close to last adjusted close",
-    })
+        })
 
-walk_forward_result = None
-walk_forward_error = None
-if run_walk_forward:
+period_performance_result = None
+period_performance_error = None
+active_page_for_compute = st.session_state.get("command_center_page_input", "Positions & Queue")
+if active_page_for_compute == "New Trade":
     try:
-        walk_forward_result = evaluate_walk_forward(
-            account=account,
-            entry_w=entry_w,
-            exit_w=exit_w,
-            atr_mult=atr_mult,
-            risk_pct_dec=risk_dec,
-            ma_w=ma_w,
-            seed=seed,
-            market_data=market_data,
-            train_fraction=train_fraction,
-            risk_limits=risk_limits,
-            strategy_type=strategy_type,
-            pullback_w=pullback_w,
-            momentum_w=momentum_w,
-            rsi_entry_filter_enabled=rsi_entry_filter_enabled,
-            rsi_length=rsi_length,
-            rsi_oversold=rsi_oversold,
-            rsi_overbought=rsi_overbought,
-            rsi_decline_points=rsi_decline_points,
-            rsi_rebound_points=rsi_rebound_points,
-            rsi_max_rebound_points=rsi_max_rebound_points,
-            rsi_sell_recovery_points=rsi_sell_recovery_points,
-            rsi_swing_lookback=rsi_swing_lookback,
-            rsi_stop_mode=rsi_stop_mode,
-            rsi_emergency_atr_multiplier=rsi_emergency_atr_multiplier,
-            rsi_max_holding_enabled=rsi_max_holding_enabled,
-            rsi_max_holding_bars=rsi_max_holding_bars,
-            rsi_profit_only_exit=rsi_profit_only_exit,
+        period_performance_result = run_selected_strategy_period_performance(
+            float(account),
+            selected_backtest_settings,
+            strategy_market_data,
+            risk_limits,
+            (ticker, data_source, interval, period),
         )
     except ValueError as exc:
-        walk_forward_error = str(exc)
+        period_performance_error = str(exc)
 
 current_strategy_config = StrategyConfig(
     name=strategy_label,
@@ -3226,7 +3292,11 @@ elif stop_worker_requested:
 automation_worker_status = automation_worker_status_store.read()
 
 
-def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
+def evaluate_exit_rule_details_from_settings(
+    settings: dict | None,
+    *,
+    refresh_history: bool = False,
+) -> dict:
     if not settings:
         return {"ready": False, "reason": "No saved exit settings for this position; auto exit is paused.", "trigger_price": None}
     symbol = str(settings.get("symbol", "")).strip().upper()
@@ -3234,7 +3304,11 @@ def evaluate_exit_rule_details_from_settings(settings: dict | None) -> dict:
         (position for position in alpaca_positions if str(position.get("Symbol", "")).strip().upper() == symbol),
         {"Symbol": symbol, "Average Entry": settings.get("entry_reference_price")},
     )
-    details = evaluate_saved_exit_settings(settings, matching_position, fetch_price_data_for_source)
+    details = (
+        evaluate_saved_exit_settings(settings, matching_position, fetch_price_data_for_source)
+        if refresh_history
+        else exit_details_from_snapshot(settings, matching_position)
+    )
     details["atr_stop_price"] = details.get("original_stop_price")
     return details
 
@@ -3277,7 +3351,7 @@ def persist_current_position_plan(
 
 
 optimizer_market_fingerprint = "synthetic-default"
-OPTIMIZER_SEARCH_STATE_VERSION = 4
+OPTIMIZER_SEARCH_STATE_VERSION = 5
 if data_source == "Synthetic" and market_data is not None:
     fingerprint_columns = [
         column for column in ("Open", "High", "Low", "Close", "Volume")
@@ -3293,6 +3367,7 @@ optimizer_signature = strategy_input_search_identity(
     risk_per_trade_pct=float(current_strategy_settings["risk_per_trade_pct"]),
     risk_limits=asdict(risk_limits),
     settings_per_strategy=max_parameter_candidates,
+    search_interval=strategy_search_interval,
     display_interval=interval,
     display_history=period,
     market_fingerprint=optimizer_market_fingerprint,
@@ -3314,50 +3389,50 @@ if run_strategy_input_search:
                     risk_limits=risk_limits,
                     train_fraction=0.55,
                     max_candidates_per_strategy=max_parameter_candidates,
+                    max_local_candidates_per_strategy=16,
                 )
             else:
                 interval_histories = strategy_search_interval_histories(data_source)
                 if not interval_histories:
                     raise ValueError("The strategy input search requires Alpaca or yfinance price data.")
+                search_history = interval_histories.get(strategy_search_interval)
+                if not search_history:
+                    raise ValueError(f"{strategy_search_interval} price history is not available for this source.")
                 interval_market_data = {}
-                strategy_test_count = len(OPTIMIZER_STRATEGY_TYPES) * len(interval_histories)
-                total_progress_steps = len(interval_histories) + strategy_test_count
+                strategy_test_count = len(OPTIMIZER_STRATEGY_TYPES)
+                total_progress_steps = 1 + strategy_test_count
                 progress_bar = st.progress(0.0)
                 progress_text = st.empty()
-                for download_number, (search_interval, search_history) in enumerate(
-                    interval_histories.items(), start=1
-                ):
-                    progress_text.caption(
-                        f"Downloading {search_interval} prices ({search_history}) "
-                        f"({download_number} of {len(interval_histories)} datasets)"
+                progress_text.caption(
+                    f"Downloading {strategy_search_interval} prices ({search_history})"
+                )
+                try:
+                    search_data = fetch_price_data_for_source(
+                        ticker,
+                        search_history,
+                        strategy_search_interval,
+                        data_source,
                     )
-                    try:
-                        search_data = fetch_price_data_for_source(
-                            ticker,
-                            search_history,
-                            search_interval,
-                            data_source,
-                        )
-                        interval_market_data[search_interval] = (search_history, search_data)
-                    except Exception as exc:
-                        interval_errors.append(f"{search_interval} / {search_history}: {exc}")
-                    progress_bar.progress(download_number / max(1, total_progress_steps))
+                    interval_market_data[strategy_search_interval] = (search_history, search_data)
+                except Exception as exc:
+                    interval_errors.append(f"{strategy_search_interval} / {search_history}: {exc}")
+                progress_bar.progress(1 / max(1, total_progress_steps))
                 if interval_errors:
                     raise ValueError(
-                        "The strategy input search did not run because all three fixed datasets are required. "
+                        "The strategy input search could not load the selected dataset. "
                         + "; ".join(interval_errors)
                     )
 
                 def update_optimizer_progress(completed, total, label):
                     progress_bar.progress(
-                        (len(interval_histories) + completed) / max(1, total_progress_steps)
+                        (1 + completed) / max(1, total_progress_steps)
                     )
                     progress_text.caption(f"{label} ({completed} of {total} strategy and interval tests complete)")
 
                 family_result = optimize_strategy_families(
                     market_data_by_interval=interval_market_data,
                     strategy_intervals={
-                        strategy: tuple(interval_histories)
+                        strategy: (strategy_search_interval,)
                         for strategy in OPTIMIZER_STRATEGY_TYPES.values()
                     },
                     current_settings=current_strategy_settings,
@@ -3365,6 +3440,7 @@ if run_strategy_input_search:
                     risk_limits=risk_limits,
                     train_fraction=0.55,
                     max_candidates_per_strategy=max_parameter_candidates,
+                    max_local_candidates_per_strategy=16,
                     progress_callback=update_optimizer_progress,
                 )
                 progress_bar.empty()
@@ -3731,6 +3807,7 @@ research_agent_report = build_research_agent_report(
     final_read=final_answer,
     decision_detail=final_detail,
     next_action=new_trade_next_action,
+    all_strategies_compared=all_strategy_comparison_requested,
 )
 research_snapshot_key = hashlib.sha256(
     json.dumps(
@@ -4070,8 +4147,32 @@ def render_buy_watchlist_manager() -> None:
         )
     else:
         st.caption("No queued setups. Research a ticker in New Trade, then click Add or Update Buy Setup.")
-    st.markdown("#### Queue automation status")
-    st.dataframe(pd.DataFrame(daily_automation_readiness_records("Queued setups")), width="stretch", hide_index=True)
+    with st.expander("Queue automation status", expanded=False):
+        st.dataframe(
+            pd.DataFrame(daily_automation_readiness_records("Queued setups")),
+            width="stretch",
+            hide_index=True,
+        )
+
+
+def render_recent_automatic_exits() -> None:
+    recent_auto_exits = automatic_exit_records(
+        current_evidence_records,
+        st.session_state["tracked_alpaca_orders"],
+        limit=5,
+    )
+    with st.expander(
+        "Recent automatic exits",
+        expanded=False,
+    ):
+        st.caption(
+            "Shows why the app or Background Worker recently sent each automatic paper sell. Decision Price is the price seen when "
+            "the decision was made. Sell Trigger is the saved level it compared against. Trigger Rule identifies the exact exit rule."
+        )
+        if recent_auto_exits:
+            st.dataframe(pd.DataFrame(recent_auto_exits), width="stretch", hide_index=True)
+        else:
+            st.caption("No recent automatic exits were found.")
 
 
 def render_open_positions_panel() -> None:
@@ -4095,26 +4196,11 @@ def render_open_positions_panel() -> None:
     metric_card(position_summary_cols[2], "Auto Exit On", auto_exit_on_count, "Position-level setting")
     metric_card(position_summary_cols[3], "Waiting Orders", count_waiting_alpaca_orders(alpaca_orders), "Alpaca paper")
     st.info(open_positions_next_step(position_settings_by_symbol))
-    st.markdown("#### Open position automation status")
-    st.dataframe(pd.DataFrame(daily_automation_readiness_records("Open positions")), width="stretch", hide_index=True)
-    render_buy_watchlist_manager()
-    recent_auto_exits = automatic_exit_records(
-        current_evidence_records,
-        st.session_state["tracked_alpaca_orders"],
-        limit=5,
-    )
-    if recent_auto_exits:
-        st.markdown(
-            "#### Recent automatic exits",
-            help=(
-                "Shows why the app or Background Worker recently sent each automatic paper sell. Decision Price is the price seen when "
-                "the decision was made. Sell Trigger is the saved level it compared against. Trigger Rule identifies the exact exit rule."
-            ),
-        )
-        st.dataframe(pd.DataFrame(recent_auto_exits), width="stretch", hide_index=True)
 
     if not alpaca_positions:
-        st.info("No Alpaca paper positions are open. Saved queued setups can still be monitored and managed above.")
+        st.info("No Alpaca paper positions are open.")
+        render_recent_automatic_exits()
+        render_buy_watchlist_manager()
         return
 
     st.markdown("#### Position manager")
@@ -4160,6 +4246,40 @@ def render_open_positions_panel() -> None:
         "strategy_label": "ATR protection only",
         "entry_source": "manual Alpaca position",
     }
+    refresh_position_calculation = st.button(
+        "Refresh selected exit calculation",
+        key=f"refresh_position_calculation_{selected_position_symbol}",
+        disabled=not has_saved_exit_plan,
+        help=(
+            "Downloads the saved interval's completed price bars and recalculates this one position now. "
+            "Ordinary page loads use the latest calculation saved by the Background Worker."
+        ),
+    )
+    if refresh_position_calculation:
+        try:
+            refreshed_details = evaluate_exit_rule_details_from_settings(
+                selected_exit_settings,
+                refresh_history=True,
+            )
+            refreshed_exit_settings = {
+                **selected_exit_settings,
+                "last_exit_snapshot": exit_snapshot_from_details(refreshed_details),
+                "last_exit_checked_at": pd.Timestamp.now(tz="America/Los_Angeles").isoformat(),
+            }
+            if refreshed_details.get("highest_high_since_entry") is not None:
+                refreshed_exit_settings["highest_high_since_entry"] = refreshed_details.get("highest_high_since_entry")
+            if refreshed_details.get("trigger_price") is not None:
+                refreshed_exit_settings["last_exit_trigger_price"] = refreshed_details.get("trigger_price")
+            if refreshed_details.get("trigger_source"):
+                refreshed_exit_settings["last_exit_trigger_source"] = refreshed_details.get("trigger_source")
+            st.session_state["tracked_alpaca_orders"] = persist_current_position_plan(
+                selected_position,
+                refreshed_exit_settings,
+                selected_entry_settings,
+            )
+            st.rerun()
+        except Exception as exc:
+            st.error(f"Could not refresh {selected_position_symbol} exit calculation: {exc}")
     selected_exit_details = evaluate_exit_rule_details_from_settings(selected_exit_settings)
     selected_exit_ready = bool(selected_exit_details["ready"])
     selected_exit_reason = str(selected_exit_details["reason"])
@@ -4200,18 +4320,18 @@ def render_open_positions_panel() -> None:
         st.info(f"Auto exit: sell {selected_position_symbol} if price is at or below ${float(selected_exit_trigger_price):,.2f}.")
     if has_saved_exit_plan and selected_exit_ready:
         st.warning(selected_exit_reason)
-    st.markdown("#### Position plan")
-    st.dataframe(
-        pd.DataFrame(
-            position_management_summary_records(
-                selected_position,
-                selected_exit_settings,
-                selected_exit_details,
-            )
-        ),
-        width="stretch",
-        hide_index=True,
-    )
+    with st.expander("Position plan", expanded=False):
+        st.dataframe(
+            pd.DataFrame(
+                position_management_summary_records(
+                    selected_position,
+                    selected_exit_settings,
+                    selected_exit_details,
+                )
+            ),
+            width="stretch",
+            hide_index=True,
+        )
     if has_saved_exit_plan and exit_mode_for_settings(selected_exit_settings) == "strategy_and_atr":
         buy_snapshot = selected_exit_details.get("buy_level_snapshot") or {}
         with st.expander("Strategy BUY requirements attached to this position", expanded=False):
@@ -4222,52 +4342,11 @@ def render_open_positions_panel() -> None:
     elif has_saved_exit_plan:
         st.caption("This position uses ATR protection only. No strategy BUY or sell line is attached.")
     if has_saved_exit_plan:
-      with st.expander("Quick exit changes", expanded=False):
-        quick_cols = st.columns(3)
-        if quick_cols[0].button("Tighten ATR Stop", key=f"tighten_exit_{selected_position_symbol}"):
-            quick_settings = adjust_initial_stop_settings(
-                selected_exit_settings,
-                max(0.5, float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))) - 0.25),
-            )
-            quick_settings["symbol"] = selected_position_symbol
-            quick_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-            updated_orders = persist_current_position_plan(selected_position, quick_settings, selected_entry_settings)
-            st.session_state["tracked_alpaca_orders"] = updated_orders
-            st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_tightened", message="ATR stop tightened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-            st.rerun()
-        if quick_cols[1].button("Loosen ATR Stop", key=f"loosen_exit_{selected_position_symbol}"):
-            quick_settings = adjust_initial_stop_settings(
-                selected_exit_settings,
-                min(5.0, float(selected_exit_settings.get("entry_stop_atr_multiplier", selected_exit_settings.get("atr_stop_multiplier", atr_mult))) + 0.25),
-            )
-            quick_settings["symbol"] = selected_position_symbol
-            quick_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-            updated_orders = persist_current_position_plan(selected_position, quick_settings, selected_entry_settings)
-            st.session_state["tracked_alpaca_orders"] = updated_orders
-            st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_loosened", message="ATR stop loosened for an Alpaca paper position.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-            st.rerun()
-        if quick_cols[2].button("Use Current Sidebar Exit Settings", key=f"use_current_exit_{selected_position_symbol}"):
-            quick_settings = replace_exit_rules(selected_exit_settings, current_exit_settings)
-            quick_settings.update({
-                "symbol": selected_position_symbol,
-                "auto_exit_enabled": bool(selected_exit_settings.get("auto_exit_enabled", False)),
-            })
-            quick_settings = adjust_initial_stop_settings(
-                quick_settings,
-                float(current_exit_settings.get("entry_stop_atr_multiplier", current_exit_settings.get("atr_stop_multiplier", atr_mult))),
-            )
-            quick_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-            quick_preview = evaluate_exit_rule_details_from_settings(quick_settings)
-            if quick_preview.get("ready") and quick_preview.get("trigger_source") == "strategy exit":
-                st.error(
-                    "The current sidebar strategy would sell this position on the next worker check because price is already at or below "
-                    f"its strategy exit at {money_or_missing(quick_preview.get('strategy_exit_price'))}. Edit the exit settings instead."
-                )
-            else:
-                updated_orders = persist_current_position_plan(selected_position, quick_settings, selected_entry_settings)
-                st.session_state["tracked_alpaca_orders"] = updated_orders
-                st.session_state["session_audit_events"].append(AuditEvent(event_type="position_exit_settings_replaced", message="Exit settings replaced with current sidebar settings.", payload={"symbol": selected_position_symbol, "exit_settings": quick_settings, "broker_writes_submitted": 0}))
-                st.rerun()
+        snapshot_checked_at = selected_exit_details.get("snapshot_checked_at")
+        st.caption(
+            f"Exit calculation last updated: {time_or_missing(snapshot_checked_at)}. "
+            "The Background Worker refreshes this automatically while it is running."
+        )
     if show_portfolio_evidence and has_saved_exit_plan:
         with st.expander("Saved exit rule details *", expanded=False):
             st.dataframe(
@@ -4289,8 +4368,7 @@ def render_open_positions_panel() -> None:
                 hide_index=True,
             )
 
-    with st.container():
-        st.markdown("#### Edit exit settings")
+    with st.expander("Edit exit settings", expanded=False):
         if not has_saved_exit_plan:
             st.caption(
                 "These are draft settings only. Nothing is saved and the app will not manage this position until you click Save Exit Settings For This Position."
@@ -4585,7 +4663,20 @@ def render_open_positions_panel() -> None:
                 )
             edited_exit_settings = adjust_initial_stop_settings(edited_exit_template, edited_atr_mult)
             edited_exit_settings["plan_user_updated_at"] = pd.Timestamp.now(tz="America/Los_Angeles").isoformat()
-            edited_preview = evaluate_exit_rule_details_from_settings(edited_exit_settings)
+            edited_preview = evaluate_exit_rule_details_from_settings(
+                edited_exit_settings,
+                refresh_history=True,
+            )
+            edited_exit_settings["last_exit_snapshot"] = exit_snapshot_from_details(edited_preview)
+            edited_exit_settings["last_exit_checked_at"] = pd.Timestamp.now(
+                tz="America/Los_Angeles"
+            ).isoformat()
+            if edited_preview.get("highest_high_since_entry") is not None:
+                edited_exit_settings["highest_high_since_entry"] = edited_preview.get("highest_high_since_entry")
+            if edited_preview.get("trigger_price") is not None:
+                edited_exit_settings["last_exit_trigger_price"] = edited_preview.get("trigger_price")
+            if edited_preview.get("trigger_source"):
+                edited_exit_settings["last_exit_trigger_source"] = edited_preview.get("trigger_source")
             immediate_strategy_exit = bool(
                 edited_exit_mode == "strategy_and_atr"
                 and edited_preview.get("ready")
@@ -4643,6 +4734,8 @@ def render_open_positions_panel() -> None:
                     )
         else:
             st.caption("No saved entry settings found for this position.")
+    render_recent_automatic_exits()
+    render_buy_watchlist_manager()
 
 
 def render_manual_order_form() -> None:
@@ -4704,12 +4797,12 @@ def render_manual_order_form() -> None:
                 key=f"manual_dollars_{manual_key}",
             )
         else:
-            default_quantity = max(0.0001 if asset_class == "crypto" else 1.0, 1_000.0 / reference_price) if reference_price else 1.0
+            default_quantity = max(0.00000001 if asset_class == "crypto" else 1.0, 1_000.0 / reference_price) if reference_price else 1.0
             requested_quantity = size_cols[0].number_input(
                 "Quantity",
-                min_value=0.0001 if asset_class == "crypto" else 1.0,
+                min_value=0.00000001 if asset_class == "crypto" else 1.0,
                 value=float(default_quantity if asset_class == "crypto" else max(1, int(default_quantity))),
-                step=0.0001 if asset_class == "crypto" else 1.0,
+                step=0.00000001 if asset_class == "crypto" else 1.0,
                 format="%.8f" if asset_class == "crypto" else "%.0f",
                 key=f"manual_quantity_{manual_key}",
             )
@@ -5029,36 +5122,32 @@ elif command_center_view == "Ideas":
         with st.expander("Scanner errors *", expanded=False):
             st.dataframe(pd.DataFrame(saved_scan_errors), width="stretch", hide_index=True)
 elif command_center_view == "New Trade":
-    sub_section("New trade", "Research the ticker, review the setup, and decide whether to send a paper buy.")
-    desk_cols = st.columns(4)
-    metric_card(desk_cols[0], "Final Answer", final_answer, final_detail)
-    metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
-    metric_card(desk_cols[2], "Strategy", strategy_label, "Selected in the sidebar")
-    metric_card(desk_cols[3], "Account P&L today", f"${paper_order_session_pnl:,.2f}", paper_order_account_source, "pos" if paper_order_session_pnl >= 0 else "neg")
-    st.info(f"Next action: {new_trade_next_action}")
-    st.markdown(
-        "#### Research read",
-        help=(
-            "Summarizes the selected ticker's current setup. Selected strategy is the exact strategy chosen in the sidebar and used for "
-            "the TRADE or WAIT decision. Best current fit across all strategies separately compares Breakout continuation, "
-            "Trend pullback continuation, Trendline breakout, Trendline retest continuation, and RSI mean-reversion scalp using today's BUY-rule progress, "
-            "the backtest from the current sidebar settings, trade count, return, win rate, profit factor, and worst drop. "
-            "It answers which of those five exact strategies fits the ticker now; it does not search for better settings."
-        ),
-    )
-    st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
-    st.markdown(
-        "#### Current BUY requirements",
-        help="Shows each required rule, its current value, the exact threshold when one exists, and the remaining distance. Pattern and RSI rules are shown honestly when they cannot be reduced to one price.",
-    )
-    st.dataframe(
-        pd.DataFrame(buy_requirement_records(live, interval=interval, latest_price=optional_float(live.get("last_p")))),
-        width="stretch",
-        hide_index=True,
-    )
-    render_current_setup_watchlist_action()
-    with st.expander("Compare all five current strategy fits", expanded=False):
-        st.dataframe(pd.DataFrame(strategy_fit_records(research_agent_report)), width="stretch", hide_index=True)
+    with st.expander(f"New Trade Research - {ticker}", expanded=True):
+        desk_cols = st.columns(4)
+        metric_card(desk_cols[0], "Final Answer", final_answer, final_detail)
+        metric_card(desk_cols[1], "Reference Price", f"${float(live['last_p']):,.2f}", ticker)
+        metric_card(desk_cols[2], "Strategy", strategy_label, "Selected in the sidebar")
+        metric_card(desk_cols[3], "Account P&L today", f"${paper_order_session_pnl:,.2f}", paper_order_account_source, "pos" if paper_order_session_pnl >= 0 else "neg")
+        st.info(f"Next action: {new_trade_next_action}")
+        st.markdown(
+            "#### Research read",
+            help=(
+                "Summarizes the selected ticker's current setup. Selected strategy is the exact strategy chosen in the sidebar and used for "
+                "the TRADE or WAIT decision. The normal refresh does not calculate or rank the other strategies. Use Compare All Strategies "
+                "to compare every strategy with the current sidebar inputs, or Strategy Input Search to search for different inputs."
+            ),
+        )
+        st.dataframe(pd.DataFrame(research_agent_records(research_agent_report)), width="stretch", hide_index=True)
+        st.markdown(
+            "#### Current BUY requirements",
+            help="Shows each required rule, its current value, the exact threshold when one exists, and the remaining distance. Pattern and RSI rules are shown honestly when they cannot be reduced to one price.",
+        )
+        st.dataframe(
+            pd.DataFrame(buy_requirement_records(live, interval=interval, latest_price=optional_float(live.get("last_p")))),
+            width="stretch",
+            hide_index=True,
+        )
+        render_current_setup_watchlist_action()
     if show_portfolio_evidence:
         with st.expander("Detailed research records *", expanded=False):
             st.markdown("#### Research loop *")
@@ -5133,7 +5222,7 @@ elif command_center_view == "Alpaca":
     if show_portfolio_evidence:
         with st.expander("Safety summary *", expanded=False):
             st.markdown("- Alpaca is the target broker. Paper remains the default workflow.")
-            st.markdown("- Paper orders require paper mode, passed risk checks, a connected paper account, and the paper account switch.")
+            st.markdown("- Paper orders require Paper trading mode, passed risk checks, and a connected Alpaca paper account.")
             st.markdown("- Live orders require live mode, live Alpaca configuration, the live sidebar switch, passed risk checks, and the Kill Switch off.")
             st.markdown("- The app cannot let the agent change risk rules, credentials, order code, or the Kill Switch.")
             st.markdown("- Automated live submission stays off until manual live order testing is complete.")
@@ -5348,24 +5437,56 @@ if command_center_view == "New Trade":
     metric_card(c6, "Allocated worst drop", f"{stats.get('allocated_max_drawdown_pct', stats['max_drawdown_pct'])}%", "Largest drop versus ticker allocation")
     metric_card(c7, "Win/loss dollars", f"{stats['profit_factor']}x", "Total wins vs total losses")
     metric_card(c8, "Time in trade", f"{stats['exposure_pct']}%", "Share of bars spent in a trade")
-    with st.expander("Backtest assumptions and exit model", expanded=False):
-        fee_assumption = (
-            "Crypto results use Alpaca's conservative Tier 1 taker fee of 0.25% on buys and sells. "
-            f"Actual maker/taker rates depend on 30-day crypto volume; see {ALPACA_CRYPTO_FEE_SCHEDULE_URL}. "
-            if asset_class == "crypto"
-            else f"Results include estimated Alpaca U.S. equity regulatory fees using the fee schedule effective "
-            f"{ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE} and a 0% direct-account commission assumption. "
+
+    st.markdown(
+        "#### Compare strategies using current inputs",
+        help=(
+            "Runs every strategy on this ticker using the exact interval, history, risk limits, and numeric inputs currently "
+            "shown in the sidebar. This table does not search for better settings."
+        ),
+    )
+    if all_strategy_comparison_requested:
+        st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
+        st.caption(
+            "This comparison uses the current sidebar inputs. It is separate from Strategy Input Search, which searches many input combinations."
         )
-        st.markdown(
-            "Historical signals use completed bars. Entries use the signal-bar close. "
-            "Protective stops fill at the stop price, or at the bar open after a gap below the stop. "
-            + fee_assumption
-            + "Paper trading may not deduct the same fees, so they are included as live-equivalent costs. "
-            "Spread, slippage, market impact, taxes, and idle-cash interest are not included."
+        if st.button("Clear Strategy Comparison", key="clear_all_strategy_comparison"):
+            st.session_state.pop("all_strategy_comparison_signature", None)
+            st.rerun()
+    else:
+        st.caption("Only the strategy selected in the sidebar was calculated on this refresh.")
+        if st.button("Compare All Strategies", key="run_all_strategy_comparison"):
+            st.session_state["all_strategy_comparison_signature"] = strategy_comparison_signature
+            st.rerun()
+
+    st.markdown(
+        "#### Performance by time period",
+        help=(
+            "Always tests the exact strategy and inputs currently shown in the sidebar. The same settings are run separately "
+            "on the older 55%, newer 25%, and latest 20% of the loaded price history. These results do not feed into or change "
+            "Strategy Input Search."
+        ),
+    )
+    if period_performance_result is not None:
+        st.dataframe(
+            pd.DataFrame(period_performance_records(period_performance_result)),
+            width="stretch",
+            hide_index=True,
         )
-        st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
-    
-    with st.expander("Optional strategy tests" + (" *" if show_portfolio_evidence else ""), expanded=False):
+        st.caption(
+            "This is a historical consistency check, not an independent prediction. Earlier bars may warm up indicators, "
+            "but each section starts with no open strategy position and counts only trades completed inside that section."
+        )
+    elif period_performance_error:
+        st.caption(period_performance_error)
+
+    with st.expander(
+        "Strategy Input Search Results" + (" *" if show_portfolio_evidence else ""),
+        expanded=optimizer_search_state is not None,
+    ):
+        st.caption(
+            "Run Strategy Input Search from the sidebar to compare broad settings. Completed results stay open so the recommendation is easy to review."
+        )
         if strategy_type == "rsi_scalp":
             st.markdown(
                 "#### Compare RSI stop protection",
@@ -5414,55 +5535,7 @@ if command_center_view == "New Trade":
                 )
 
         st.markdown(
-            "#### Strategy comparison",
-            help=(
-                "Runs all five strategies on the same ticker, interval, history, account size, risk limits, and current sidebar settings. "
-                "Compare return, completed trades, win rate, worst drop, and profit factor. This table does not search for better settings "
-                "and does not change the selected strategy."
-            ),
-        )
-        st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
-        st.caption(
-            "This compares all five strategies and buy-and-hold using the same ticker allocation set by Max symbol concentration. "
-            "Account return remains visible separately. Buy and hold uses adjusted closing prices; taxes, idle-cash interest, "
-            "spread, slippage, and market impact are not included. Strategy results are net of estimated Alpaca trading fees; "
-            "buy and hold includes one estimated buy and one estimated sell."
-        )
-        
-        st.markdown("#### Test on newer price data")
-        if walk_forward_result is None:
-            if walk_forward_error:
-                st.warning(walk_forward_error)
-            else:
-                st.caption("Testing on newer data is turned off.")
-        else:
-            verdict_color = {
-                "Pass": "#3B6D11",
-                "Inconclusive": "#8A6D1D",
-                "Needs review": "#A32D2D",
-            }.get(walk_forward_result.verdict, "inherit")
-            st.markdown(
-                f"**Result:** "
-                f"<span style='color:{verdict_color};font-weight:600'>{walk_forward_result.verdict}</span>",
-                unsafe_allow_html=True,
-            )
-            if show_portfolio_evidence:
-                st.dataframe(
-                    pd.DataFrame(walk_forward_records(walk_forward_result)),
-                    width="stretch",
-                    hide_index=True,
-                )
-            with st.expander("What this test used", expanded=False):
-                st.markdown(
-                    f"Older bars used first: **{walk_forward_result.train_bars}**. "
-                    f"Newer bars used for the final test: **{walk_forward_result.oos_bars}**. "
-                    f"Extra bars needed for indicators: **{walk_forward_result.warmup_bars}**."
-                )
-                for reason in walk_forward_result.reasons:
-                    st.markdown(f"- {reason}")
-        
-        st.markdown(
-            "#### Strategy input search result",
+            "#### Search recommendation",
             help=(
                 "Searches broad input ranges for the four trend strategies, then deliberately tests neighboring numeric settings. "
                 "The older 55% of prices finds useful regions, the newer 25% chooses among those regions, and the latest 20% "
@@ -5680,6 +5753,19 @@ if command_center_view == "New Trade":
         if strategy_optimizer_family_result is not None and not parameter_loop_error:
             if optimizer_result_stale:
                 st.warning("Inputs changed since this search finished. Run Strategy Input Search again before using a result.")
+            st.info(strategy_optimizer_family_result.summary)
+            search_data_rows = strategy_search_data_records(strategy_optimizer_family_result)
+            if search_data_rows:
+                tested = search_data_rows[0]
+                st.caption(
+                    f"Price data tested: {tested.get('Interval')} / {tested.get('Requested History')} / "
+                    f"{tested.get('Completed Bars')} completed bars / {tested.get('Actual Price Dates')}."
+                )
+            st.dataframe(
+                pd.DataFrame(strategy_search_summary_records(strategy_optimizer_family_result)),
+                width="stretch",
+                hide_index=True,
+            )
             current_search_evidence = build_strategy_search_evidence(ticker, strategy_optimizer_family_result)
             strategy_recommendation_run = st.session_state.get("strategy_recommendation_loop")
             if not recommendation_run_matches(
@@ -5696,31 +5782,36 @@ if command_center_view == "New Trade":
                 )
                 st.session_state["strategy_recommendation_loop"] = strategy_recommendation_run
             st.markdown(
-                "#### Strategy search decision",
+                "### Agent assessment",
                 help=(
-                    "The built-in decision summarizes the strongest strategy-search result, recent consistency, nearby-input "
-                    "stability, and the latest historical price section. An optional agent review uses the same fixed evidence in three "
-                    "bounded steps: an analyst drafts a read, a skeptical reviewer challenges it, and an editor revises it. "
-                    "The agent cannot change calculations, enable automation, or send an order."
+                    "Reviews up to two high-ranked input regions from every strategy in this search. The analyst compares them, "
+                    "a skeptical reviewer challenges the reasoning, and an editor writes the final assessment in plain language. "
+                    "The model receives deterministic historical facts only. It cannot change calculations, enable automation, or send an order."
                 ),
+            )
+            st.caption(
+                "The built-in assessment is always available. Choose Ollama or Gemini and review the search when you want a model to compare the candidate regions and explain the tradeoffs."
             )
             decision_rows = recommendation_summary_records(strategy_recommendation_run)
             st.dataframe(pd.DataFrame(decision_rows), width="stretch", hide_index=True)
-            agent_cols = st.columns([1, 1, 3])
+            agent_cols = st.columns([1, 1.3, 3])
             research_writer = agent_cols[0].selectbox(
-                "Optional agent review",
+                "Review method",
                 ["Built-in", "Ollama", "Gemini"],
                 key="strategy_search_research_writer",
                 help=(
-                    "Built-in uses only deterministic rules. Ollama runs a local model. Gemini uses GEMINI_API_KEY. "
-                    "Both model options review the same evidence and may only keep or lower the built-in action."
+                    "Built-in applies fixed rules. Ollama runs the configured local model. Gemini uses the configured Gemini model. "
+                    "Both model options compare the same neutral candidate evidence and may choose a different supplied candidate or reject the search."
                 ),
             )
             if agent_cols[1].button(
-                "Run Agent Review",
+                "Review Search Results",
                 disabled=optimizer_result_stale or research_writer == "Built-in",
                 key="run_strategy_agent_review",
-                help="Runs one analyst draft, one skeptical review, and one final revision. It does not contact Alpaca.",
+                help=(
+                    "Runs an analyst comparison, a skeptical review, and a final plain-language assessment. "
+                    "The review is research only and never contacts Alpaca."
+                ),
             ):
                 selected_provider = research_writer.lower()
                 config = LLMResearchConfig.from_env(selected_provider)
@@ -5746,61 +5837,42 @@ if command_center_view == "New Trade":
                     + strategy_recommendation_run.recommendation.error
                 )
             best_search_result = strategy_optimizer_family_result.best_strategy
-            with st.expander("How price behavior affected this result", expanded=False):
-                st.caption(
-                    "These labels describe this ticker's price path, not the economic business cycle. The app checks whether "
-                    "each period is backtested independently using the same saved settings. Strategy and buy-and-hold returns "
-                    "therefore cover the same dates. This shows whether the result repeated across different price behavior or "
-                    "relied on one especially favorable period."
-                )
-                st.dataframe(
-                    pd.DataFrame(optimizer_regime_dependency_records(best_search_result.best_result)),
-                    width="stretch",
-                    hide_index=True,
-                )
-                st.dataframe(
-                    pd.DataFrame(optimizer_strategy_behavior_records(best_search_result.best_result)),
-                    width="stretch",
-                    hide_index=True,
-                )
-                if show_portfolio_evidence:
-                    st.markdown("##### Price behavior calculations *")
+            if show_portfolio_evidence:
+                with st.expander("Agent evidence and price behavior *", expanded=False):
+                    st.caption(
+                        "These are the deterministic facts supplied to the model. Candidate IDs are audit references only and are hidden from the daily assessment."
+                    )
                     st.dataframe(
-                        pd.DataFrame(optimizer_price_behavior_records(best_search_result.best_result)),
+                        pd.DataFrame(
+                            [
+                                {"Evidence": evidence_id, "Fact": fact}
+                                for evidence_id, fact in current_search_evidence.facts.items()
+                            ]
+                        ),
                         width="stretch",
                         hide_index=True,
                     )
-                    st.markdown("##### Agent review record *")
                     st.dataframe(
-                        pd.DataFrame(recommendation_audit_records(strategy_recommendation_run)),
+                        pd.DataFrame(optimizer_regime_dependency_records(best_search_result.best_result)),
                         width="stretch",
                         hide_index=True,
                     )
-            st.info(strategy_optimizer_family_result.summary)
-            fixed_search_windows = strategy_search_interval_histories(data_source)
-            fixed_search_description = ", ".join(
-                f"{search_interval} bars for {search_history}"
-                for search_interval, search_history in fixed_search_windows.items()
-            )
-            st.markdown(
-                "##### Price data tested",
-                help=(
-                    f"This search independently loads {fixed_search_description}. The Interval and History period "
-                    "shown in the sidebar are ignored. Actual Price Dates show what the provider returned."
-                    if fixed_search_windows else
-                    "A synthetic search uses the single synthetic dataset selected in the sidebar."
-                ),
-            )
-            st.dataframe(
-                pd.DataFrame(strategy_search_data_records(strategy_optimizer_family_result)),
-                width="stretch",
-                hide_index=True,
-            )
-            st.dataframe(
-                pd.DataFrame(strategy_search_ranking_records(strategy_optimizer_family_result)),
-                width="stretch",
-                hide_index=True,
-            )
+                    if st.checkbox("Load detailed price-behavior records *", value=False):
+                        st.dataframe(
+                            pd.DataFrame(optimizer_strategy_behavior_records(best_search_result.best_result)),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                        st.dataframe(
+                            pd.DataFrame(optimizer_price_behavior_records(best_search_result.best_result)),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                        st.dataframe(
+                            pd.DataFrame(recommendation_audit_records(strategy_recommendation_run)),
+                            width="stretch",
+                            hide_index=True,
+                        )
             strategy_result_by_label = {
                 result.strategy_label: result
                 for result in strategy_optimizer_family_result.strategy_results
@@ -5839,16 +5911,6 @@ if command_center_view == "New Trade":
                 st.session_state["optimizer_apply_interval"] = selected_strategy_result.best_interval
                 st.session_state["optimizer_apply_history"] = selected_strategy_result.best_history
                 st.rerun()
-            with st.expander("Compare this strategy's intervals", expanded=False):
-                st.dataframe(
-                    pd.DataFrame(strategy_search_interval_records(selected_strategy_result)),
-                    width="stretch",
-                    hide_index=True,
-                )
-                st.caption(
-                    "The selected interval had the strongest newer-price result among this strategy's tested intervals. "
-                    "The latest 20% did not choose or replace it."
-                )
             with st.expander("Test these exact settings on other tickers", expanded=False):
                 if data_source == "Synthetic":
                     st.caption("Choose Ticker (Alpaca) or Ticker (yfinance) first. This check needs real price history.")
@@ -5916,32 +5978,58 @@ if command_center_view == "New Trade":
                             st.warning(problem)
             if show_portfolio_evidence and selected_candidate is not None:
                 with st.expander("Detailed search records *", expanded=False):
-                    st.markdown("##### Trading-cost checks")
-                    st.dataframe(
-                        pd.DataFrame(optimizer_stress_records(selected_recommendation)),
-                        width="stretch",
-                        hide_index=True,
-                    )
-                    st.markdown("##### Results in different market conditions")
-                    st.dataframe(
-                        pd.DataFrame(optimizer_regime_records(selected_recommendation)),
-                        width="stretch",
-                        hide_index=True,
-                    )
-                    st.markdown("##### Tested settings")
-                    st.dataframe(
-                        pd.DataFrame(optimizer_candidate_records(selected_recommendation.candidates, limit=24)),
-                        width="stretch",
-                        hide_index=True,
-                    )
+                    if st.checkbox("Load detailed search tables", value=False):
+                        st.markdown("##### Trading-cost checks")
+                        st.dataframe(
+                            pd.DataFrame(optimizer_stress_records(selected_recommendation)),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                        st.markdown("##### Results in different market conditions")
+                        st.dataframe(
+                            pd.DataFrame(optimizer_regime_records(selected_recommendation)),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                        st.markdown("##### Tested settings")
+                        st.dataframe(
+                            pd.DataFrame(optimizer_candidate_records(selected_recommendation.candidates, limit=16)),
+                            width="stretch",
+                            hide_index=True,
+                        )
+                    else:
+                        st.caption("Load these tables only when you need to audit the search in detail.")
             st.caption(
                 "This search compares historical results. It does not change account risk limits, broker access, order mode, credentials, automation, or the Kill Switch."
             )
+
+    with st.expander("Backtest assumptions and exit model", expanded=False):
+        fee_assumption = (
+            "Crypto results use Alpaca's conservative Tier 1 taker fee of 0.25% on buys and sells. "
+            f"Actual maker/taker rates depend on 30-day crypto volume; see {ALPACA_CRYPTO_FEE_SCHEDULE_URL}. "
+            if asset_class == "crypto"
+            else f"Results include estimated Alpaca U.S. equity regulatory fees using the fee schedule effective "
+            f"{ALPACA_EQUITY_FEE_SCHEDULE_EFFECTIVE} and a 0% direct-account commission assumption. "
+        )
+        st.markdown(
+            "Historical signals use completed bars. Entries use the signal-bar close. "
+            "Protective stops fill at the stop price, or at the bar open after a gap below the stop. "
+            + fee_assumption
+            + "Paper trading may not deduct the same fees, so they are included as live-equivalent costs. "
+            "Spread, slippage, market impact, taxes, and idle-cash interest are not included."
+        )
+        st.dataframe(pd.DataFrame(exit_model_records()), width="stretch", hide_index=True)
     
     if show_portfolio_evidence:
         page_section("Trade details *", "Full Records view only: detailed trade rules, agent notes, and risk records.")
-        detail_tabs = st.tabs(["Rules *", "Agent notes *", "Risk records *"])
-        with detail_tabs[0]:
+        detail_view = st.radio(
+            "Trade detail to load",
+            ["Rules *", "Agent notes *", "Risk records *"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="trade_detail_view",
+        )
+        if detail_view == "Rules *":
             sig = live["signal"]
             if sig == "long":
                 st.markdown('<span class="signal-long">BUY SIGNAL</span>', unsafe_allow_html=True)
@@ -5965,14 +6053,14 @@ if command_center_view == "New Trade":
             )
             st.markdown("#### Quality checks")
             st.dataframe(pd.DataFrame(optional_quality_input_records(setup_inputs)), width="stretch", hide_index=True)
-        with detail_tabs[1]:
+        elif detail_view == "Agent notes *":
             st.dataframe(pd.DataFrame(proposal_records(trade_proposal)), width="stretch", hide_index=True)
             st.markdown(f"**Trade idea:** {trade_proposal.thesis.thesis}")
             st.markdown(f"**What would make this wrong:** {trade_proposal.thesis.invalidation}")
             st.markdown("#### What the agent used")
             for item in trade_proposal.thesis.data_basis:
                 st.markdown(f"- {item}")
-        with detail_tabs[2]:
+        else:
             st.markdown(
                 f"**Final answer:** "
                 f"<span style='color:{answer_color};font-weight:700'>{final_answer}</span> - {final_detail}",
@@ -6027,19 +6115,25 @@ if command_center_view == "Alpaca":
             )
             st.markdown("#### Alpaca setup checks *")
             st.dataframe(pd.DataFrame(alpaca_config_validation_records(alpaca_adapter.config)), width="stretch", hide_index=True)
-        alpaca_tabs = st.tabs(["Alpaca account", "Alpaca positions", "Alpaca orders"])
-        with alpaca_tabs[0]:
+        alpaca_detail_view = st.radio(
+            "Alpaca detail to load",
+            ["Alpaca account", "Alpaca positions", "Alpaca orders"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="alpaca_detail_view",
+        )
+        if alpaca_detail_view == "Alpaca account":
             account_records = alpaca_account_records
             if account_records:
                 st.dataframe(pd.DataFrame(account_records), width="stretch", hide_index=True)
             else:
                 st.caption("No Alpaca account data available. Configure paper credentials and install alpaca-py.")
-        with alpaca_tabs[1]:
+        elif alpaca_detail_view == "Alpaca positions":
             if alpaca_positions:
                 st.dataframe(pd.DataFrame(alpaca_positions), width="stretch", hide_index=True)
             else:
                 st.caption("No Alpaca positions available.")
-        with alpaca_tabs[2]:
+        else:
             if alpaca_orders:
                 st.dataframe(pd.DataFrame(alpaca_orders), width="stretch", hide_index=True)
             else:
@@ -6579,7 +6673,7 @@ if command_center_view == "Alpaca":
     elif can_submit:
         st.caption("Paper orders use the strategy reference price and never contact a live broker.")
     if intent is not None:
-        st.caption("Alpaca paper orders require paper mode, a real ticker, connected Alpaca paper credentials, and the paper account switch.")
+        st.caption("Alpaca paper orders require Paper trading mode, a real ticker, and connected Alpaca paper credentials.")
     
     with st.expander("Automation check", expanded=False):
         automation_decision = paper_automation_dry_run(
@@ -6783,13 +6877,19 @@ if command_center_view == "Alpaca":
             st.caption("No practice decisions saved this session.")
     
     with st.expander("Local simulator positions and orders", expanded=False):
-        exec_tabs = st.tabs(["Positions", "Orders"])
-        with exec_tabs[0]:
+        simulator_detail_view = st.radio(
+            "Local simulator detail to load",
+            ["Positions", "Orders"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="simulator_detail_view",
+        )
+        if simulator_detail_view == "Positions":
             if position_records:
                 st.dataframe(pd.DataFrame(position_records), width="stretch", hide_index=True)
             else:
                 st.caption("No open paper positions.")
-        with exec_tabs[1]:
+        else:
             if order_records:
                 st.dataframe(pd.DataFrame(order_records), width="stretch", hide_index=True)
             else:

@@ -118,6 +118,47 @@ def active_automation_level(selected_level: str, full_automation_enabled: bool, 
     return selected_level
 
 
+def position_management_status_message(
+    position_symbols: list[str],
+    settings_by_symbol: dict[str, dict],
+    automation_level: str,
+    worker_running: bool,
+    *,
+    exit_ready: bool = False,
+    exit_symbol: str = "",
+    exit_quantity: str = "",
+) -> str:
+    symbols = [str(symbol).strip().upper() for symbol in position_symbols if str(symbol).strip()]
+    if not symbols:
+        return "No open Alpaca positions. Use New Trade when you want to research the next setup."
+
+    unmanaged = [symbol for symbol in symbols if not settings_by_symbol.get(symbol)]
+    if unmanaged:
+        return f"Save exit settings for {', '.join(unmanaged)} before the app can manage those positions."
+
+    auto_exit_off = [
+        symbol
+        for symbol in symbols
+        if not bool(settings_by_symbol.get(symbol, {}).get("auto_exit_enabled", False))
+    ]
+    if auto_exit_off:
+        return (
+            f"Automatic exit is off for {', '.join(auto_exit_off)}. "
+            "Open Edit exit settings, check Auto exit this position, and save."
+        )
+
+    if automation_level == "Manual review only":
+        return "Position exit plans are saved, but Automation is set to Manual review only."
+    if not worker_running:
+        return "Position exit plans and automatic exits are on, but the Background Worker is stopped."
+    if exit_ready:
+        quantity = f"{exit_quantity} " if str(exit_quantity).strip() else ""
+        symbol = str(exit_symbol).strip().upper() or "the triggered position"
+        return f"Ready to sell {quantity}{symbol}. The Background Worker is running."
+
+    return "Automatic exits are active. The Background Worker is watching all saved position exit rules."
+
+
 class AutomationDryRunStore:
     def __init__(self, path: str | Path | None = None):
         self.path = Path(path) if path is not None else DEFAULT_AUTOMATION_DRY_RUN_PATH
@@ -203,7 +244,7 @@ def auto_exit_decision(
     if not broker_can_submit:
         reasons.append("Alpaca paper order submission is not available.")
     if not paper_orders_enabled:
-        reasons.append("Use Alpaca paper account is off.")
+        reasons.append("Alpaca is not configured for paper trading.")
     if kill_switch_enabled:
         reasons.append("Kill Switch is on.")
     if broker_state_stale:
@@ -296,7 +337,7 @@ def auto_entry_decision(
     if not broker_can_submit:
         reasons.append("Alpaca paper order submission is not available.")
     if not paper_orders_enabled:
-        reasons.append("Use Alpaca paper account is off.")
+        reasons.append("Alpaca is not configured for paper trading.")
     if kill_switch_enabled:
         reasons.append("Kill Switch is on.")
     if broker_state_stale:

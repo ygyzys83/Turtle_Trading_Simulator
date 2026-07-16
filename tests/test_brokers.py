@@ -24,8 +24,10 @@ class FakeAlpacaClient:
         self.submitted_orders = []
         self.canceled_orders = []
         self.order_status = order_status
+        self.account_reads = 0
 
     def get_account(self):
+        self.account_reads += 1
         return SimpleNamespace(
             status="ACTIVE",
             cash="100000",
@@ -118,9 +120,10 @@ def test_alpaca_adapter_reports_missing_credentials_and_blocks_orders():
 
 
 def test_alpaca_read_only_adapter_reports_fake_account_data():
+    client = FakeAlpacaClient()
     adapter = AlpacaBrokerAdapterStub(
         AlpacaConfig(api_key="key", api_secret="secret", base_url="https://paper-api.alpaca.markets"),
-        trading_client=FakeAlpacaClient(),
+        trading_client=client,
     )
 
     status = adapter.status()
@@ -132,6 +135,7 @@ def test_alpaca_read_only_adapter_reports_fake_account_data():
     assert adapter.position_records()[0]["Symbol"] == "AAPL"
     assert adapter.order_records()[0]["Order ID"] == "abcdef12"
     assert adapter.order_records()[0]["Filled Qty"] == "10"
+    assert client.account_reads == 1
 
 
 def test_alpaca_adapter_blocks_submission_when_manual_gate_disabled():

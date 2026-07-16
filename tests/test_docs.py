@@ -59,9 +59,11 @@ def test_strategy_input_search_is_explicit_and_alpaca_intraday_history_is_bounde
     assert '"Inputs changed. Run the search again."' in text
     assert "strategy_search_interval_histories(data_source)" in text
     assert "search_interval == interval and search_history == period" not in text
-    assert "all three fixed datasets are required" in text
+    assert '"Strategy search interval"' in text
+    assert "The strategy input search could not load the selected dataset" in text
+    assert "all three fixed datasets are required" not in text
     assert "Price data tested" in text
-    assert "OPTIMIZER_SEARCH_STATE_VERSION = 4" in text
+    assert "OPTIMIZER_SEARCH_STATE_VERSION = 5" in text
     assert 'optimizer_search_state.get("schema_version")' in text
 
 
@@ -102,7 +104,7 @@ def test_long_price_load_shows_three_explicit_progress_stages():
     app_text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
 
     assert "Step 1 of 3 - Download price history." in app_text
-    assert "Step 2 of 3 - Run backtests." in app_text
+    assert "Step 2 of 3 - Run backtest." in app_text
     assert "Step 3 of 3 - Prepare results." in app_text
     assert "Wait for the finished results before changing sidebar inputs." in app_text
 
@@ -132,14 +134,20 @@ def test_main_navigation_is_sticky_and_precedes_status_strip():
 
 def test_strategy_decision_sections_have_plain_language_helpers():
     text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
 
-    assert "It answers which of those five exact strategies fits the ticker now; it does not search for better settings." in text
+    assert "The normal refresh does not calculate or rank the other strategies." in text
+    assert "Compare all five current strategy fits" not in text
+    assert "paper account switch" not in text
     assert "This table does not search for better settings" in text
+    assert "Performance by time period" in text
+    assert "do not feed into or change" in text
     assert "The older 55% of prices finds useful regions" in text
     assert "the newer 25% chooses among those regions" in text
     assert "the latest 20% " in text
     assert "only reports what happened afterward" in text
     assert "RSI rules are not part of this search" in text
+    assert "out-of-sample walk-forward evaluation panel" not in readme
 
 
 def test_long_ticker_load_shows_numerical_progress_through_backtests():
@@ -147,7 +155,7 @@ def test_long_ticker_load_shows_numerical_progress_through_backtests():
 
     assert "load_progress_bar = st.progress(" in text
     assert "Downloading completed price bars (step 1 of 3)" in text
-    assert "Running five backtests across" in text
+    assert "'five backtests' if all_strategy_comparison_requested else 'the selected backtest'" in text
     assert "Building decisions, tables, and charts (step 3 of 3)" in text
     assert 'load_progress_bar.progress(1.0, text=f"{ticker} is ready")' in text
 
@@ -222,9 +230,16 @@ def test_buy_watchlist_creation_and_management_are_on_their_intended_pages():
     assert 'if command_center_view == "Positions & Queue":' in text
     assert 'if command_center_view == "Open Positions":' not in text
     assert text.count("render_current_setup_watchlist_action()") == 2
-    assert text.count("render_buy_watchlist_manager()") == 2
+    # Definition plus one call for the open-position branch and one for the
+    # no-position branch. The queue remains available in either state.
+    assert text.count("render_buy_watchlist_manager()") == 3
     positions_panel = text[text.index("def render_open_positions_panel()") : text.index('if command_center_view == "Positions & Queue":')]
-    assert positions_panel.index("render_buy_watchlist_manager()") < positions_panel.index("if not alpaca_positions:")
+    managed_watchlist_call = positions_panel.rindex("render_buy_watchlist_manager()")
+    assert positions_panel.index('st.markdown("#### Position manager")') < managed_watchlist_call
+    assert positions_panel.index('with st.expander("Saved entry plan"') < managed_watchlist_call
+    assert positions_panel.index("render_recent_automatic_exits()") < managed_watchlist_call
+    assert "Quick exit changes" not in positions_panel
+    assert "Open position automation status" not in positions_panel
 
 
 def test_position_stop_labels_distinguish_planned_price_from_fill_adjusted_stop():
@@ -247,3 +262,13 @@ def test_position_exit_editor_reacts_before_save_and_owns_its_interval():
     assert "This setting belongs only to this position and does not use the current sidebar interval." in text
     assert "Choose Strategy exit + ATR protection under Exit method to enable this selector." in text
     assert 'st.session_state["position_exit_save_notice"]' in text
+
+
+def test_new_trade_research_and_strategy_search_have_clear_sections():
+    text = (ROOT / "turtle_trading.py").read_text(encoding="utf-8")
+
+    assert 'with st.expander(f"New Trade Research - {ticker}", expanded=True):' in text
+    assert '"Strategy Input Search Results"' in text
+    assert "expanded=optimizer_search_state is not None" in text
+    assert text.index('"Strategy Input Search Results"') < text.index('"Backtest assumptions and exit model"')
+    assert '"Optional strategy tests"' not in text

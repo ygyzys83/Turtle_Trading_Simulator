@@ -34,10 +34,10 @@ def _order(
     }
 
 
-def _position(quantity: float, average_entry: float, symbol: str = "NVDA") -> dict:
+def _position(quantity: float, average_entry: float, symbol: str = "NVDA", asset_type: str = "equity") -> dict:
     return {
         "Symbol": symbol,
-        "Asset Type": "equity",
+        "Asset Type": asset_type,
         "Quantity": str(quantity),
         "Average Entry": str(average_entry),
     }
@@ -56,6 +56,10 @@ def _tracked(order_id: str, *, high: float | None = None, status: str = "filled"
         settings["highest_high_since_entry"] = high
         settings["last_exit_trigger_price"] = high - 1
         settings["last_exit_trigger_source"] = "break-even stop"
+        settings["last_exit_snapshot"] = {
+            "trigger_price": high - 1,
+            "trigger_source": "break-even stop",
+        }
     return {
         "broker_order_id": order_id,
         "symbol": "NVDA",
@@ -139,6 +143,7 @@ def test_live_fill_uses_new_order_settings_even_when_local_status_is_stale():
     assert resolution.entry_settings["entry_reference_price"] == 210.758696
     assert resolution.exit_settings["highest_high_since_entry"] == 210.758696
     assert "last_exit_trigger_price" not in resolution.exit_settings
+    assert "last_exit_snapshot" not in resolution.exit_settings
 
 
 def test_old_cycle_settings_never_attach_when_new_buy_is_manual():
@@ -309,6 +314,57 @@ def test_quantity_mismatch_fails_closed():
     assert not resolution.managed
     assert resolution.exit_settings is None
     assert "reconstructs 20" in resolution.reason
+
+
+def test_crypto_position_quantity_reconciles_net_of_alpaca_buy_fee():
+    orders = [
+        _order(
+            "btc-buy",
+            "buy",
+            0.077,
+            "2026-07-16T12:02:02+00:00",
+            symbol="BTC/USD",
+            average_fill=64172.62,
+        )
+    ]
+
+    cycle = current_position_cycle(
+        _position(0.0768845, 64172.62, symbol="BTC/USD", asset_type="crypto"),
+        orders,
+    )
+
+    assert cycle.reliable
+    assert cycle.broker_quantity == pytest.approx(0.0768845)
+    assert cycle.reconstructed_quantity == pytest.approx(0.077)
+    assert "BUY fees" in cycle.reason
+
+
+def test_crypto_fee_residual_does_not_keep_a_closed_cycle_open():
+    orders = [
+        _order("old-buy", "buy", 0.077, "2026-07-15T10:00:00+00:00", symbol="BTC/USD"),
+        _order("old-sell", "sell", 0.0768845, "2026-07-15T11:00:00+00:00", symbol="BTC/USD"),
+        _order("new-buy", "buy", 0.02, "2026-07-16T10:00:00+00:00", symbol="BTC/USD"),
+    ]
+
+    cycle = current_position_cycle(
+        _position(0.01997, 64000, symbol="BTC/USD", asset_type="crypto"),
+        orders,
+    )
+
+    assert cycle.reliable
+    assert cycle.cycle_id == "new-buy"
+    assert cycle.buy_order_ids == ("new-buy",)
+
+
+def test_crypto_quantity_mismatch_beyond_maximum_buy_fee_fails_closed():
+    orders = [_order("btc-buy", "buy", 0.077, "2026-07-16T10:00:00+00:00", symbol="BTC/USD")]
+
+    cycle = current_position_cycle(
+        _position(0.07, 64000, symbol="BTC/USD", asset_type="crypto"),
+        orders,
+    )
+
+    assert not cycle.reliable
 
 
 def test_position_plan_record_is_keyed_to_cycle_and_preserves_entry_snapshot():

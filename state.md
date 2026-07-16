@@ -1,6 +1,6 @@
 # Trading Simulator - Conversation State Handoff
 
-Last updated: 2026-07-10 (Pacific Time)
+Last updated: 2026-07-16 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
@@ -825,6 +825,34 @@ Optimizer session state is schema-versioned. If Streamlit hot-reloads new optimi
 
 Crypto uses shorter fixed search windows because it trades continuously and therefore produces far more bars per calendar year: 1-hour bars for 1 year, 4-hour bars for 2 years, and daily bars for 5 years. Equity Alpaca searches remain 1-hour/2-year, 4-hour/5-year, and daily/10-year. Alpaca's crypto endpoint returned minute-scale pagination for a direct 4-hour request, so the app now downloads supported 1-hour crypto bars and aggregates each four complete UTC-aligned bars locally into one 4-hour OHLCV bar. This avoids hundreds of API pages without reducing the intended 4-hour sample.
 
+## Performance Simplification (July 15, 2026)
+
+The expensive research paths are now explicit instead of automatic. A normal trading-screen refresh calculates only the strategy selected in the sidebar. `Compare All Strategies` runs the five-strategy comparison on demand and caches it until a material ticker, timeframe, strategy, or risk input changes. The Research Read states whether it used a true all-strategy comparison or only the selected strategy.
+
+The strategy input search now uses one operator-selected interval per run while still comparing all four trend strategies. The default workload is 32 broad settings plus up to 16 deliberate neighboring settings per strategy. Only three finalists per strategy receive the extra chronological checks. Price-behavior analysis reuses the same older 55%, newer 25%, and latest 20% sections instead of running six additional periods. The daily output is one concise strategy table; raw cost, regime, candidate, and agent-audit tables load only when explicitly requested in Full Records.
+
+Historical bars are cached until another bar can complete. Equity cache boundaries follow the regular 9:30 a.m. to 4:00 p.m. Eastern session, while crypto uses continuous UTC boundaries. A lightweight Alpaca latest-trade request refreshes current pricing every 15 seconds without repeatedly downloading full history. The former optional newer-price control was later removed; New Trade now always shows the exact selected settings across the older 55%, newer 25%, and latest 20% of loaded history. Hidden Full Records tab bodies were replaced with one-at-a-time selectors so hidden tables no longer render on every rerun.
+
+The performance refactor does not change trading math. The selected-strategy fast path calls the same deterministic strategy implementation used by the full comparison. The 55/25/20 optimizer split, warmup exclusion, equal-date buy-and-hold benchmark, ticker allocation, fees, sizing, stops, position lifecycle, and broker gates remain unchanged. The full automated suite passed after the refactor.
+
+## Live Protective-Stop Price Consistency (July 16, 2026)
+
+CRWV exposed a mismatch between the Streamlit position screen and the background worker. The UI could compare Alpaca's current position value-derived price with the saved stop, while the worker's shared exit evaluator preferred the last completed saved-interval bar price. A fast intrabar move below a protective stop could therefore display `Exit is triggered` in the UI while the worker reported that no exit was ready.
+
+The shared exit evaluator now derives the current execution price from the live Alpaca position (`Market Value / Quantity`) whenever it is available. This same price is used by both the UI and worker for initial-stop, break-even, and ATR-trail trigger decisions. Completed bars still calculate strategy sell lines, ATR, RSI, and historical high-water information. The result records the current-price source for auditability.
+
+The worker also records and displays a specific `triggered but was not sent` reason when an exit reaches its trigger but an invalid broker preview or an existing open sell order blocks submission. The previous generic `No auto exits were ready` message remains only when no position has actually triggered. Regression coverage includes the exact CRWV case where the live Alpaca price is below the stop while the last completed 1-hour bar remains above it. The full suite passed with 424 tests.
+
+## Fast Positions And Queue Startup (July 16, 2026)
+
+A fresh Streamlit process previously downloaded the saved historical bars and reran the exit strategy for every managed position before `Positions & Queue` could render. It then evaluated the selected position a second time. Crypto and short-interval plans made the cold page load take roughly 45 to 60 seconds.
+
+The Background Worker now saves a compact, complete exit-calculation snapshot inside each exact-cycle position plan on every check. The snapshot includes the current and trigger prices, trigger rule, strategy and initial stops, break-even and ATR-trail levels, profit in R, ATR and RSI reads, completed-bar timestamp, interval, reason, readiness, and calculation time. Position-cycle replacement treats this snapshot as dynamic state, so a later re-entry cannot inherit an older position's calculation.
+
+`Positions & Queue` now renders all rows and the selected position from these saved snapshots plus the current Alpaca position price. It does not download historical bars during ordinary page startup. `Refresh selected exit calculation` explicitly recalculates only the selected position, and saving edited exit settings still downloads the required interval history and validates the resulting plan before persisting it. The UI shows when the saved exit calculation was last updated.
+
+Sidebar ticker history is deferred while `Positions & Queue` or `Paper Review` is selected. It loads when the operator opens `Ideas`, `New Trade`, or `Alpaca`. The Alpaca adapter also reuses the account object read during its connection check instead of making a duplicate account request in the same Streamlit run. The full automated suite passed with 427 tests.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.
@@ -839,3 +867,23 @@ Crypto uses shorter fixed search windows because it trades continuously and ther
 10. Never submit an Alpaca order while testing unless the user explicitly authorizes that exact paper/live action.
 11. Treat paper trading as a practical test environment, not as a reason to build repetitive approval ceremony.
 12. Be honest about residual uncertainty before live capital.
+## 2026-07-16 - New Trade research and agent-review cleanup
+
+- Removed the misleading `Compare all five current strategy fits` section. The normal refresh often calculates only the selected strategy, so the section no longer represented what its title claimed.
+- Removed the optional `Test on newer price data` checkbox and its adjustable split. The exact strategy and sidebar inputs are now always evaluated separately on the older 55%, newer 25%, and latest 20% of the loaded history.
+- Added `Performance by time period` to the ordinary backtest workflow. It compares strategy return with buy-and-hold for each price section and is cached independently from Strategy Input Search.
+- Moved `Compare All Strategies` out of Strategy Input Search Results. It now clearly compares all strategies using the exact current sidebar inputs, while Strategy Input Search remains the separate broad parameter search.
+- Rebuilt the strategy-search agent evidence packet so it contains up to two high-ranked candidate regions from every searched strategy rather than only the deterministic winner.
+- Candidate evidence is phrased as neutral measurements. The LLM may select another supplied candidate, identify an alternative, say candidates are too close, or recommend skipping the search.
+- The agent loop remains analyst -> skeptical reviewer -> editor. The editor is explicitly instructed to write a clear, well-reasoned assessment in complete sentences and simple language.
+- The daily agent output now focuses on recommendation, best candidate, why it may work, main concern, best alternative, and next step. Candidate IDs and detailed price-behavior evidence are shown only in Full Records and Evidence.
+
+## 2026-07-16 - Fresh-eyes review of the New Trade changes
+
+- Fixed an agent-loop severity bug: when the skeptical reviewer rejected an analyst draft, the editor could previously receive a higher action ceiling than the analyst selected. Rejection can now only preserve or lower the analyst's action; it can never promote `SKIP` to `WATCH` or `WATCH` to a paper-test recommendation.
+- The final explanation may quote useful numbers only when those numbers appear in the evidence IDs it cites. Invented numbers still fail validation and fall back to the built-in result.
+- The best-alternative row now shows the alternative strategy and interval in the value column, with the model's reasoning and exact inputs in the explanation column.
+- Time-period labels now derive from the fractions actually calculated, invalid splits fail clearly, dates are compact, and buy-and-hold fees normalize equity versus crypto using the same asset-class rule as the rest of the app.
+- Time-period tests may use earlier bars to warm up indicators, but the backtest engine now blocks simulated entries before the section's actual start. This prevents a warmup-period position from occupying or changing the beginning of the newer or latest section.
+- Removed stale UI and README wording that referenced the deleted paper-account checkbox and the old optional walk-forward panel.
+- Focused agent, evaluation, automation, and documentation tests passed before the final full-suite checkpoint.

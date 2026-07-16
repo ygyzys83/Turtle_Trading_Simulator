@@ -14,6 +14,7 @@ from agentloop_trader.automation import (
     evidence_dashboard_records,
     paper_automation_candidate_records,
     paper_automation_dry_run,
+    position_management_status_message,
     strategy_settings_match,
     strategy_settings_match_reason,
 )
@@ -21,6 +22,43 @@ from agentloop_trader.broker_governance import BrokerStateHealth
 from agentloop_trader.models import PreflightCheckResult, RiskCheckResult, TradeIntent
 import tempfile
 from datetime import datetime
+
+
+def test_position_management_status_accepts_full_automation_mode():
+    message = position_management_status_message(
+        ["AAPL"],
+        {"AAPL": {"auto_exit_enabled": True}},
+        "Auto entries and exits",
+        True,
+    )
+
+    assert message == "Automatic exits are active. The Background Worker is watching all saved position exit rules."
+
+
+def test_position_management_status_identifies_position_level_auto_exit_switch():
+    message = position_management_status_message(
+        ["AAPL", "IBM"],
+        {
+            "AAPL": {"auto_exit_enabled": True},
+            "IBM": {"auto_exit_enabled": False},
+        },
+        "Auto exits only",
+        True,
+    )
+
+    assert message.startswith("Automatic exit is off for IBM.")
+    assert "Auto exit this position" in message
+
+
+def test_position_management_status_identifies_stopped_worker():
+    message = position_management_status_message(
+        ["AAPL"],
+        {"AAPL": {"auto_exit_enabled": True}},
+        "Auto exits only",
+        False,
+    )
+
+    assert message == "Position exit plans and automatic exits are on, but the Background Worker is stopped."
 
 
 def test_paper_automation_dry_run_holds_without_intent():

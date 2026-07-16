@@ -5,7 +5,7 @@ from decimal import Decimal, ROUND_DOWN
 from agentloop_trader.models import AssetClass
 
 
-CRYPTO_QUANTITY_INCREMENT = Decimal("0.0001")
+CRYPTO_QUANTITY_INCREMENT = Decimal("0.00000001")
 EQUITY_QUANTITY_INCREMENT = Decimal("1")
 _CRYPTO_QUOTES = ("USDT", "USDC", "USD", "BTC")
 
