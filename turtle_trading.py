@@ -158,9 +158,12 @@ from agentloop_trader.parameter_loop import (
     optimize_strategy_inputs,
     optimizer_candidate_records,
     optimizer_interval_records,
+    optimizer_price_behavior_records,
     optimizer_regime_records,
+    optimizer_regime_dependency_records,
     optimizer_recommendation_records,
     optimizer_robustness_records,
+    optimizer_strategy_behavior_records,
     optimizer_stress_records,
     strategy_search_detail_records,
     strategy_search_data_records,
@@ -182,6 +185,14 @@ from agentloop_trader.research_memory import (
     build_research_snapshot,
     compare_research_snapshots,
     research_snapshot_records,
+)
+from agentloop_trader.strategy_recommendation import (
+    RecommendationLoopStore,
+    build_strategy_search_evidence,
+    recommendation_audit_records,
+    recommendation_run_matches,
+    recommendation_summary_records,
+    run_strategy_recommendation_loop,
 )
 from agentloop_trader.risk import (
     build_preflight_check,
@@ -2754,6 +2765,7 @@ st.session_state.setdefault("tracked_alpaca_orders", [])
 audit_store = JsonlAuditStore(audit_log_path)
 automation_store = AutomationDryRunStore(automation_dry_run_path)
 research_snapshot_store = ResearchSnapshotStore(research_snapshot_path)
+strategy_recommendation_store = RecommendationLoopStore("automation_logs/strategy_recommendations.jsonl")
 manifest_store = RunManifestStore(run_manifest_path)
 broker_state_store = BrokerStateStore(broker_state_path)
 persisted_broker_state = broker_state_store.read()
@@ -3265,7 +3277,7 @@ def persist_current_position_plan(
 
 
 optimizer_market_fingerprint = "synthetic-default"
-OPTIMIZER_SEARCH_STATE_VERSION = 2
+OPTIMIZER_SEARCH_STATE_VERSION = 4
 if data_source == "Synthetic" and market_data is not None:
     fingerprint_columns = [
         column for column in ("Open", "High", "Low", "Close", "Volume")
@@ -5668,6 +5680,102 @@ if command_center_view == "New Trade":
         if strategy_optimizer_family_result is not None and not parameter_loop_error:
             if optimizer_result_stale:
                 st.warning("Inputs changed since this search finished. Run Strategy Input Search again before using a result.")
+            current_search_evidence = build_strategy_search_evidence(ticker, strategy_optimizer_family_result)
+            strategy_recommendation_run = st.session_state.get("strategy_recommendation_loop")
+            if not recommendation_run_matches(
+                strategy_recommendation_run,
+                current_search_evidence.evidence_hash,
+            ):
+                strategy_recommendation_run = run_strategy_recommendation_loop(
+                    ticker,
+                    strategy_optimizer_family_result,
+                    LLMResearchConfig(provider="deterministic"),
+                )
+                st.session_state["strategy_recommendation_log_error"] = (
+                    strategy_recommendation_store.append_safely(strategy_recommendation_run)
+                )
+                st.session_state["strategy_recommendation_loop"] = strategy_recommendation_run
+            st.markdown(
+                "#### Strategy search decision",
+                help=(
+                    "The built-in decision summarizes the strongest strategy-search result, recent consistency, nearby-input "
+                    "stability, and the latest historical price section. An optional agent review uses the same fixed evidence in three "
+                    "bounded steps: an analyst drafts a read, a skeptical reviewer challenges it, and an editor revises it. "
+                    "The agent cannot change calculations, enable automation, or send an order."
+                ),
+            )
+            decision_rows = recommendation_summary_records(strategy_recommendation_run)
+            st.dataframe(pd.DataFrame(decision_rows), width="stretch", hide_index=True)
+            agent_cols = st.columns([1, 1, 3])
+            research_writer = agent_cols[0].selectbox(
+                "Optional agent review",
+                ["Built-in", "Ollama", "Gemini"],
+                key="strategy_search_research_writer",
+                help=(
+                    "Built-in uses only deterministic rules. Ollama runs a local model. Gemini uses GEMINI_API_KEY. "
+                    "Both model options review the same evidence and may only keep or lower the built-in action."
+                ),
+            )
+            if agent_cols[1].button(
+                "Run Agent Review",
+                disabled=optimizer_result_stale or research_writer == "Built-in",
+                key="run_strategy_agent_review",
+                help="Runs one analyst draft, one skeptical review, and one final revision. It does not contact Alpaca.",
+            ):
+                selected_provider = research_writer.lower()
+                config = LLMResearchConfig.from_env(selected_provider)
+                with st.spinner("Reviewing the fixed strategy evidence..."):
+                    reviewed_run = run_strategy_recommendation_loop(
+                        ticker,
+                        strategy_optimizer_family_result,
+                        config,
+                    )
+                    st.session_state["strategy_recommendation_log_error"] = (
+                        strategy_recommendation_store.append_safely(reviewed_run)
+                    )
+                st.session_state["strategy_recommendation_loop"] = reviewed_run
+                st.rerun()
+            if st.session_state.get("strategy_recommendation_log_error"):
+                st.warning(
+                    "The recommendation is available, but its research record could not be saved: "
+                    + st.session_state["strategy_recommendation_log_error"]
+                )
+            if strategy_recommendation_run.recommendation.used_fallback:
+                st.caption(
+                    "The optional model review failed validation, so the app kept the built-in decision. "
+                    + strategy_recommendation_run.recommendation.error
+                )
+            best_search_result = strategy_optimizer_family_result.best_strategy
+            with st.expander("How price behavior affected this result", expanded=False):
+                st.caption(
+                    "These labels describe this ticker's price path, not the economic business cycle. The app checks whether "
+                    "each period is backtested independently using the same saved settings. Strategy and buy-and-hold returns "
+                    "therefore cover the same dates. This shows whether the result repeated across different price behavior or "
+                    "relied on one especially favorable period."
+                )
+                st.dataframe(
+                    pd.DataFrame(optimizer_regime_dependency_records(best_search_result.best_result)),
+                    width="stretch",
+                    hide_index=True,
+                )
+                st.dataframe(
+                    pd.DataFrame(optimizer_strategy_behavior_records(best_search_result.best_result)),
+                    width="stretch",
+                    hide_index=True,
+                )
+                if show_portfolio_evidence:
+                    st.markdown("##### Price behavior calculations *")
+                    st.dataframe(
+                        pd.DataFrame(optimizer_price_behavior_records(best_search_result.best_result)),
+                        width="stretch",
+                        hide_index=True,
+                    )
+                    st.markdown("##### Agent review record *")
+                    st.dataframe(
+                        pd.DataFrame(recommendation_audit_records(strategy_recommendation_run)),
+                        width="stretch",
+                        hide_index=True,
+                    )
             st.info(strategy_optimizer_family_result.summary)
             fixed_search_windows = strategy_search_interval_histories(data_source)
             fixed_search_description = ", ".join(

@@ -14,7 +14,9 @@ A governed trading simulator, paper-trading console, and research lab for testin
 - Runs each trade intent through deterministic risk checks.
 - Supports explicit execution modes: backtest only, paper trading, shadow mode, live with approval, and automated live.
 - Adds an out-of-sample walk-forward evaluation panel to compare training and test-period behavior.
-- Adds a bounded strategy-input search that favors stable nearby settings, rolling periods, an untouched final period, and realistic execution-cost stress.
+- Adds a bounded strategy-input search that favors stable nearby settings, separates older/newer/latest price sections, and includes realistic execution-cost stress.
+- Describes each winning result across deterministic price-behavior periods and reports whether performance depended on one favorable environment.
+- Adds an optional bounded analyst, skeptical-reviewer, and decision-editor loop over hashed deterministic evidence. Invalid or invented claims fall back to the built-in decision.
 - Can apply the selected settings unchanged to other tickers and report whether the result generalizes.
 - Adds portfolio-aware risk policy and execution preflight checks.
 - Adds a broker adapter interface with a local simulator and Alpaca paper-order support.
@@ -63,8 +65,9 @@ The daily workflow should stay simple enough for an expert operator to use quick
 - Results include unrealized profit or loss from a simulated position still open on the final bar.
 - Newer-data and optimizer comparisons use completed trades on both sides of the split so open-position P&L cannot skew one side.
 - Backtest results deduct estimated Alpaca trading fees. Stock tests use the current U.S. equity regulatory-fee model; crypto tests conservatively use Alpaca's Tier 1 taker fee on each side. Spread, market impact, taxes, and idle-cash interest are not included. The strategy-input recommendation separately shows 5, 10, and 20 basis-point-per-side stress results; paper and live fills remain the final execution test.
-- For real tickers, the strategy-input search ranks daily, 4-hour, and 1-hour results over the same latest two-year calendar window (or the shorter common window available from every interval). It then tests each interval's winning settings without changes on its longer available history: daily up to 10 years, 4-hour up to 5 years, and 1-hour up to 2 years with Alpaca. A result is labeled ready for paper testing only when it beats equal-capital buy-and-hold in both the newer-data and untouched locked periods and passes the minimum trade, rolling-period, and slippage checks.
-- `Require RSI 50-70 for BUY` is an optional hard entry rule for the four trend strategies. The RSI mean-reversion scalp uses its own adjustable RSI entry and exit rules instead. The optimizer tests the optional 50-70 rule off and on for the trend strategies and searches a bounded set of RSI scalp inputs separately.
+- For real prices, each strategy-input search independently downloads fixed datasets rather than reusing the sidebar chart. Alpaca equity searches use 1-hour/2-year, 4-hour/5-year, and daily/10-year data. Alpaca crypto searches use 1-hour/1-year, 4-hour/2-year, and daily/5-year data because crypto trades continuously. The older 55% supplies the historical sample, the newer 25% selects among the historical finalists, and the latest 20% reports what happened without choosing replacement settings.
+- RSI remains available as current setup information and as the separate RSI mean-reversion strategy. RSI rules are intentionally excluded from the four-strategy input search so the search stays focused and less vulnerable to combinatorial overfitting.
+- Price-behavior labels describe the ticker path rather than claiming to identify an economic business cycle. Direction is classified as strong/mild uptrend, sideways, or mild/strong downtrend; path is classified as persistent, mixed, or choppy. The result also reports performance across six chronological periods and whether profits were concentrated in one type of price behavior.
 - Strategy quality is measured against a stable per-ticker capital allocation set by `Max symbol concentration`. The UI keeps whole-account return for portfolio impact, while allocated return, allocated worst drop, and equal-capital buy-and-hold are used for strategy comparison and optimizer evidence. Strategy and buy-and-hold worst drops both divide the largest peak-to-trough dollar decline by the original ticker allocation, making the displayed percentages directly comparable. Annualized allocated and buy-and-hold returns use actual timestamps and appear only when the measured period exceeds one year. Return on average capital deployed is intentionally not used.
 - Alpaca and Yahoo price data are validated, sorted, deduplicated, and checked for impossible OHLC values before use.
 - Crypto bars are completed on elapsed UTC time rather than stock-session boundaries, so the worker can evaluate crypto entries and exits on weekends and outside stock market hours.
@@ -83,6 +86,9 @@ agentloop_trader/
   indicators.py   # ATR and SMA calculations
   models.py       # structured trading, risk, and audit contracts
   llm_research.py # deterministic/Ollama/Gemini research writer adapter
+  price_regime.py # deterministic price-path classification and regime-dependence evidence
+  strategy_recommendation.py # bounded strategy analyst/reviewer/editor loop
+  idea_pipeline.py # research-only ticker source contract and durable future queue
   market_data.py  # Alpaca/yfinance bars plus Alpaca news context
   ops_readiness.py # local-only paper automation readiness checks
   scanner.py      # deterministic watchlist scanner and candidate store
@@ -114,7 +120,7 @@ GEMINI_API_KEY=
 GEMINI_MODEL=gemini-2.5-flash-lite
 ```
 
-The LLM cannot promote a deterministic `WAIT` into a paper-trade `TRADE`, cannot change risk settings, and cannot submit orders.
+The LLM cannot promote a built-in recommendation, change strategy calculations or risk settings, or submit orders. The strategy-search review runs at most one analyst draft, one skeptical review, and one edited decision. Every final claim must cite a supplied evidence ID; failed validation uses the built-in recommendation and records the failure.
 
 ## Setup
 

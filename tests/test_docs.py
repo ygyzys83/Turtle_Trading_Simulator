@@ -61,7 +61,7 @@ def test_strategy_input_search_is_explicit_and_alpaca_intraday_history_is_bounde
     assert "search_interval == interval and search_history == period" not in text
     assert "all three fixed datasets are required" in text
     assert "Price data tested" in text
-    assert "OPTIMIZER_SEARCH_STATE_VERSION = 2" in text
+    assert "OPTIMIZER_SEARCH_STATE_VERSION = 4" in text
     assert 'optimizer_search_state.get("schema_version")' in text
 
 

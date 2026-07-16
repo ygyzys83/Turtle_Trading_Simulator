@@ -5,6 +5,8 @@ AgentLoop Trader is being built with the assumption that it may eventually manag
 ## Non-Negotiable Controls
 
 - The LLM or rules agent may propose trades, but deterministic code must approve or reject them.
+- Research agents receive immutable, hashed evidence and have no broker, credential, order, automation, or risk-setting interface.
+- Any future ticker-discovery agent may add symbols only to a research queue. It cannot add them directly to the automated Buy watchlist or submit an order.
 - Risk limits, broker credentials, order submission code, and kill-switch behavior are not agent-modifiable.
 - Live order submission must remain disabled until paper trading and shadow-mode evidence are reviewed.
 - Alpaca live mode must require separate configuration from Alpaca paper mode.
@@ -34,6 +36,7 @@ AgentLoop Trader is being built with the assumption that it may eventually manag
 - Kill switch always visible.
 - Broker reconciliation required before order submission.
 - No market order submission outside an approved session.
+- Unattended live positions require broker-native protective orders, or an independently verified equivalent that remains effective when the desktop, network, Streamlit page, or worker is unavailable.
 
 ## Stop Conditions
 

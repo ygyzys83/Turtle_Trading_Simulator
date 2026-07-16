@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from hashlib import sha256
 from itertools import product
 import json
@@ -20,6 +20,11 @@ from agentloop_trader.performance import (
     annualized_return_percent,
     elapsed_years,
     ticker_allocated_capital,
+)
+from agentloop_trader.price_regime import (
+    price_regime_records,
+    strategy_regime_rows,
+    summarize_regime_dependency,
 )
 from agentloop_trader.strategy_runtime import STRATEGY_TYPES, _run_one
 
@@ -164,6 +169,9 @@ class RobustnessEvidence:
     bootstrap: BootstrapResult | None = None
     trial_adjustment: TrialAdjustment | None = None
     diagnostics: CandidateDiagnostics | None = None
+    price_regime_rows: list[dict[str, Any]] = field(default_factory=list)
+    strategy_regime_rows: list[dict[str, Any]] = field(default_factory=list)
+    regime_dependency: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -600,6 +608,35 @@ def optimize_strategy_inputs(
         full_trades = list(full_result["trade_log"])
         stress_rows = _execution_stress_rows(full_trades, account_equity, risk_limits)
         regime_rows = _regime_rows(data, full_trades, account_equity, best.settings, risk_limits)
+        price_behavior_rows = price_regime_records(
+            data,
+            older_fraction=train_fraction,
+            latest_fraction=locked_fraction,
+        )
+
+        def evaluate_price_period(start: int, end: int) -> dict[str, Any]:
+            stats, _ = _evaluate_range(
+                best.strategy_type,
+                best.settings,
+                data,
+                start,
+                end,
+                account_equity,
+                risk_limits,
+            )
+            return stats
+
+        strategy_behavior_rows = strategy_regime_rows(
+            data,
+            full_trades,
+            ticker_allocated_capital(account_equity, risk_limits),
+            period_evaluator=evaluate_price_period,
+        )
+        regime_dependency = summarize_regime_dependency(
+            data,
+            strategy_behavior_rows,
+            latest_fraction=locked_fraction,
+        )
         bootstrap = _bootstrap_trades(
             full_trades,
             ticker_allocated_capital(account_equity, risk_limits),
@@ -649,6 +686,9 @@ def optimize_strategy_inputs(
             bootstrap=bootstrap,
             trial_adjustment=trial_adjustment,
             diagnostics=diagnostics,
+            price_regime_rows=price_behavior_rows,
+            strategy_regime_rows=strategy_behavior_rows,
+            regime_dependency=asdict(regime_dependency),
         )
     summary = optimizer_summary(best)
     return StrategyInputRecommendation(
@@ -1681,6 +1721,49 @@ def optimizer_stress_records(result: StrategyInputRecommendation) -> list[dict[s
 
 def optimizer_regime_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
     return list(result.robustness.regime_rows) if result.robustness else []
+
+
+def optimizer_price_behavior_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+    """Describe the ticker's price behavior without implying a macroeconomic cycle."""
+    return list(result.robustness.price_regime_rows) if result.robustness else []
+
+
+def optimizer_strategy_behavior_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+    if not result.robustness:
+        return []
+    return [
+        {key: value for key, value in row.items() if not str(key).startswith("_")}
+        for row in result.robustness.strategy_regime_rows
+    ]
+
+
+def optimizer_regime_dependency_records(result: StrategyInputRecommendation) -> list[dict[str, Any]]:
+    if not result.robustness or not result.robustness.regime_dependency:
+        return []
+    dependency = result.robustness.regime_dependency
+    latest_percent = int(round(result.locked_fraction * 100))
+    return [
+        {
+            "Item": "Latest price-section behavior",
+            "Value": dependency.get("current_regime", "Not enough evidence"),
+            "Plain English": f"Classified from the latest {latest_percent}% of this interval's price history.",
+        },
+        {
+            "Item": "Best relative price behavior",
+            "Value": dependency.get("strongest_regime", "Not enough evidence"),
+            "Plain English": "The price behavior in which these exact settings had their largest advantage over buy and hold, or their smallest shortfall if none of the periods beat it.",
+        },
+        {
+            "Item": "Latest section match",
+            "Value": dependency.get("current_match", "Not enough evidence"),
+            "Plain English": "Whether the latest historical price section resembles the environment where these settings had their largest advantage over buy and hold.",
+        },
+        {
+            "Item": "Dependence on one environment",
+            "Value": dependency.get("dependency", "Not enough evidence"),
+            "Plain English": dependency.get("summary", "Not enough evidence is available."),
+        },
+    ]
 
 
 def optimizer_candidate_records(candidates: list[OptimizerCandidate], limit: int = 12) -> list[dict[str, Any]]:

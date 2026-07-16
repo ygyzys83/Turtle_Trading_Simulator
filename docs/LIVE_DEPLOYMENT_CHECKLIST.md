@@ -1,5 +1,7 @@
 # Live Deployment Checklist
 
+Strategy-search or LLM recommendations are research evidence only. Completing an agent review never satisfies an execution, risk, or broker-readiness item below.
+
 Use this checklist before enabling any real-money order path.
 
 ## Alpaca Account
