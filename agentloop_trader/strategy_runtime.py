@@ -28,6 +28,27 @@ STRATEGY_TYPES = {
     "RSI mean-reversion scalp": "rsi_scalp",
 }
 
+
+def normalize_managed_exit_settings(
+    settings: dict[str, Any] | None,
+    position: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Keep broker-managed exits independent from the research screen's data source."""
+    normalized = dict(settings or {})
+    if not normalized:
+        return normalized
+    position = position or {}
+    symbol = str(position.get("Symbol") or normalized.get("symbol") or "").strip().upper()
+    asset_class = normalize_asset_class(
+        position.get("Asset Type") or normalized.get("asset_class"),
+        symbol,
+    )
+    normalized["asset_class"] = asset_class
+    normalized["price_data_source"] = (
+        "Alpaca crypto" if asset_class == "crypto" else "Ticker (Alpaca)"
+    )
+    return normalized
+
 EXIT_SNAPSHOT_FIELDS = (
     "ready",
     "reason",

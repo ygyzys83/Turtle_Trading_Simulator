@@ -853,6 +853,14 @@ The Background Worker now saves a compact, complete exit-calculation snapshot in
 
 Sidebar ticker history is deferred while `Positions & Queue` or `Paper Review` is selected. It loads when the operator opens `Ideas`, `New Trade`, or `Alpaca`. The Alpaca adapter also reuses the account object read during its connection check instead of making a duplicate account request in the same Streamlit run. The full automated suite passed with 427 tests.
 
+## Managed Exit Data-Source Invariant (July 16, 2026)
+
+CRWV exposed a worker/UI mismatch caused by ownership leakage from the research sidebar. Its exact-cycle ATR exit plan correctly stored a `$75.24` fill-adjusted stop, but it also inherited `price_data_source: Synthetic` from the research screen. The UI could display the saved stop snapshot and correctly show that the live Alpaca price had crossed it. The worker, however, attempted to refresh the exit calculation through the saved synthetic source; worker market-data loading supports only real ticker providers, so the evaluation returned not ready and the sell was silently skipped.
+
+A read-only Alpaca bar check confirmed that CRWV first crossed the saved stop on the July 16 regular-session opening bar at 6:30 AM Pacific. This was not an after-hours-only crossing. The worker audit contained no CRWV exit submission or broker rejection.
+
+Managed Alpaca exit plans now have an explicit invariant: equities always use `Ticker (Alpaca)` and crypto always uses `Alpaca crypto`, regardless of the research screen's current provider. New saves enforce this invariant, and the worker repairs older exact-cycle plans before evaluating them. A calculation failure is saved in the plan, surfaced in worker status, and audited once per distinct failure instead of disappearing behind `No auto exits were ready`. Managed equity exits waiting outside regular hours are also named explicitly in worker status. Regression coverage reproduces the CRWV synthetic-source condition and verifies that normalization occurs before a triggered exit is submitted. The full suite passed with 451 tests.
+
 ## Instructions For The Next Codex Conversation
 
 1. Read this entire file before making recommendations.
@@ -887,3 +895,10 @@ Sidebar ticker history is deferred while `Positions & Queue` or `Paper Review` i
 - Time-period tests may use earlier bars to warm up indicators, but the backtest engine now blocks simulated entries before the section's actual start. This prevents a warmup-period position from occupying or changing the beginning of the newer or latest section.
 - Removed stale UI and README wording that referenced the deleted paper-account checkbox and the old optional walk-forward panel.
 - Focused agent, evaluation, automation, and documentation tests passed before the final full-suite checkpoint.
+
+## 2026-07-16 - Gemini recommendation validation fix
+
+- Fixed a mismatch in the strategy-search review prompt: Gemini previously received both rounded evidence sentences and a second internal candidate catalog containing higher-precision values, while validation accepted numbers only from the rounded sentences. A legitimate value from the internal catalog could therefore trigger the generic invented-number fallback.
+- The model now receives one canonical numeric evidence source plus a minimal candidate index. Numeric claims remain restricted to the evidence IDs cited by that response.
+- Analyst, skeptical-reviewer, and editor validation failures now identify the failing stage and unsupported number. Rejected raw stage output is retained in the local recommendation audit record for diagnosis while the app still falls back to the built-in decision.
+- The skeptical reviewer now receives the same numeric evidence validation as the analyst and editor. The full suite passed with 453 tests.

@@ -144,6 +144,7 @@ from agentloop_trader.strategy_runtime import (
     exit_plan_history_for_interval,
     exit_mode_for_settings,
     latest_atr_snapshot,
+    normalize_managed_exit_settings,
     reprice_trade_intent,
     selected_strategy_result as calculate_selected_strategy_result,
 )
@@ -4827,7 +4828,7 @@ def render_open_positions_panel() -> None:
         )
 
     if save_exit_settings:
-        edited_exit_template = {
+        edited_exit_template = normalize_managed_exit_settings({
             **exit_editor_settings,
             "symbol": selected_position_symbol,
             "interval": edited_exit_interval,
@@ -4851,7 +4852,7 @@ def render_open_positions_panel() -> None:
             "breakeven_after_r": edited_breakeven_after_r,
             "trail_after_r": edited_trail_after_r,
             "trailing_atr_multiplier": edited_trailing_atr_multiplier,
-        }
+        }, selected_position)
         try:
             interval_changed = edited_exit_interval != str(exit_editor_settings.get("interval") or "")
             needs_atr_snapshot = (

@@ -395,6 +395,120 @@ def test_worker_reports_triggered_exit_that_is_blocked_by_existing_sell_order(mo
     assert events[0].payload["current_price_source"] == "Alpaca position market value"
 
 
+def test_worker_repairs_research_data_source_before_sending_managed_exit(monkeypatch):
+    events = []
+    captured = {}
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(paper=True),
+        submit_order=lambda *args, **kwargs: SimpleNamespace(id="sell-crwv"),
+    )
+    position = {
+        "Symbol": "CRWV",
+        "Asset Type": "equity",
+        "Quantity": 64,
+        "Average Entry": 77.08,
+    }
+    orders = [{
+        "Alpaca Order ID": "buy-crwv",
+        "Symbol": "CRWV",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 64,
+        "Avg Fill": 77.08,
+        "Filled": "2026-07-15T19:05:42+00:00",
+    }]
+    tracked = [{
+        "broker_order_id": "buy-crwv",
+        "symbol": "CRWV",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {
+            "symbol": "CRWV",
+            "price_data_source": "Synthetic",
+            "entry_stop_distance": 1.8368,
+            "auto_exit_enabled": True,
+        },
+    }]
+
+    def evaluate(settings, current_position, fetch_bars):
+        captured.update(settings)
+        return {
+            "ready": True,
+            "state_changed": False,
+            "reason": "CRWV reached its stop.",
+            "current_price": 72.29,
+            "trigger_price": 75.24,
+            "trigger_source": "fill-adjusted initial stop",
+        }
+
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+    monkeypatch.setattr("agentloop_trader.worker.evaluate_exit_settings", evaluate)
+    monkeypatch.setattr(
+        "agentloop_trader.worker.build_alpaca_order_preview",
+        lambda *args: SimpleNamespace(valid=True, preview_hash="exit-preview", blocked_reasons=[]),
+    )
+    monkeypatch.setattr("agentloop_trader.worker.open_exit_order_reasons", lambda *args: [])
+    monkeypatch.setattr(
+        "agentloop_trader.worker._track_broker_order",
+        lambda *args: {"broker_order_id": "sell-crwv", "symbol": "CRWV", "side": "sell"},
+    )
+
+    sent, updated, message = _send_exits(
+        control,
+        adapter,
+        [position],
+        orders,
+        tracked,
+        lambda *_: None,
+        SimpleNamespace(append=events.append),
+    )
+
+    resolution = resolve_position_plan(position, orders, updated)
+    assert sent == 1
+    assert "Sent 1 auto exit order" in message
+    assert captured["price_data_source"] == "Ticker (Alpaca)"
+    assert resolution.exit_settings["price_data_source"] == "Ticker (Alpaca)"
+    assert events[-1].event_type == "worker_paper_exit_sent"
+
+
+def test_worker_reports_managed_equity_exit_waiting_for_regular_hours(monkeypatch):
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    position = {"Symbol": "CRWV", "Asset Type": "equity", "Quantity": 64, "Average Entry": 77.08}
+    orders = [{
+        "Alpaca Order ID": "buy-crwv",
+        "Symbol": "CRWV",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 64,
+        "Avg Fill": 77.08,
+        "Filled": "2026-07-15T19:05:42+00:00",
+    }]
+    tracked = [{
+        "broker_order_id": "buy-crwv",
+        "symbol": "CRWV",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {"auto_exit_enabled": True, "price_data_source": "Synthetic"},
+    }]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: False)
+
+    sent, updated, message = _send_exits(
+        control,
+        SimpleNamespace(config=SimpleNamespace(paper=True)),
+        [position],
+        orders,
+        tracked,
+        lambda *_: (_ for _ in ()).throw(AssertionError("Closed-market exits must not load bars")),
+        SimpleNamespace(append=lambda event: None),
+    )
+
+    resolution = resolve_position_plan(position, orders, updated)
+    assert sent == 0
+    assert message == "CRWV auto exit is waiting for regular market hours."
+    assert resolution.exit_settings["price_data_source"] == "Ticker (Alpaca)"
+
+
 def test_worker_stop_wait_checks_control_each_second(monkeypatch):
     checks = []
 

@@ -170,6 +170,73 @@ def test_execution_language_or_invented_numbers_cannot_reach_the_final_recommend
 
     assert run.recommendation.used_fallback
     assert run.recommendation.provider == "deterministic"
+    assert "Strategy Analyst" in run.recommendation.error
+    assert "99" in run.recommendation.error
+    assert run.analyst_draft["recommended_candidate_id"] == "C1"
+
+
+def test_model_prompt_uses_facts_instead_of_the_high_precision_internal_catalog():
+    class PromptInspectingClient(ScriptedClient):
+        def __init__(self):
+            super().__init__()
+            self.prompts = []
+
+        def generate_json(self, prompt, schema):
+            self.prompts.append(prompt)
+            return super().generate_json(prompt, schema)
+
+    result = _search_result()
+    client = PromptInspectingClient()
+    run = run_strategy_recommendation_loop(
+        "TEST",
+        result,
+        LLMResearchConfig(provider="gemini", model="test"),
+        client,
+    )
+
+    assert not run.recommendation.used_fallback
+    assert '"candidate_index"' in client.prompts[0]
+    assert '"candidate_catalog"' not in client.prompts[0]
+    assert '"nearby_top_percent"' not in client.prompts[0]
+    assert '"complete_history_trades"' not in client.prompts[0]
+
+
+def test_reviewer_invented_number_is_rejected_and_saved_for_diagnosis():
+    class UnsafeReviewerClient(ScriptedClient):
+        def generate_json(self, prompt, schema):
+            self.calls += 1
+            if self.calls == 2:
+                return {
+                    "accepted": False,
+                    "primary_objection": "The candidate has a 99 percent failure rate.",
+                    "evidence_ids": ["C1"],
+                    "required_change": "Use more cautious language.",
+                }
+            return {
+                "action": "WATCH FOR A BETTER SETUP",
+                "recommended_candidate_id": "C1",
+                "alternative_candidate_id": "C2",
+                "assessment": "This candidate has some support, but it still needs confirmation.",
+                "why_it_may_work": "The cited evidence includes more than one price section.",
+                "primary_concern": "Historical behavior may not repeat.",
+                "alternative_view": "The alternative deserves comparison.",
+                "next_action": "Review the current setup before a paper test.",
+                "evidence_ids": ["C1", "C2"],
+            }
+
+    result = _search_result()
+    client = UnsafeReviewerClient()
+    run = run_strategy_recommendation_loop(
+        "TEST",
+        result,
+        LLMResearchConfig(provider="gemini", model="test"),
+        client,
+    )
+
+    assert run.recommendation.used_fallback
+    assert "Skeptical Reviewer" in run.recommendation.error
+    assert "99" in run.recommendation.error
+    assert run.reviewer_response["accepted"] is False
 
 
 def test_agent_may_quote_numbers_that_exist_in_cited_evidence():

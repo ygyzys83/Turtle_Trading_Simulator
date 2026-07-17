@@ -434,6 +434,8 @@ def _validated_agent_payload(
     payload: dict[str, Any],
     evidence: StrategySearchEvidence,
     maximum_action: str,
+    *,
+    stage: str = "The agent",
 ) -> dict[str, Any]:
     action = str(payload.get("action", "SKIP")).upper()
     if action not in ALLOWED_ACTIONS:
@@ -481,7 +483,10 @@ def _validated_agent_payload(
         if _normalized_number(token) not in supplied_numbers
     }
     if unsupported_numbers:
-        raise ValueError("The agent used a number that was not present in its cited evidence.")
+        unsupported_text = ", ".join(sorted(unsupported_numbers))
+        raise ValueError(
+            f"{stage} used number(s) that were not present in its cited evidence: {unsupported_text}."
+        )
     forbidden = (
         "buy now",
         "sell now",
@@ -508,10 +513,59 @@ def _normalized_number(value: str) -> str:
         return number
 
 
+def _validated_review_payload(
+    payload: dict[str, Any],
+    evidence: StrategySearchEvidence,
+) -> dict[str, Any]:
+    evidence_ids = tuple(dict.fromkeys(str(item) for item in payload.get("evidence_ids", ())))[:5]
+    if not evidence_ids or any(item not in evidence.facts for item in evidence_ids):
+        raise ValueError("The Skeptical Reviewer cited evidence that was not supplied.")
+    accepted = payload.get("accepted")
+    if not isinstance(accepted, bool):
+        raise ValueError("The Skeptical Reviewer did not return a true/false decision.")
+    review = {
+        "accepted": accepted,
+        "primary_objection": str(payload.get("primary_objection", "")).strip()[:500],
+        "evidence_ids": evidence_ids,
+        "required_change": str(payload.get("required_change", "")).strip()[:500],
+    }
+    if not review["primary_objection"]:
+        raise ValueError("The Skeptical Reviewer omitted its main objection or conclusion.")
+    if not review["accepted"] and not review["required_change"]:
+        raise ValueError("The Skeptical Reviewer rejected the draft without explaining the required change.")
+
+    narrative = f"{review['primary_objection']} {review['required_change']}".lower()
+    cited_text = " ".join(evidence.facts[item] for item in evidence_ids)
+    supplied_numbers = {_normalized_number(token) for token in _number_tokens(cited_text)}
+    unsupported_numbers = {
+        token
+        for token in _number_tokens(narrative)
+        if _normalized_number(token) not in supplied_numbers
+    }
+    if unsupported_numbers:
+        unsupported_text = ", ".join(sorted(unsupported_numbers))
+        raise ValueError(
+            "The Skeptical Reviewer used number(s) that were not present in its cited evidence: "
+            f"{unsupported_text}."
+        )
+    return review
+
+
 def _evidence_prompt(evidence: StrategySearchEvidence) -> str:
+    # Facts are the single canonical numeric source. The full internal candidate
+    # catalog contains higher-precision and diagnostic values that are not all
+    # included in the trader-facing evidence sentences.
+    candidate_index = {
+        candidate_id: {
+            "strategy": candidate.get("strategy"),
+            "interval": candidate.get("interval"),
+            "settings": candidate.get("settings_text"),
+        }
+        for candidate_id, candidate in evidence.candidates.items()
+    }
     return json.dumps({
         "ticker": evidence.ticker,
-        "candidate_catalog": evidence.candidates,
+        "candidate_index": candidate_index,
         "evidence": evidence.facts,
         "rules": [
             "Cite only evidence IDs that appear above.",
@@ -547,6 +601,9 @@ def run_strategy_recommendation_loop(
         )
         return RecommendationLoopRun(fallback, evidence.facts, evidence.candidates)
 
+    draft_raw: dict[str, Any] = {}
+    review_raw: dict[str, Any] = {}
+    editor_raw: dict[str, Any] = {}
     try:
         provider = client
         if provider is None:
@@ -559,7 +616,12 @@ def run_strategy_recommendation_loop(
             "complete sentences.\n" + facts,
             RECOMMENDATION_SCHEMA,
         )
-        draft = _validated_agent_payload(draft_raw, evidence, "USE FOR PAPER TEST")
+        draft = _validated_agent_payload(
+            draft_raw,
+            evidence,
+            "USE FOR PAPER TEST",
+            stage="The Strategy Analyst",
+        )
         review_raw = provider.generate_json(
             "Act as the Skeptical Reviewer. Review the full candidate set, not just the analyst's selection. Challenge "
             "overfitting, weak samples, dependence on one type of price movement, one exceptional trade, unstable nearby "
@@ -568,20 +630,7 @@ def run_strategy_recommendation_loop(
             + facts + "\nANALYST DRAFT:\n" + json.dumps(draft, default=str),
             REVIEW_SCHEMA,
         )
-        review_ids = tuple(dict.fromkeys(str(item) for item in review_raw.get("evidence_ids", ())))[:5]
-        if not review_ids or any(item not in evidence.facts for item in review_ids):
-            raise ValueError("The reviewer cited evidence that was not supplied.")
-        accepted = review_raw.get("accepted")
-        if not isinstance(accepted, bool):
-            raise ValueError("The reviewer did not return a true/false decision.")
-        review = {
-            "accepted": accepted,
-            "primary_objection": str(review_raw.get("primary_objection", "")).strip()[:500],
-            "evidence_ids": review_ids,
-            "required_change": str(review_raw.get("required_change", "")).strip()[:500],
-        }
-        if not review["accepted"] and (not review["primary_objection"] or not review["required_change"]):
-            raise ValueError("The reviewer rejected the draft without explaining the required change.")
+        review = _validated_review_payload(review_raw, evidence)
         editor_maximum_action = draft["action"]
         if not review["accepted"]:
             lower_level = max(0, ACTION_LEVEL[editor_maximum_action] - 1)
@@ -599,7 +648,12 @@ def run_strategy_recommendation_loop(
             + "\nREVIEW:\n" + json.dumps(review, default=str),
             RECOMMENDATION_SCHEMA,
         )
-        editor = _validated_agent_payload(editor_raw, evidence, editor_maximum_action)
+        editor = _validated_agent_payload(
+            editor_raw,
+            evidence,
+            editor_maximum_action,
+            stage="The Decision Editor",
+        )
         selected_candidate = evidence.candidates[editor["candidate_id"]]
         recommendation = StrategyRecommendation(
             created_at=datetime.now(PACIFIC_TIME).isoformat(),
@@ -629,7 +683,14 @@ def run_strategy_recommendation_loop(
         )
     except Exception as exc:
         fallback = _fallback_recommendation(evidence, result, error=str(exc))
-        return RecommendationLoopRun(fallback, evidence.facts, evidence.candidates)
+        return RecommendationLoopRun(
+            fallback,
+            evidence.facts,
+            evidence.candidates,
+            draft_raw,
+            review_raw,
+            editor_raw,
+        )
 
 
 class RecommendationLoopStore:

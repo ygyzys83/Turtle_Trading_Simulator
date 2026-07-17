@@ -278,4 +278,5 @@ def test_management_chart_displays_only_the_latest_ninety_bars_by_default():
     )
 
     assert len(figure.data[0].x) == 90
-    assert figure.layout.title.text is None
+    assert figure.layout.title.text == ""
+    assert figure.layout.xaxis.type == "category"

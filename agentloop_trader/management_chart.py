@@ -365,12 +365,20 @@ def build_management_chart(
             pass
 
     fig.update_layout(
-        title=None,
+        # Streamlit/Plotly can render a null title as the JavaScript text "undefined".
+        # The visible title is rendered immediately above the chart by Streamlit.
+        title=dict(text=""),
         height=500,
         margin=dict(l=16, r=16, t=66, b=32),
         font=dict(color=CHART_COLORS["text"], family="Inter, Segoe UI, sans-serif", size=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0, font=dict(size=9)),
-        xaxis=dict(showgrid=False, rangeslider=dict(visible=False), linecolor=CHART_COLORS["border"]),
+        xaxis=dict(
+            showgrid=False,
+            type="category",
+            nticks=10,
+            rangeslider=dict(visible=False),
+            linecolor=CHART_COLORS["border"],
+        ),
         yaxis=dict(tickprefix="$", gridcolor=CHART_COLORS["grid"], zeroline=False),
         yaxis2=dict(
             range=[0, 100], overlaying="y", side="right", showgrid=False, zeroline=False,

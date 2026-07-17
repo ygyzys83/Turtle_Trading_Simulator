@@ -51,6 +51,7 @@ from agentloop_trader.strategy_runtime import (
     apply_buy_order_style,
     evaluate_exit_settings,
     exit_snapshot_from_details,
+    normalize_managed_exit_settings,
     reprice_trade_intent,
     selected_strategy_result,
 )
@@ -396,11 +397,26 @@ def _send_exits(
         asset_class = normalize_asset_class(position.get("Asset Type"), symbol)
         if not symbol or _number(position.get("Quantity")) <= 0:
             continue
-        if asset_class != "crypto" and not _market_is_open(adapter):
-            continue
         resolution = resolve_position_plan(position, orders, updated)
-        settings = resolution.exit_settings
+        settings = normalize_managed_exit_settings(resolution.exit_settings, position)
         if not resolution.cycle or not resolution.cycle.reliable:
+            continue
+        source_was_repaired = bool(
+            resolution.exit_settings
+            and settings.get("price_data_source")
+            != resolution.exit_settings.get("price_data_source")
+        )
+        if source_was_repaired:
+            updated = upsert_position_plan(
+                position,
+                orders,
+                updated,
+                settings,
+                resolution.entry_settings,
+            )
+        if asset_class != "crypto" and not _market_is_open(adapter):
+            if settings.get("auto_exit_enabled", False):
+                blocked_messages.append(f"{symbol} auto exit is waiting for regular market hours.")
             continue
         details = evaluate_exit_settings(settings, position, fetch_bars)
         exit_snapshot = exit_snapshot_from_details(details)
@@ -411,6 +427,7 @@ def _send_exits(
         )
         if settings and (details.get("state_changed") or snapshot_changed):
             refreshed_settings = dict(settings)
+            refreshed_settings.pop("last_exit_error", None)
             if details.get("highest_high_since_entry") is not None:
                 refreshed_settings["highest_high_since_entry"] = details.get("highest_high_since_entry")
             if details.get("trigger_price") is not None:
@@ -427,6 +444,31 @@ def _send_exits(
                 resolution.entry_settings,
             )
         if not details.get("ready"):
+            calculation_error = str(details.get("reason") or "").strip()
+            if calculation_error.startswith("Could not check saved exit rule:"):
+                prior_error = str(settings.get("last_exit_error") or "").strip()
+                failed_settings = dict(settings)
+                failed_settings["last_exit_error"] = calculation_error
+                failed_settings["last_exit_checked_at"] = datetime.now(PACIFIC_TIME).isoformat()
+                updated = upsert_position_plan(
+                    position,
+                    orders,
+                    updated,
+                    failed_settings,
+                    resolution.entry_settings,
+                )
+                blocked_messages.append(f"{symbol} auto exit could not be calculated: {calculation_error}.")
+                if calculation_error != prior_error:
+                    audit_store.append(AuditEvent(
+                        event_type="worker_paper_exit_calculation_failed",
+                        message="Background worker could not calculate a saved Alpaca paper exit.",
+                        payload={
+                            "symbol": symbol,
+                            "position_cycle_id": resolution.cycle.cycle_id,
+                            "reason": calculation_error,
+                            "price_data_source": settings.get("price_data_source"),
+                        },
+                    ))
             continue
         intent = build_exit_intent_from_position(position)
         if intent is None:
