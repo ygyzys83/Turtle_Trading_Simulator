@@ -902,3 +902,13 @@ Managed Alpaca exit plans now have an explicit invariant: equities always use `T
 - The model now receives one canonical numeric evidence source plus a minimal candidate index. Numeric claims remain restricted to the evidence IDs cited by that response.
 - Analyst, skeptical-reviewer, and editor validation failures now identify the failing stage and unsupported number. Rejected raw stage output is retained in the local recommendation audit record for diagnosis while the app still falls back to the built-in decision.
 - The skeptical reviewer now receives the same numeric evidence validation as the analyst and editor. The full suite passed with 453 tests.
+
+## 2026-07-17 - Touch-scored trendline engine
+
+- Replaced the old newest-two-pivot approximation underneath `Trendline breakout` and `Trendline retest continuation`; no additional user-facing strategy or legacy-version selector was added.
+- Swing-high pivots require two completed bars on each side and at least 0.25 ATR of prominence. Every descending candidate formed inside the saved lookback is evaluated.
+- A candidate is rejected after a completed close through it or a wick beyond its 0.25 ATR tolerance band. Surviving lines are ranked by additional confirmed touches, wider anchor spacing, recency, and pivot prominence.
+- A breakout now requires a completed close above the selected line plus 0.10 ATR. The prior completed close must have been at or below its own buffered level. The retest strategy freezes the selected breakout line before waiting for its retest and upward turn.
+- Live strategy output now records the raw line, exact buffered breakout level, anchors, additional touches, slope, tolerance, and a plain-language quality summary. A missing line no longer lets the trend-filter value masquerade as the next BUY level.
+- Position and queued-setup charts show the selected line, 0.25 ATR wick-tolerance band, 0.10 ATR completed-close breakout line, anchor markers, and additional-touch markers. Sidebar strategy helpers describe these exact executable rules.
+- Added no-lookahead, line-selection, ATR-buffer, BUY-level, queue-label, and chart-overlay regression tests. The full suite passed with 461 tests.

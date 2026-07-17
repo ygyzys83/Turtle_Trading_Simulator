@@ -2032,6 +2032,20 @@ def render_saved_strategy_chart(
         })
     chart_title = f"{symbol} | {interval_value} | {chart_display_settings.get('strategy_label', 'Saved setup')}"
     st.markdown(f"**{chart_title}**")
+    chart_key_suffix = f"{context}_{symbol}_{interval_value}_{chart_display_settings.get('strategy_type', '')}"
+    chart_height_label = st.segmented_control(
+        "Chart height",
+        ["Standard", "Tall", "Extra tall"],
+        default="Standard",
+        key=f"management_chart_height_{chart_key_suffix}",
+        help="Changes only the chart's vertical height. Its width continues to follow the page width.",
+        width="content",
+    )
+    chart_height = {
+        "Standard": 500,
+        "Tall": 700,
+        "Extra tall": 900,
+    }.get(str(chart_height_label), 500)
     figure = build_management_chart(
         chart_data,
         chart_display_settings,
@@ -2040,6 +2054,7 @@ def render_saved_strategy_chart(
         static_levels=levels,
         entry_time=entry_time,
         entry_price=entry_price,
+        height=chart_height,
     )
     st.plotly_chart(
         figure,
@@ -2564,13 +2579,14 @@ strategy_label = st.sidebar.selectbox(
         "the Pullback average zone, defined as no more than 2% above that average. Finally, the latest completed bar must turn up above the Momentum "
         "turn average, that short average must be flat or rising, and the close must exceed the prior close. Its strategy exit is the Sell exit length "
         "moving average.\n\n"
-        "TRENDLINE BREAKOUT: Uses the Buy breakout / trendline lookback to find two confirmed descending swing highs and project a downward-sloping "
-        "resistance line. A BUY requires the prior completed close to be at or below its projected line and the latest completed close to cross above "
-        "the new projected line, while price is above a flat-or-rising Trend filter. Its strategy exit is the lowest Low from the prior Sell exit length bars.\n\n"
-        "TRENDLINE RETEST CONTINUATION: First finds a valid Trendline breakout inside the lookback window. It then waits for a later bar whose Low comes "
-        "within 0.5 ATR above the projected broken trendline while that bar closes at or above the line. A BUY requires the latest completed close to remain "
-        "above the line, exceed the Momentum turn average, and exceed the prior close, with price above a flat-or-rising Trend filter. Its strategy exit is "
-        "the lowest Low from the prior Sell exit length bars.\n\n"
+        "TRENDLINE BREAKOUT: Finds meaningful swing highs confirmed by two completed bars on each side, evaluates every descending line they can form, and "
+        "selects the line with the best combination of additional touches, anchor distance, and recency. A completed close through a candidate invalidates it; "
+        "wicks may touch or slightly exceed the raw line only inside a 0.25 ATR tolerance band. A BUY requires the latest completed close to cross above the selected line plus a 0.10 ATR "
+        "confirmation buffer, while price is above a flat-or-rising Trend filter. Its strategy exit is the lowest Low from the prior Sell exit length bars.\n\n"
+        "TRENDLINE RETEST CONTINUATION: Uses the same touch-scored line and buffered breakout. After that breakout, it freezes the selected line and waits for "
+        "a later bar whose Low comes within 0.5 ATR above the projected broken line while closing at or above it. A BUY requires a later completed close to remain "
+        "above the line, exceed the Momentum turn average, and exceed the prior close, with price above a flat-or-rising Trend filter. Its strategy exit is the "
+        "lowest Low from the prior Sell exit length bars.\n\n"
         "RSI MEAN-REVERSION SCALP: Arms after RSI reaches the selected low level or falls by the selected number of points from a recent RSI high. It buys "
         "only after RSI rebounds by the selected amount and price closes above the prior completed bar. It exits when RSI recovers to the saved exit level, "
         "when enabled price protection is reached, or when the optional maximum holding period is reached."
@@ -2609,11 +2625,13 @@ entry_w = st.sidebar.slider(
         "calculation. Example: with Interval 1h and length 20, suppose the highest High in the previous 20 completed 1-hour bars is $105.00. A BUY can pass "
         "this rule only when the latest completed 1-hour bar closes above $105.00. Increasing the length makes price clear a longer-term high and usually creates "
         "fewer signals. Decreasing it uses a more recent high and usually creates more signals.\n\n"
-        "TRENDLINE BREAKOUT: This is the recent window searched for confirmed swing highs. A swing high must be at least as high as the two bars immediately before "
-        "it and the two bars immediately after it. The app connects two descending swing highs and projects that line to the latest bar. A larger lookback can use older, "
-        "broader resistance; a smaller lookback focuses on newer, shorter resistance.\n\n"
-        "TRENDLINE RETEST CONTINUATION: The same window is used to find the original descending trendline breakout and then its later retest. It is not a fixed number of "
-        "bars that price must wait before buying."
+        "TRENDLINE BREAKOUT: This is the recent window searched for confirmed swing highs. A swing high must be at least as high as the two completed bars immediately "
+        "before it and the two completed bars immediately after it, and it must stand out by at least 0.25 ATR. The app evaluates all descending lines formed by those "
+        "pivots. It rejects a line after a completed close through it or a wick beyond its 0.25 ATR tolerance, and prefers more confirming touches, "
+        "wider anchor spacing, then more recent anchors. Two anchors can define a line; extra touches make it stronger. A BUY requires a completed close above the line "
+        "plus 0.10 ATR. Example: if the line is $100 and ATR is $2, the required completed-bar close is above $100.20.\n\n"
+        "TRENDLINE RETEST CONTINUATION: The same window and line-selection rules find the original breakout. The chosen line is then frozen while the app waits for the "
+        "retest and upward turn. This input is not a fixed number of bars that price must wait before buying."
     ),
 )
 exit_w = st.sidebar.slider(

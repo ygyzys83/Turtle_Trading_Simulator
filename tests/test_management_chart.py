@@ -70,6 +70,23 @@ def test_queue_chart_includes_numeric_buy_and_projected_stop():
     assert values["ATR-only stop reference if bought now"] == 97.0
 
 
+def test_trendline_queue_level_is_labeled_as_the_completed_close_requirement():
+    levels = queued_price_levels(
+        current_price=99.0,
+        settings={"atr_stop_multiplier": 1.5},
+        live={
+            "last_atr": 2.0,
+            "trendline_breakout_level": 100.2,
+            "trend_filter_level": 105.0,
+        },
+        next_buy_level=100.2,
+    )
+
+    names = [row["name"] for row in levels]
+    assert "Required completed-close breakout" in names
+    assert "Next numeric BUY level" not in names
+
+
 def test_profit_levels_and_trend_filter_use_distinct_styles():
     levels = position_price_levels(
         entry_price=100.0,
@@ -265,6 +282,43 @@ def test_overlay_last_values_match_live_strategy_levels():
     assert traces["10-bar strategy exit"].y[-1] == pytest.approx(data["Close"].iloc[-10:].mean())
 
 
+def test_trendline_chart_shows_selected_line_buffer_anchors_and_confirming_touches():
+    data = market_frame()
+    result = {
+        "prices": data["Close"].to_numpy(),
+        "smas": data["Close"].rolling(20).mean().tolist(),
+        "atrs": [2.0] * len(data),
+        "live": {
+            "trendline_level": 118.0,
+            "trendline_slope": -0.1,
+            "trendline_anchor_indices": [20, 40],
+            "trendline_touch_indices": [60],
+            "trendline_tolerance_atr": 0.25,
+            "trendline_breakout_buffer_atr": 0.10,
+        },
+    }
+
+    figure = build_management_chart(
+        data,
+        {
+            "strategy_type": "trendline",
+            "entry_window": 20,
+            "exit_window": 10,
+            "moving_average_window": 20,
+        },
+        result,
+        title="Trendline",
+        static_levels=[],
+    )
+
+    names = [trace.name for trace in figure.data]
+    assert "Selected descending trendline" in names
+    assert "Allowed wick tolerance (0.25 ATR)" in names
+    assert "Required completed-close breakout (line + 0.10 ATR)" in names
+    assert "Trendline anchors" in names
+    assert "Additional confirming touches" in names
+
+
 def test_management_chart_displays_only_the_latest_ninety_bars_by_default():
     data = market_frame(220)
     result = {"prices": data["Close"].to_numpy(), "smas": [], "live": {}}
@@ -280,3 +334,19 @@ def test_management_chart_displays_only_the_latest_ninety_bars_by_default():
     assert len(figure.data[0].x) == 90
     assert figure.layout.title.text == ""
     assert figure.layout.xaxis.type == "category"
+
+
+def test_management_chart_accepts_independent_vertical_height():
+    data = market_frame(180)
+    result = {"prices": data["Close"].to_numpy(), "smas": [], "live": {}}
+
+    figure = build_management_chart(
+        data,
+        {"strategy_type": "atr_only"},
+        result,
+        title="Tall chart",
+        static_levels=[],
+        height=900,
+    )
+
+    assert figure.layout.height == 900

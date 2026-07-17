@@ -17,6 +17,19 @@ from agentloop_trader.models import BacktestResult, RiskLimits, StrategyConfig, 
 from agentloop_trader.performance import allocation_metrics, elapsed_years
 
 
+@dataclass(frozen=True)
+class DescendingTrendline:
+    """A completed-bar trendline selected from confirmed swing-high pivots."""
+
+    intercept: float
+    slope: float
+    anchors: tuple[int, int]
+    touch_indices: tuple[int, ...] = ()
+    wick_violations: int = 0
+    tolerance_atr: float = 0.25
+    breakout_buffer_atr: float = 0.10
+
+
 def _max_drawdown_pct(equity_curve: list[float]) -> float:
     if not equity_curve:
         return 0.0
@@ -390,14 +403,26 @@ def _market_arrays(seed: int | None, market_data=None):
     return prices, highs, lows, volumes, n_bars, labels, symbol
 
 
-def _trendline_crossed(prices, line: tuple[float, float, tuple[int, int]] | None, index: int) -> tuple[bool, float | None]:
+def _trendline_crossed(
+    prices,
+    line: DescendingTrendline | None,
+    index: int,
+    atrs=None,
+) -> tuple[bool, float | None]:
     if line is None or index <= 0:
         return False, None
-    intercept, slope, (x1, _) = line
-    current_level = _trendline_value(intercept, slope, x1, index)
-    previous_level = _trendline_value(intercept, slope, x1, index - 1)
-    crossed = float(prices[index - 1]) <= previous_level and float(prices[index]) > current_level
-    return bool(crossed), current_level
+    x1, _ = line.anchors
+    current_level = _trendline_value(line.intercept, line.slope, x1, index)
+    previous_level = _trendline_value(line.intercept, line.slope, x1, index - 1)
+    current_atr = _trendline_atr(atrs, index)
+    previous_atr = _trendline_atr(atrs, index - 1)
+    current_breakout = current_level + line.breakout_buffer_atr * current_atr
+    previous_breakout = previous_level + line.breakout_buffer_atr * previous_atr
+    crossed = (
+        float(prices[index - 1]) <= previous_breakout
+        and float(prices[index]) > current_breakout
+    )
+    return bool(crossed), current_breakout
 
 
 def _live_retest_context(
@@ -409,33 +434,39 @@ def _live_retest_context(
     momentum_smas,
     index: int,
     lookback: int,
-) -> tuple[bool, float | None, float | None]:
+) -> tuple[bool, DescendingTrendline | None, float | None]:
     """Reconstruct a prior trendline breakout and later retest for the live bar."""
     source = highs if highs is not None else prices
     start = max(lookback, index - lookback)
-    latest: tuple[int, float, float, int] | None = None
+    latest: tuple[int, DescendingTrendline] | None = None
     for breakout_index in range(start, index):
-        line = _recent_descending_trendline(source, breakout_index, lookback)
-        crossed, _ = _trendline_crossed(prices, line, breakout_index)
+        line = _recent_descending_trendline(
+            source,
+            breakout_index,
+            lookback,
+            closes=prices,
+            atrs=atrs,
+        )
+        crossed, _ = _trendline_crossed(prices, line, breakout_index, atrs)
         sma = smas[breakout_index]
         prev_sma = smas[breakout_index - 1] if breakout_index > 0 else sma
         trend_ok = bool(sma is not None and prev_sma is not None and prices[breakout_index] > sma and sma >= prev_sma)
         if crossed and trend_ok and line is not None:
-            intercept, slope, (x1, _) = line
-            latest = (breakout_index, intercept, slope, x1)
+            latest = (breakout_index, line)
     if latest is None:
         return False, None, None
-    breakout_index, intercept, slope, x1 = latest
+    breakout_index, line = latest
+    x1, _ = line.anchors
     retest_seen = False
     for retest_index in range(breakout_index + 1, index + 1):
         atr = atrs[retest_index]
         if atr is None:
             continue
-        level = _trendline_value(intercept, slope, x1, retest_index)
+        level = _trendline_value(line.intercept, line.slope, x1, retest_index)
         low_value = float(lows[retest_index]) if lows is not None else float(prices[retest_index])
         if low_value <= level + float(atr) * 0.5 and float(prices[retest_index]) >= level:
             retest_seen = True
-    current_level = _trendline_value(intercept, slope, x1, index)
+    current_level = _trendline_value(line.intercept, line.slope, x1, index)
     momentum_sma = momentum_smas[index]
     momentum_turn = bool(
         retest_seen
@@ -443,7 +474,7 @@ def _live_retest_context(
         and float(prices[index]) > float(momentum_sma)
         and float(prices[index]) > float(prices[index - 1])
     )
-    return momentum_turn and float(prices[index]) >= current_level, current_level, slope
+    return momentum_turn and float(prices[index]) >= current_level, line, current_level
 
 
 def _volume_status(volumes, index: int, window: int = 20) -> tuple[str, bool | None]:
@@ -508,28 +539,100 @@ def _liquidity_status(prices, volumes, index: int, window: int = 20) -> str:
     return "Thin"
 
 
-def _recent_descending_trendline(prices, end_index: int, lookback: int, pivot_window: int = 2) -> tuple[float, float, tuple[int, int]] | None:
+def _trendline_atr(atrs, index: int) -> float:
+    if atrs is not None and 0 <= index < len(atrs):
+        value = atrs[index]
+        if value is not None and np.isfinite(value) and float(value) > 0:
+            return float(value)
+    return 0.0
+
+
+def _clustered_touch_indices(indices: list[int], minimum_gap: int) -> tuple[int, ...]:
+    clustered: list[int] = []
+    for index in indices:
+        if not clustered or index - clustered[-1] >= minimum_gap:
+            clustered.append(index)
+    return tuple(clustered)
+
+
+def _recent_descending_trendline(
+    prices,
+    end_index: int,
+    lookback: int,
+    pivot_window: int = 2,
+    *,
+    closes=None,
+    atrs=None,
+) -> DescendingTrendline | None:
+    """Choose the strongest valid descending line using only confirmed prior pivots."""
     start = max(pivot_window, end_index - lookback)
-    swing_highs: list[tuple[int, float]] = []
-    for idx in range(start, end_index - pivot_window):
+    last_confirmed_pivot = end_index - pivot_window
+    if last_confirmed_pivot < start:
+        return None
+
+    swing_highs: list[tuple[int, float, float]] = []
+    for idx in range(start, last_confirmed_pivot + 1):
         left = prices[idx - pivot_window:idx]
         right = prices[idx + 1:idx + 1 + pivot_window]
         if len(left) < pivot_window or len(right) < pivot_window:
             continue
         value = float(prices[idx])
-        if value >= max(left) and value >= max(right):
-            swing_highs.append((idx, value))
+        if value < max(left) or value < max(right):
+            continue
+        prominence = value - max(float(min(left)), float(min(right)))
+        atr = _trendline_atr(atrs, idx)
+        if atr > 0 and prominence < atr * 0.25:
+            continue
+        swing_highs.append((idx, value, prominence / atr if atr > 0 else prominence))
 
-    for right_idx in range(len(swing_highs) - 1, 0, -1):
-        x2, y2 = swing_highs[right_idx]
-        for left_idx in range(right_idx - 1, -1, -1):
-            x1, y1 = swing_highs[left_idx]
-            if x2 <= x1 or y2 >= y1:
+    minimum_spacing = max(pivot_window + 1, min(5, max(3, lookback // 8)))
+    candidates: list[tuple[tuple[float, ...], DescendingTrendline]] = []
+    close_values = closes if closes is not None else prices
+    for left_position in range(len(swing_highs) - 1):
+        x1, y1, prominence1 = swing_highs[left_position]
+        for right_position in range(left_position + 1, len(swing_highs)):
+            x2, y2, prominence2 = swing_highs[right_position]
+            if x2 - x1 < minimum_spacing or y2 >= y1:
                 continue
             slope = (y2 - y1) / (x2 - x1)
-            if slope < 0:
-                return y1, slope, (x1, x2)
-    return None
+            if slope >= 0:
+                continue
+
+            wick_violations = 0
+            close_violations = 0
+            touches: list[int] = []
+            for idx in range(x1, end_index):
+                level = _trendline_value(y1, slope, x1, idx)
+                tolerance = 0.25 * _trendline_atr(atrs, idx)
+                high_value = float(prices[idx])
+                close_value = float(close_values[idx])
+                if idx > x2 and close_value > level + tolerance:
+                    close_violations += 1
+                elif idx not in (x1, x2) and high_value > level + tolerance:
+                    wick_violations += 1
+                if idx not in (x1, x2) and abs(high_value - level) <= tolerance:
+                    touches.append(idx)
+
+            # A completed close through the line means this is no longer active.
+            if close_violations or wick_violations:
+                continue
+            confirming_touches = _clustered_touch_indices(touches, minimum_spacing)
+            line = DescendingTrendline(
+                intercept=y1,
+                slope=slope,
+                anchors=(x1, x2),
+                touch_indices=confirming_touches,
+                wick_violations=wick_violations,
+            )
+            score = (
+                float(len(confirming_touches)),
+                float(x2 - x1),
+                float(x2),
+                float(prominence1 + prominence2),
+            )
+            candidates.append((score, line))
+
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
 
 
 def _trendline_value(intercept_at_x1: float, slope: float, x1: int, index: int) -> float:
@@ -1277,11 +1380,13 @@ def simulate_trendline_breakout_strategy(
             equity_curve.append(balance)
             continue
         trendline_source = highs if highs is not None else prices
-        line = _recent_descending_trendline(trendline_source, i, trendline_w)
+        line = _recent_descending_trendline(
+            trendline_source, i, trendline_w, closes=prices, atrs=atrs
+        )
         trendline_level = None
         crossed_trendline = False
         if line is not None:
-            crossed_trendline, trendline_level = _trendline_crossed(prices, line, i)
+            crossed_trendline, trendline_level = _trendline_crossed(prices, line, i, atrs)
         prev_sma = smas[i - 1] if smas[i - 1] is not None else sma
         trend_ok = bool(p > sma and sma >= prev_sma)
         exit_source = lows if lows is not None else prices
@@ -1438,7 +1543,7 @@ def simulate_trendline_retest_strategy(
     in_trade = False
     waiting_retest = False
     retest_seen = False
-    breakout_line: tuple[float, float, int] | None = None
+    breakout_line: DescendingTrendline | None = None
     breakout_bar: int | None = None
     entry_price = stop_price = initial_stop_price = shares = entry_bar = 0
     high_since_entry = 0.0
@@ -1467,7 +1572,9 @@ def simulate_trendline_retest_strategy(
             equity_curve.append(balance)
             continue
         trendline_source = highs if highs is not None else prices
-        line = _recent_descending_trendline(trendline_source, i, trendline_w)
+        line = _recent_descending_trendline(
+            trendline_source, i, trendline_w, closes=prices, atrs=atrs
+        )
         prev_sma = smas[i - 1] if smas[i - 1] is not None else sma
         trend_ok = bool(p > sma and sma >= prev_sma)
         exit_source = lows if lows is not None else prices
@@ -1480,16 +1587,17 @@ def simulate_trendline_retest_strategy(
                 breakout_line = None
                 breakout_bar = None
             if not waiting_retest and line is not None:
-                crossed_trendline, level = _trendline_crossed(prices, line, i)
-                intercept, slope, (x1, _) = line
+                crossed_trendline, level = _trendline_crossed(prices, line, i, atrs)
                 if crossed_trendline and trend_ok:
                     waiting_retest = True
                     retest_seen = False
-                    breakout_line = (intercept, slope, x1)
+                    breakout_line = line
                     breakout_bar = i
             elif waiting_retest and breakout_line is not None:
-                intercept, slope, x1 = breakout_line
-                level = _trendline_value(intercept, slope, x1, i)
+                x1, _ = breakout_line.anchors
+                level = _trendline_value(
+                    breakout_line.intercept, breakout_line.slope, x1, i
+                )
                 low_value = float(lows[i]) if lows is not None else p
                 if low_value <= level + atr * 0.5 and p >= level:
                     retest_seen = True
@@ -1651,25 +1759,35 @@ def _trendline_live_fields(
     last_atr = atrs[index]
     last_sma = smas[index]
     trendline_source = highs if highs is not None else prices
-    line = _recent_descending_trendline(trendline_source, index, lookback)
+    line = _recent_descending_trendline(
+        trendline_source, index, lookback, closes=prices, atrs=atrs
+    )
     trendline_level = None
+    trendline_breakout_level = None
     trendline_slope = None
     if line is not None:
-        intercept, slope, (x1, _) = line
-        trendline_level = _trendline_value(intercept, slope, x1, index)
-        trendline_slope = slope
+        x1, _ = line.anchors
+        trendline_level = _trendline_value(line.intercept, line.slope, x1, index)
+        trendline_breakout_level = trendline_level + line.breakout_buffer_atr * _trendline_atr(atrs, index)
+        trendline_slope = line.slope
     prev_sma = next((smas[i] for i in range(index - 1, -1, -1) if smas[i] is not None), last_sma)
     trend_ok = bool(last_sma and prev_sma and last_p > last_sma and last_sma >= prev_sma)
-    crossed_trendline, _ = _trendline_crossed(prices, line, index)
+    crossed_trendline, _ = _trendline_crossed(prices, line, index, atrs)
     trendline_break = bool(trendline_level is not None and crossed_trendline and trend_ok)
     retest_ready = False
+    retest_line = None
     if require_retest and momentum_smas is not None:
-        retest_ready, retest_level, retest_slope = _live_retest_context(
+        retest_ready, retest_line, retest_level = _live_retest_context(
             prices, highs, lows, smas, atrs, momentum_smas, index, lookback
         )
-        if retest_level is not None:
+        if retest_line is not None and retest_level is not None:
+            line = retest_line
             trendline_level = retest_level
-            trendline_slope = retest_slope
+            trendline_breakout_level = (
+                retest_level
+                + retest_line.breakout_buffer_atr * _trendline_atr(atrs, index)
+            )
+            trendline_slope = retest_line.slope
         retest_ready = bool(retest_ready and trend_ok)
     structural_entry_ready = retest_ready if require_retest else trendline_break
     rsi_entry_ready = _rsi_entry_allowed(rsis, index, rsi_entry_filter_enabled)
@@ -1717,8 +1835,12 @@ def _trendline_live_fields(
         )
 
     buy_requirements = {
-        f"Descending trendline found in last {lookback} bars": trendline_level is not None,
-        "Price above trendline": trendline_break,
+        f"Touch-scored descending trendline found in last {lookback} bars": trendline_level is not None,
+        (
+            "Prior completed bar broke above trendline"
+            if require_retest
+            else "Completed bar crossed above buffered trendline"
+        ): bool(retest_line is not None) if require_retest else trendline_break,
         f"{lookback}-bar trendline slopes down": bool(trendline_slope is not None and trendline_slope < 0),
         "Retest held trendline": True if not require_retest else retest_ready,
         "Position size above zero": pos_size > 0,
@@ -1729,11 +1851,11 @@ def _trendline_live_fields(
     if proposed_trade_intent is not None:
         no_trade_reason = "BUY intent is present."
     elif trendline_level is None:
-        no_trade_reason = f"No BUY because a clean descending trendline was not found in the last {lookback} bars."
+        no_trade_reason = f"No BUY because a valid touch-scored descending trendline was not found in the last {lookback} bars."
     elif structural_entry_ready and not rsi_entry_ready:
         no_trade_reason = f"No BUY because RSI({RSI_ENTRY_LENGTH}) is outside the required {RSI_ENTRY_MIN:.0f}-{RSI_ENTRY_MAX:.0f} range."
     elif not require_retest and not trendline_break:
-        no_trade_reason = "No BUY because price has not broken above the descending trendline."
+        no_trade_reason = "No BUY because a completed bar has not crossed above the trendline plus its ATR buffer."
     elif require_retest and not retest_ready:
         no_trade_reason = "No BUY because price has not retested the broken trendline and turned back up."
     elif pos_size <= 0:
@@ -1762,9 +1884,21 @@ def _trendline_live_fields(
         momentum_turn=retest_ready if require_retest else trendline_break,
     )
     live["trendline_level"] = trendline_level
+    live["trendline_breakout_level"] = trendline_breakout_level
     live["trendline_slope"] = trendline_slope
     live["trendline_break"] = trendline_break
     live["retest_ready"] = retest_ready
+    live["trendline_anchor_indices"] = list(line.anchors) if line is not None else []
+    live["trendline_touch_indices"] = list(line.touch_indices) if line is not None else []
+    live["trendline_wick_violations"] = line.wick_violations if line is not None else None
+    live["trendline_tolerance_atr"] = line.tolerance_atr if line is not None else None
+    live["trendline_breakout_buffer_atr"] = line.breakout_buffer_atr if line is not None else None
+    live["trendline_quality"] = (
+        f"2 anchors + {len(line.touch_indices)} additional confirmed touch"
+        f"{'es' if len(line.touch_indices) != 1 else ''}"
+        if line is not None
+        else "No valid line"
+    )
     live.update({
         "entry_window": lookback,
         "trend_window": ma_w,

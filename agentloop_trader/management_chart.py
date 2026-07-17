@@ -150,9 +150,16 @@ def queued_price_levels(
         if current_price is not None and current_atr is not None and atr_multiplier is not None
         else None
     )
+    buy_label = "Next numeric BUY level"
+    breakout_level = _number(live.get("trendline_breakout_level"))
+    trend_filter_level = _number(live.get("trend_filter_level"))
+    if next_buy_level is not None and breakout_level is not None and abs(next_buy_level - breakout_level) < 0.01:
+        buy_label = "Required completed-close breakout"
+    elif next_buy_level is not None and trend_filter_level is not None and abs(next_buy_level - trend_filter_level) < 0.01:
+        buy_label = "Required trend filter level"
     return _deduplicate_levels([
         _level("Current quote", current_price, CHART_COLORS["price"], "dot", 1.2, 30),
-        _level("Next numeric BUY level", next_buy_level, CHART_COLORS["entry"], "solid", 2.1, 90),
+        _level(buy_label, next_buy_level, CHART_COLORS["entry"], "solid", 2.1, 90),
         _level("ATR-only stop reference if bought now", projected_stop, CHART_COLORS["sell"], "dot", 1.2, 20),
     ])
 
@@ -216,6 +223,7 @@ def build_management_chart(
     entry_time: Any = None,
     entry_price: float | None = None,
     max_bars: int = 90,
+    height: int = 500,
 ) -> go.Figure:
     """Plot the exact saved strategy context without running any new decision logic."""
     if market_data is None or market_data.empty or "Close" not in market_data:
@@ -281,10 +289,62 @@ def build_management_chart(
         trendline_slope = _number(live.get("trendline_slope"))
         if trendline_level is not None and trendline_slope is not None:
             line_values = pd.Series(np.nan, index=frame.index, dtype="float64")
-            line_start = max(0, total - entry_window)
+            anchors = [int(value) for value in live.get("trendline_anchor_indices", []) if value is not None]
+            touches = [int(value) for value in live.get("trendline_touch_indices", []) if value is not None]
+            line_start = max(0, anchors[0] if anchors else total - entry_window)
             for index in range(line_start, total):
                 line_values.iloc[index] = trendline_level + trendline_slope * (index - (total - 1))
-            overlays.append(("Current descending trendline", line_values, CHART_COLORS["entry"]))
+            fig.add_trace(go.Scatter(
+                x=x,
+                y=line_values.iloc[start:],
+                name="Selected descending trendline",
+                mode="lines",
+                line=dict(color=CHART_COLORS["entry"], width=1.8, dash="solid"),
+            ))
+            result_atrs = list(result.get("atrs") or [])[-total:]
+            tolerance_atr = _number(live.get("trendline_tolerance_atr")) or 0.25
+            if len(result_atrs) == total:
+                tolerance = pd.Series(
+                    [
+                        float(value) * tolerance_atr if value is not None and np.isfinite(value) else np.nan
+                        for value in result_atrs
+                    ],
+                    index=frame.index,
+                    dtype="float64",
+                )
+                lower = line_values - tolerance
+                upper = line_values + tolerance
+                fig.add_trace(go.Scatter(
+                    x=x, y=lower.iloc[start:], mode="lines", showlegend=False,
+                    hoverinfo="skip", line=dict(width=0),
+                ))
+                fig.add_trace(go.Scatter(
+                    x=x, y=upper.iloc[start:], name="Allowed wick tolerance (0.25 ATR)",
+                    mode="lines", hoverinfo="skip", line=dict(width=0),
+                    fill="tonexty", fillcolor="rgba(57, 208, 122, 0.10)",
+                ))
+                breakout_buffer_atr = _number(live.get("trendline_breakout_buffer_atr")) or 0.10
+                breakout_values = line_values + tolerance * (breakout_buffer_atr / tolerance_atr)
+                fig.add_trace(go.Scatter(
+                    x=x,
+                    y=breakout_values.iloc[start:],
+                    name="Required completed-close breakout (line + 0.10 ATR)",
+                    mode="lines",
+                    line=dict(color="#72A7FF", width=1.3, dash="dot"),
+                ))
+            for marker_name, indices, symbol, color in (
+                ("Trendline anchors", anchors, "diamond", "#F4B942"),
+                ("Additional confirming touches", touches, "circle-open", "#B388FF"),
+            ):
+                visible_indices = [value for value in indices if start <= value < total]
+                if visible_indices:
+                    fig.add_trace(go.Scatter(
+                        x=[frame.index[value] for value in visible_indices],
+                        y=[float(high.iloc[value]) for value in visible_indices],
+                        name=marker_name,
+                        mode="markers",
+                        marker=dict(symbol=symbol, size=9, color=color, line=dict(width=1)),
+                    ))
         momentum_level = int(settings.get("momentum_turn_length", 10))
         if strategy_type == "trendline_retest":
             overlays.append((f"{momentum_level}-bar momentum average", _rolling(close, momentum_level, operation="mean"), CHART_COLORS["atr"]))
@@ -368,7 +428,7 @@ def build_management_chart(
         # Streamlit/Plotly can render a null title as the JavaScript text "undefined".
         # The visible title is rendered immediately above the chart by Streamlit.
         title=dict(text=""),
-        height=500,
+        height=max(360, min(int(height), 1200)),
         margin=dict(l=16, r=16, t=66, b=32),
         font=dict(color=CHART_COLORS["text"], family="Inter, Segoe UI, sans-serif", size=10),
         legend=dict(orientation="h", yanchor="bottom", y=1.01, x=0, font=dict(size=9)),

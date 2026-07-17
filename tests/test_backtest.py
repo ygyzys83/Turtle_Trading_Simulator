@@ -2,6 +2,9 @@ from agentloop_trader.backtest import (
     _BacktestSessionRisk,
     _backtest_session_keys,
     _build_stats,
+    _recent_descending_trendline,
+    _trendline_crossed,
+    DescendingTrendline,
     simulate_rsi_mean_reversion_strategy,
     simulate_trendline_breakout_strategy,
     simulate_trendline_retest_strategy,
@@ -374,7 +377,7 @@ def test_pullback_sell_exit_length_changes_backtest_exits():
 
 
 def test_latest_bar_trendline_breakout_generates_trade_intent():
-    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 97, 99, 95, 106]
+    prices = [100, 105, 110, 105, 100, 98, 104, 108, 103, 99, 97, 100, 103, 101, 98, 96, 97, 98, 95, 106]
     market_data = pd.DataFrame(
         {
             "Close": prices,
@@ -400,8 +403,10 @@ def test_latest_bar_trendline_breakout_generates_trade_intent():
     assert live["signal"] == "long"
     assert live["trade_intent"] is not None
     assert live["trade_intent"].symbol == "TL"
-    assert live["buy_requirements"]["Descending trendline found in last 15 bars"] is True
-    assert live["buy_requirements"]["Price above trendline"] is True
+    assert live["buy_requirements"]["Touch-scored descending trendline found in last 15 bars"] is True
+    assert live["buy_requirements"]["Completed bar crossed above buffered trendline"] is True
+    assert live["trendline_breakout_level"] > live["trendline_level"]
+    assert len(live["trendline_anchor_indices"]) == 2
     assert live["no_trade_reason"] == "BUY intent is present."
 
 
@@ -455,6 +460,50 @@ def test_trendline_breakout_requires_a_new_crossing_not_merely_price_above_line(
 
     assert live["signal"] == "flat"
     assert live["trendline_break"] is False
+
+
+def test_touch_scored_trendline_prefers_the_line_confirmed_by_more_pivots():
+    highs = [104.0 - 0.5 * index for index in range(25)]
+    for index, value in ((2, 110.0), (8, 106.0), (14, 102.0), (20, 98.0)):
+        highs[index] = value
+    closes = [value - 1.0 for value in highs]
+    atrs = [2.0] * len(highs)
+
+    line = _recent_descending_trendline(
+        highs, 24, 24, closes=closes, atrs=atrs
+    )
+
+    assert line is not None
+    assert line.anchors == (2, 20)
+    assert line.touch_indices == (8, 14)
+    assert line.wick_violations == 0
+
+
+def test_trendline_selection_does_not_look_at_uncompleted_future_pivots():
+    highs = [90.0, 95.0, 110.0, 96.0, 94.0, 92.0, 90.0, 91.0, 106.0, 90.0,
+             88.0, 87.0, 86.0, 85.0, 102.0, 84.0, 83.0, 82.0, 81.0, 80.0,
+             150.0, 160.0, 170.0]
+    closes = [value - 1.0 for value in highs]
+    atrs = [2.0] * len(highs)
+
+    original = _recent_descending_trendline(highs, 19, 19, closes=closes, atrs=atrs)
+    changed_future = list(highs)
+    changed_future[20:] = [300.0, 50.0, 400.0]
+    repeated = _recent_descending_trendline(changed_future, 19, 19, closes=closes, atrs=atrs)
+
+    assert original == repeated
+
+
+def test_trendline_breakout_requires_the_atr_confirmation_buffer():
+    line = DescendingTrendline(intercept=100.0, slope=0.0, anchors=(0, 1))
+    atrs = [2.0, 2.0]
+
+    below_buffer, required = _trendline_crossed([100.0, 100.1], line, 1, atrs)
+    above_buffer, _ = _trendline_crossed([100.0, 100.3], line, 1, atrs)
+
+    assert required == 100.2
+    assert below_buffer is False
+    assert above_buffer is True
 
 
 def test_final_backtest_equity_includes_latest_open_position_value():

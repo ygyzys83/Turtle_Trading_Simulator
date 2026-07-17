@@ -190,8 +190,10 @@ def setup_scorecard_records(
         ]
     elif setup_type in {"trendline", "trendline_retest"}:
         trendline_level = _as_float(live.get("trendline_level"))
+        breakout_level = _as_float(live.get("trendline_breakout_level"))
         trendline_break = bool(live.get("trendline_break"))
         retest_ready = bool(live.get("retest_ready"))
+        quality = str(live.get("trendline_quality") or "No valid line")
         setup_ready = signal == "long"
         core_rows = [
             {
@@ -203,15 +205,23 @@ def setup_scorecard_records(
                 "Read": "Trendline",
                 "Status": "Found" if trendline_level > 0 else "Not found",
                 "Plain English": (
-                    f"Descending trendline level is near ${trendline_level:,.2f}."
+                    f"The selected descending trendline is near ${trendline_level:,.2f}; quality: {quality.lower()}."
                     if trendline_level > 0
-                    else "No clean descending trendline was found."
+                    else "No valid touch-scored descending trendline was found."
                 ),
             },
             {
-                "Read": "Break above line",
+                "Read": "Completed-close breakout",
                 "Status": "Yes" if trendline_break else "No",
-                "Plain English": "Price is above the descending trendline." if trendline_break else "Price has not cleared the descending trendline.",
+                "Plain English": (
+                    f"A completed bar crossed above the required ${breakout_level:,.2f} level."
+                    if trendline_break and breakout_level > 0
+                    else (
+                        f"Waiting for a completed bar to cross above ${breakout_level:,.2f}; this includes the 0.10 ATR confirmation buffer."
+                        if breakout_level > 0
+                        else "A valid line is required before an exact breakout price can be calculated."
+                    )
+                ),
             },
         ]
         if setup_type == "trendline_retest":

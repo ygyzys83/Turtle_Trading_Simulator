@@ -92,8 +92,23 @@ def build_buy_level_snapshot(
         add("Momentum turn", f"Price {_money(current)}; short average {_money(momentum)}", f"Completed {timeframe} bar above {_money(momentum_target)} while the short average is rising", _status(requirements, "momentum turned"), "After the pullback, price and the short average must turn back up.", momentum_target)
     elif setup_type in {"trendline", "trendline_retest"}:
         line = _number(live.get("trendline_level"))
-        add("Descending trendline", _money(line), "A valid downward-sloping line exists", _status(requirements, "trendline found"), "The app must be able to fit a descending line to recent highs.")
-        add("Price above trendline", _money(current), f"Completed {timeframe} bar above {_money(line)}", _status(requirements, "price above trendline"), "This is the current projected trendline price.", line)
+        breakout = _number(live.get("trendline_breakout_level"))
+        quality = str(live.get("trendline_quality") or "No valid line")
+        add(
+            "Descending trendline",
+            quality,
+            "Two meaningful descending swing-high anchors with no completed-close violation",
+            _status(requirements, "touch-scored descending trendline"),
+            "The app compares recent descending lines and selects the one with the best confirmed touches, span, and recency.",
+        )
+        add(
+            "Completed-close breakout",
+            _money(current),
+            f"Completed {timeframe} bar closes above {_money(breakout)}",
+            _status(requirements, "buffered trendline") if setup_type == "trendline" else _status(requirements, "prior completed bar"),
+            f"The trendline itself is {_money(line)}. The required close adds a 0.10 ATR buffer so a one-cent move above the line does not count.",
+            breakout,
+        )
         if setup_type == "trendline_retest":
             add("Retest and turn up", str(live.get("retest_description") or "Current pattern"), "Broken line is retested and momentum turns up", _status(requirements, "retest held"), "This requires a sequence of bars, so one exact BUY price would be misleading.")
         add("Trend filter", f"Price {_money(current)}; filter {_money(trend_level)}", "Price above a flat or rising trend filter", "Pass" if bool(live.get("trend_ok")) else "Not met", "The broader trend must support the setup.", trend_level)
@@ -131,6 +146,9 @@ def build_buy_level_snapshot(
 
     passed = sum(row["Status"] == "Pass" for row in rows)
     total = len(rows)
+    if setup_type in {"trendline", "trendline_retest"} and _number(live.get("trendline_level")) is None:
+        # A moving-average level is not a substitute for a trendline that does not exist.
+        actionable_target = None
     return {
         "records": rows or [{
             "Required BUY Rule": "Selected strategy rules",
