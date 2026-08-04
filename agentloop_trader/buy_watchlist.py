@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import time as time_module
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 from agentloop_trader.models import PACIFIC_TIME
 
@@ -58,10 +62,7 @@ class BuyWatchlistStore:
     def read(self) -> list[BuyWatchPlan]:
         if not self.path.exists():
             return []
-        try:
-            payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, OSError):
-            return []
+        payload = self._read_payload(self.path)
         allowed = {field.name for field in BuyWatchPlan.__dataclass_fields__.values()}
         rows = payload if isinstance(payload, list) else []
         return [
@@ -71,55 +72,119 @@ class BuyWatchlistStore:
         ]
 
     def replace_all(self, plans: list[BuyWatchPlan]) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = self.path.with_suffix(self.path.suffix + ".tmp")
-        temporary.write_text(
-            json.dumps([asdict(plan) for plan in plans], indent=2, sort_keys=True, default=str),
-            encoding="utf-8",
-        )
-        temporary.replace(self.path)
+        with self._exclusive_lock():
+            self._replace_all_unlocked(plans)
 
     def upsert(self, plan: BuyWatchPlan) -> BuyWatchPlan:
-        plans = self.read()
-        existing = next((row for row in plans if row.plan_id == plan.plan_id), None)
-        if existing is None and len(plans) >= MAX_BUY_WATCHLIST_ITEMS:
-            raise ValueError(f"Buy watchlist is limited to {MAX_BUY_WATCHLIST_ITEMS} setups.")
-        now = datetime.now(PACIFIC_TIME).isoformat()
-        saved = replace(
-            plan,
-            symbol=plan.symbol.strip().upper(),
-            created_at=existing.created_at if existing and existing.created_at else (plan.created_at or now),
-            updated_at=now,
-            last_checked_at="" if existing is None else existing.last_checked_at,
-            order_sent_at="",
-        )
-        updated = [saved if row.plan_id == saved.plan_id else row for row in plans]
-        if existing is None:
-            updated.append(saved)
-        self.replace_all(updated)
-        return saved
+        with self._exclusive_lock():
+            plans = self.read()
+            existing = next((row for row in plans if row.plan_id == plan.plan_id), None)
+            if existing is None and len(plans) >= MAX_BUY_WATCHLIST_ITEMS:
+                raise ValueError(f"Buy watchlist is limited to {MAX_BUY_WATCHLIST_ITEMS} setups.")
+            now = datetime.now(PACIFIC_TIME).isoformat()
+            saved = replace(
+                plan,
+                symbol=plan.symbol.strip().upper(),
+                created_at=existing.created_at if existing and existing.created_at else (plan.created_at or now),
+                updated_at=now,
+                last_checked_at="" if existing is None else existing.last_checked_at,
+                order_sent_at="",
+            )
+            updated = [saved if row.plan_id == saved.plan_id else row for row in plans]
+            if existing is None:
+                updated.append(saved)
+            self._replace_all_unlocked(updated)
+            return saved
 
     def update(self, plan_id: str, **changes: Any) -> BuyWatchPlan | None:
-        plans = self.read()
-        updated_plan = None
-        updated = []
-        for plan in plans:
-            if plan.plan_id == plan_id:
-                updated_plan = replace(plan, **changes, updated_at=datetime.now(PACIFIC_TIME).isoformat())
-                updated.append(updated_plan)
-            else:
-                updated.append(plan)
-        if updated_plan is not None:
-            self.replace_all(updated)
-        return updated_plan
+        with self._exclusive_lock():
+            plans = self.read()
+            updated_plan = None
+            updated = []
+            for plan in plans:
+                if plan.plan_id == plan_id:
+                    updated_plan = replace(plan, **changes, updated_at=datetime.now(PACIFIC_TIME).isoformat())
+                    updated.append(updated_plan)
+                else:
+                    updated.append(plan)
+            if updated_plan is not None:
+                self._replace_all_unlocked(updated)
+            return updated_plan
 
     def remove(self, plan_id: str) -> bool:
-        plans = self.read()
-        updated = [plan for plan in plans if plan.plan_id != plan_id]
-        if len(updated) == len(plans):
-            return False
-        self.replace_all(updated)
-        return True
+        with self._exclusive_lock():
+            plans = self.read()
+            updated = [plan for plan in plans if plan.plan_id != plan_id]
+            if len(updated) == len(plans):
+                return False
+            self._replace_all_unlocked(updated)
+            return True
+
+    @staticmethod
+    def _read_payload(path: Path) -> Any:
+        try:
+            return json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Buy watchlist file is invalid and was not treated as empty: {path}"
+            ) from exc
+        except OSError as exc:
+            raise RuntimeError(f"Buy watchlist file could not be read: {path}") from exc
+
+    def _replace_all_unlocked(self, plans: list[BuyWatchPlan]) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps([asdict(plan) for plan in plans], indent=2, sort_keys=True, default=str)
+        json.loads(payload)
+        temporary = self.path.with_name(
+            f"{self.path.name}.{os.getpid()}.{uuid4().hex}.tmp"
+        )
+        temporary.write_text(payload, encoding="utf-8")
+        try:
+            self._replace_with_retry(temporary)
+        finally:
+            if temporary.exists():
+                try:
+                    temporary.unlink()
+                except OSError:
+                    pass
+
+    @contextmanager
+    def _exclusive_lock(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = self.path.with_suffix(self.path.suffix + ".lock")
+        lock_fd = None
+        for _ in range(100):
+            try:
+                lock_fd = os.open(str(lock_path), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                break
+            except (FileExistsError, PermissionError):
+                try:
+                    if time_module.time() - lock_path.stat().st_mtime > 30:
+                        lock_path.unlink()
+                        continue
+                except OSError:
+                    pass
+                time_module.sleep(0.02)
+        if lock_fd is None:
+            raise RuntimeError("Buy watchlist file is busy; try again.")
+        try:
+            os.close(lock_fd)
+            yield
+        finally:
+            try:
+                lock_path.unlink()
+            except OSError:
+                pass
+
+    def _replace_with_retry(self, temporary: Path, attempts: int = 50, delay_seconds: float = 0.02) -> None:
+        for attempt in range(attempts):
+            try:
+                temporary.replace(self.path)
+                return
+            except PermissionError:
+                if attempt == attempts - 1:
+                    raise
+                time_module.sleep(delay_seconds)
 
 
 def buy_watchlist_records(plans: list[BuyWatchPlan]) -> list[dict[str, Any]]:

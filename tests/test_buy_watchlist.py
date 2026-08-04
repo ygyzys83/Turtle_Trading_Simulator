@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import pytest
 
 from agentloop_trader.buy_watchlist import (
@@ -63,6 +65,27 @@ def test_watchlist_enforces_maximum_queued_setups(tmp_path):
 
     with pytest.raises(ValueError, match=str(MAX_BUY_WATCHLIST_ITEMS)):
         store.upsert(_plan(symbol="TOO-MANY"))
+
+
+def test_invalid_watchlist_is_not_silently_treated_as_empty(tmp_path):
+    path = tmp_path / "watchlist.json"
+    path.write_text('[{"plan_id": "saved-plan"}]]', encoding="utf-8")
+    store = BuyWatchlistStore(path)
+
+    with pytest.raises(RuntimeError, match="was not treated as empty"):
+        store.read()
+
+
+def test_concurrent_watchlist_updates_preserve_every_setup(tmp_path):
+    path = tmp_path / "watchlist.json"
+    plans = [_plan(symbol=f"T{index}") for index in range(8)]
+
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        list(executor.map(lambda plan: BuyWatchlistStore(path).upsert(plan), plans))
+
+    saved = BuyWatchlistStore(path).read()
+    assert {plan.symbol for plan in saved} == {plan.symbol for plan in plans}
+    assert not list(tmp_path.glob("*.tmp"))
 
 
 def test_saved_setup_details_show_strategy_risk_order_and_exit_inputs():
