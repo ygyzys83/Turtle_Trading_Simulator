@@ -214,6 +214,8 @@ def test_fresh_streamlit_session_restores_running_worker_controls_before_renderi
     assert "index=list(automation_level_options.keys()).index(saved_automation_label)" in text
     assert "saved_sidebar_control.full_automation_enabled and sidebar_worker_present" in text
     assert 'st.session_state["background_worker_enabled"] = sidebar_worker_present' in text
+    assert "disabled=kill_switch or sidebar_worker_present" in text
+    assert "Changing pages does not stop the worker." in text
 
 
 def test_streamlit_page_has_no_automatic_buy_submission_path():

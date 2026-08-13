@@ -1261,6 +1261,20 @@ def run_loop(control_path: str | Path, status_path: str | Path, once: bool = Fal
                     )
                 )
                 break
+            cycle_started_at = datetime.now(PACIFIC_TIME).isoformat()
+            status_store.write(
+                replace(
+                    status_store.read(),
+                    running=True,
+                    pid=os.getpid(),
+                    state="Checking",
+                    last_checked_at=cycle_started_at,
+                    last_action="Checking saved exits, queued buys, and open Alpaca orders.",
+                    last_error="",
+                    code_fingerprint=startup_fingerprint,
+                    started_at=started_at,
+                )
+            )
             status = run_once(control, status_store.read())
             status = replace(
                 status,

@@ -2184,6 +2184,7 @@ worker_actions_enabled = bool(
     and active_automation_level != "Manual review only"
     and not kill_switch
     and sidebar_worker_code_current
+    and sidebar_worker_present
 )
 last_heartbeat = sidebar_worker_status.last_checked_at or "Not recorded"
 if sidebar_worker_active and not sidebar_worker_code_current:
@@ -2198,15 +2199,17 @@ elif sidebar_worker_active:
     )
 elif sidebar_worker_present:
     st.sidebar.caption(
-        f"Worker process: Needs attention. Last heartbeat: {last_heartbeat}. "
-        "Automation actions are not trusted until the heartbeat resumes or the worker is stopped."
+        f"Worker process: Running. The current check is taking longer than usual. "
+        f"Last heartbeat: {last_heartbeat}. "
+        f"Automation actions: {'On' if worker_actions_enabled else 'Off'}. "
+        "Changing pages does not stop the worker."
     )
 else:
     st.sidebar.caption("Worker process: Stopped. Automatic exits, queued buys, and automatic cancels are paused.")
 worker_control_cols = st.sidebar.columns(2)
 if worker_control_cols[0].button(
     "Start Worker",
-    disabled=kill_switch or sidebar_worker_active,
+    disabled=kill_switch or sidebar_worker_present,
     help="Start background monitoring so saved exits and the Buy watchlist continue when Streamlit is closed.",
 ):
     st.session_state["background_worker_enabled"] = True
