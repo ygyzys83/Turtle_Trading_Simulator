@@ -268,11 +268,13 @@ def test_worker_does_not_attach_old_settings_to_new_manual_reentry(monkeypatch):
 
 def test_worker_exit_audit_identifies_exact_position_cycle(monkeypatch):
     events = []
+    submitted = {}
     control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
-    adapter = SimpleNamespace(
-        config=SimpleNamespace(paper=True),
-        submit_order=lambda *args, **kwargs: SimpleNamespace(id="sell-1"),
-    )
+    def submit_order(*args, **kwargs):
+        submitted.update(kwargs)
+        return SimpleNamespace(id="sell-1")
+
+    adapter = SimpleNamespace(config=SimpleNamespace(paper=True), submit_order=submit_order)
     orders = [{
         "Alpaca Order ID": "buy-1",
         "Symbol": "NVDA",
@@ -329,6 +331,7 @@ def test_worker_exit_audit_identifies_exact_position_cycle(monkeypatch):
     assert events[0].payload["position_average_entry"] == 210.758696
     assert events[0].payload["entry_stop_distance"] == 6.78
     assert events[0].payload["exit_details"]["highest_profit_r"] == 0.09
+    assert submitted["client_order_scope"] == "position-cycle:buy-1"
 
 
 def test_worker_reports_triggered_exit_that_is_blocked_by_existing_sell_order(monkeypatch):
@@ -393,6 +396,67 @@ def test_worker_reports_triggered_exit_that_is_blocked_by_existing_sell_order(mo
     assert "open CRWV sell order" in message
     assert events[0].event_type == "worker_paper_exit_blocked"
     assert events[0].payload["current_price_source"] == "Alpaca position market value"
+
+
+def test_worker_contains_alpaca_exit_rejection_to_affected_position(monkeypatch):
+    events = []
+    control = AutomationControl(enabled=True, paper_orders_enabled=True, mode="Auto exits only")
+    adapter = SimpleNamespace(
+        config=SimpleNamespace(paper=True),
+        submit_order=lambda *args, **kwargs: (_ for _ in ()).throw(
+            RuntimeError("client_order_id must be unique")
+        ),
+    )
+    position = {"Symbol": "SPCX", "Quantity": 36, "Average Entry": 139.18}
+    orders = [{
+        "Alpaca Order ID": "spcx-buy",
+        "Symbol": "SPCX",
+        "Side": "buy",
+        "Status": "filled",
+        "Filled Qty": 36,
+        "Avg Fill": 139.18,
+        "Filled": "2026-08-12T15:33:51+00:00",
+    }]
+    tracked = [{
+        "broker_order_id": "spcx-buy",
+        "symbol": "SPCX",
+        "side": "buy",
+        "status": "filled",
+        "exit_settings": {"entry_stop_distance": 4.52, "auto_exit_enabled": True},
+    }]
+    monkeypatch.setattr("agentloop_trader.worker._market_is_open", lambda adapter: True)
+    monkeypatch.setattr(
+        "agentloop_trader.worker.evaluate_exit_settings",
+        lambda *args: {
+            "ready": True,
+            "state_changed": False,
+            "reason": "SPCX reached its ATR trail.",
+            "current_price": 140.95,
+            "trigger_price": 145.04,
+            "trigger_source": "ATR trail",
+        },
+    )
+    monkeypatch.setattr(
+        "agentloop_trader.worker.build_alpaca_order_preview",
+        lambda *args: SimpleNamespace(valid=True, preview_hash="exit-preview", blocked_reasons=[]),
+    )
+    monkeypatch.setattr("agentloop_trader.worker.open_exit_order_reasons", lambda *args: [])
+
+    sent, updated, message = _send_exits(
+        control,
+        adapter,
+        [position],
+        orders,
+        tracked,
+        lambda *_: None,
+        SimpleNamespace(append=events.append),
+    )
+
+    resolution = resolve_position_plan(position, orders, updated)
+    assert sent == 0
+    assert "SPCX exit triggered but Alpaca rejected it" in message
+    assert resolution.exit_settings["last_exit_error"] == "client_order_id must be unique"
+    assert events[-1].event_type == "worker_paper_exit_submission_failed"
 
 
 def test_worker_repairs_research_data_source_before_sending_managed_exit(monkeypatch):

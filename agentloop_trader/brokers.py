@@ -263,7 +263,13 @@ class AlpacaBrokerAdapterStub:
             ),
         )
 
-    def submit_order(self, intent: TradeIntent, decision: ExecutionDecision, expected_preview_hash: str | None = None):
+    def submit_order(
+        self,
+        intent: TradeIntent,
+        decision: ExecutionDecision,
+        expected_preview_hash: str | None = None,
+        client_order_scope: str = "",
+    ):
         preview = build_alpaca_order_preview(intent, decision, self.config)
         if not preview.valid:
             raise RuntimeError("; ".join(preview.blocked_reasons))
@@ -278,7 +284,11 @@ class AlpacaBrokerAdapterStub:
         client = self._get_client()
         if client is None:
             raise RuntimeError(self._client_error or "Alpaca client is unavailable.")
-        request = self._build_order_request(intent, client_order_id=f"agentloop-{preview.preview_hash}"[:128])
+        client_order_seed = preview.preview_hash
+        if client_order_scope:
+            scoped_payload = f"{preview.preview_hash}|{client_order_scope}"
+            client_order_seed = hashlib.sha256(scoped_payload.encode("utf-8")).hexdigest()[:16]
+        request = self._build_order_request(intent, client_order_id=f"agentloop-{client_order_seed}"[:128])
         return client.submit_order(order_data=request)
 
     def cancel_order(self, broker_order_id: str, expected_cancel_hash: str | None = None):

@@ -912,3 +912,13 @@ Managed Alpaca exit plans now have an explicit invariant: equities always use `T
 - Live strategy output now records the raw line, exact buffered breakout level, anchors, additional touches, slope, tolerance, and a plain-language quality summary. A missing line no longer lets the trend-filter value masquerade as the next BUY level.
 - Position and queued-setup charts show the selected line, 0.25 ATR wick-tolerance band, 0.10 ATR completed-close breakout line, anchor markers, and additional-touch markers. Sidebar strategy helpers describe these exact executable rules.
 - Added no-lookahead, line-selection, ATR-buffer, BUY-level, queue-label, and chart-overlay regression tests. The full suite passed with 461 tests.
+
+## 2026-08-13 - SPCX automatic exit submission failure
+
+- Investigated an SPCX paper position that was below its active ATR-trailing exit but had not sold.
+- The worker was running and correctly calculated an exit trigger near $145.04 while SPCX was near $140.95.
+- Alpaca rejected the SELL because the generated `client_order_id` had already been used for an older SPCX exit with the same symbol, side, and quantity. The prior ID was derived only from order content and did not distinguish separate position cycles.
+- Fixed broker submissions so client order IDs remain stable for retries within one position cycle but are unique across later position cycles. Queued BUY orders now receive equivalent setup-cycle scoping.
+- Isolated exit submission errors per position so one broker rejection is recorded and does not abort the rest of the worker cycle.
+- Added regression coverage for cycle-scoped order IDs, worker scope forwarding, and contained broker rejection handling.
+- Verification: full test suite passed with 465 tests. The background worker stopped itself after detecting changed code and must be restarted manually after choosing the desired automation mode.

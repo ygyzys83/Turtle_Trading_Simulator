@@ -500,7 +500,39 @@ def _send_exits(
                 },
             ))
             continue
-        order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
+        try:
+            order = adapter.submit_order(
+                intent,
+                decision,
+                expected_preview_hash=preview.preview_hash,
+                client_order_scope=f"position-cycle:{resolution.cycle.cycle_id}",
+            )
+        except Exception as exc:
+            submission_error = str(exc).strip() or exc.__class__.__name__
+            failed_settings = dict(settings)
+            failed_settings["last_exit_error"] = submission_error
+            failed_settings["last_exit_checked_at"] = datetime.now(PACIFIC_TIME).isoformat()
+            updated = upsert_position_plan(
+                position,
+                orders,
+                updated,
+                failed_settings,
+                resolution.entry_settings,
+            )
+            blocked_messages.append(f"{symbol} exit triggered but Alpaca rejected it: {submission_error}.")
+            audit_store.append(AuditEvent(
+                event_type="worker_paper_exit_submission_failed",
+                message="Background worker found a triggered exit, but Alpaca rejected the order.",
+                payload={
+                    "symbol": symbol,
+                    "quantity": intent.quantity,
+                    "reason": details.get("reason"),
+                    "broker_error": submission_error,
+                    "position_cycle_id": resolution.cycle.cycle_id,
+                    "review_id": preview.preview_hash,
+                },
+            ))
+            continue
         tracked_exit = _track_broker_order(order, preview.preview_hash, settings)
         tracked_exit.update({
             "parent_position_cycle_id": resolution.cycle.cycle_id,
@@ -560,6 +592,7 @@ def _send_entry(
     *,
     latest_price: float | None = None,
     require_latest_price: bool = False,
+    client_order_scope: str = "",
 ) -> tuple[int, list[dict], str]:
     if control.mode != "Auto entries and exits" or not control.full_automation_enabled:
         return 0, tracked_orders, "Auto entries are off."
@@ -623,7 +656,12 @@ def _send_entry(
     if not preview.valid or duplicate_reasons:
         return 0, tracked_orders, "; ".join(preview.blocked_reasons + duplicate_reasons) or "Auto buy blocked."
 
-    order = adapter.submit_order(intent, decision, expected_preview_hash=preview.preview_hash)
+    order = adapter.submit_order(
+        intent,
+        decision,
+        expected_preview_hash=preview.preview_hash,
+        client_order_scope=client_order_scope,
+    )
     settings = dict(control.strategy_settings)
     live = result.get("live", {})
     settings.update({
@@ -1006,6 +1044,10 @@ def _send_watchlist_entries(
             audit_store,
             latest_price=(latest_prices or {}).get(plan.symbol),
             require_latest_price=True,
+            client_order_scope=(
+                f"buy-watch:{plan.plan_id}:"
+                f"{plan.last_cycle_completed_at or plan.order_sent_at or 'initial'}"
+            ),
         )
         if count:
             sent += count

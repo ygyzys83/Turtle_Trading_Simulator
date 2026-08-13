@@ -171,6 +171,50 @@ def test_alpaca_adapter_submits_paper_order_when_all_gates_enabled():
     assert str(_order_field(client.submitted_orders[0], "client_order_id")).startswith("agentloop-")
 
 
+def test_alpaca_adapter_scopes_client_order_id_to_position_cycle():
+    client = FakeAlpacaClient()
+    adapter = AlpacaBrokerAdapterStub(
+        AlpacaConfig(api_key="key", api_secret="secret", paper=True),
+        trading_client=client,
+        allow_order_submission=True,
+    )
+    intent = TradeIntent(symbol="SPCX", side="sell", quantity=36)
+    decision = ExecutionDecision(
+        mode="paper",
+        approved_for_execution=True,
+        requires_manual_approval=False,
+        reason="Exit approved.",
+        risk_check=RiskCheckResult(approved=True, rejected_reasons=[], checks={"exit": True}),
+    )
+    preview = build_alpaca_order_preview(intent, decision, adapter.config)
+
+    adapter.submit_order(
+        intent,
+        decision,
+        expected_preview_hash=preview.preview_hash,
+        client_order_scope="position-cycle:new-cycle",
+    )
+    first_id = str(_order_field(client.submitted_orders[-1], "client_order_id"))
+    adapter.submit_order(
+        intent,
+        decision,
+        expected_preview_hash=preview.preview_hash,
+        client_order_scope="position-cycle:new-cycle",
+    )
+    retry_id = str(_order_field(client.submitted_orders[-1], "client_order_id"))
+    adapter.submit_order(
+        intent,
+        decision,
+        expected_preview_hash=preview.preview_hash,
+        client_order_scope="position-cycle:later-cycle",
+    )
+    later_cycle_id = str(_order_field(client.submitted_orders[-1], "client_order_id"))
+
+    assert first_id == retry_id
+    assert first_id != later_cycle_id
+    assert first_id.startswith("agentloop-")
+
+
 def test_alpaca_adapter_submits_limit_order_when_intent_uses_limit_price():
     client = FakeAlpacaClient()
     adapter = AlpacaBrokerAdapterStub(
