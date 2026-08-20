@@ -2084,10 +2084,13 @@ def _parameter_range_text(strategy_type: str, ranges: dict[str, tuple[float, flo
         keys.append("momentum_turn_length")
     parts = []
     for key in keys:
-        low, high = ranges[key]
+        bounds = ranges.get(key)
+        if not bounds or len(bounds) != 2:
+            continue
+        low, high = bounds
         number = lambda value: f"{value:.2f}" if key == "atr_stop_multiplier" else f"{value:.0f}"
         parts.append(f"{labels[key]} {number(low)}-{number(high)}")
-    return "; ".join(parts)
+    return "; ".join(parts) if parts else "No dependable range found"
 
 
 def _locked_text(locked: LockedTestResult | None) -> str:

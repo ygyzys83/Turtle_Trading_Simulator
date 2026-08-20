@@ -46,6 +46,7 @@ from agentloop_trader.parameter_loop import (
     strategy_input_search_identity,
     validate_settings_across_tickers,
     _attach_plateau_scores,
+    _parameter_range_text,
     _parameter_plateau_range,
 )
 
@@ -776,3 +777,8 @@ def test_relative_input_stability_can_report_a_partial_one_input_range():
     assert best.nearby_top_count == 3
     assert best.nearby_varied_inputs == 1
     assert set(_parameter_plateau_range(best, scored)) == {"exit_window"}
+
+
+def test_parameter_range_text_tolerates_partial_stable_ranges():
+    assert _parameter_range_text("breakout", {"entry_window": (10, 20)}) == "buy lookback 10-20"
+    assert _parameter_range_text("breakout", {}) == "No dependable range found"
