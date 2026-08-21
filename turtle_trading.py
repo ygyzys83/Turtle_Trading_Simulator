@@ -320,10 +320,11 @@ def fetch_latest_alpaca_price(ticker: str, asset_class: str, api_key: str | None
 
 def fetch_price_data_for_source(symbol: str, history: str, interval_value: str, price_source: str) -> pd.DataFrame:
     bar_bucket = completed_bar_cache_bucket(interval_value, price_source)
-    if price_source == "Crypto (Alpaca)":
+    normalized_source = str(price_source).strip().lower()
+    if normalized_source in {"crypto (alpaca)", "alpaca crypto"}:
         market_data_config = AlpacaConfig.from_env()
         return fetch_alpaca_crypto_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret, bar_bucket)
-    if price_source == "Ticker (Alpaca)":
+    if normalized_source == "ticker (alpaca)":
         market_data_config = AlpacaConfig.from_env()
         return fetch_alpaca_stock_data(symbol, history, interval_value, market_data_config.api_key, market_data_config.api_secret, bar_bucket)
     return fetch_stock_data(symbol, history, interval_value, bar_bucket)

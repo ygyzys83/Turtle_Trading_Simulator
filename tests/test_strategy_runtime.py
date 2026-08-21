@@ -13,12 +13,23 @@ from agentloop_trader.strategy_runtime import (
     exit_plan_history_for_interval,
     exit_mode_for_settings,
     latest_atr_snapshot,
+    normalize_managed_exit_settings,
     reprice_trade_intent,
     run_strategy_suite,
     selected_strategy_result,
     trade_intent_from_record,
     trade_intent_to_record,
 )
+
+
+def test_managed_crypto_exit_settings_use_the_canonical_alpaca_source():
+    settings = normalize_managed_exit_settings(
+        {"price_data_source": "Alpaca crypto", "auto_exit_enabled": True},
+        {"Symbol": "BTC/USD", "Asset Type": "crypto"},
+    )
+
+    assert settings["asset_class"] == "crypto"
+    assert settings["price_data_source"] == "Crypto (Alpaca)"
 
 
 def test_selected_strategy_path_matches_the_same_strategy_in_the_full_suite():

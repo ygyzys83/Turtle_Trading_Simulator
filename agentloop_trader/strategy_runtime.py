@@ -45,7 +45,7 @@ def normalize_managed_exit_settings(
     )
     normalized["asset_class"] = asset_class
     normalized["price_data_source"] = (
-        "Alpaca crypto" if asset_class == "crypto" else "Ticker (Alpaca)"
+        "Crypto (Alpaca)" if asset_class == "crypto" else "Ticker (Alpaca)"
     )
     return normalized
 
