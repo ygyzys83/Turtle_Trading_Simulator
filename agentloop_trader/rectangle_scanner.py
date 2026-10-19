@@ -8,10 +8,10 @@ import numpy as np
 import pandas as pd
 
 from agentloop_trader.indicators import calc_atr
-from agentloop_trader.rectangle_timeframes import analysis_bars, completed_daily_bars, validate_interval
+from agentloop_trader.rectangle_timeframes import analysis_bars, completed_daily_bars, session_schedule, validate_interval
 
 
-DETECTOR_VERSION = 3
+DETECTOR_VERSION = 4
 WINDOWS = tuple(month*21 for month in range(3, 25))
 WEEKLY_WINDOWS = tuple(round(month*52/12) for month in range(3, 25))
 
@@ -32,6 +32,18 @@ class Rectangle:
     support_touches: tuple[str, ...]
     resistance_touches: tuple[str, ...]
     interval: str = "1d"
+    prior_trend: str = "Not assessed"
+    prior_return_percent: float | None = None
+    prior_trend_bonus: float = 0.0
+    prior_start: str = ""
+    prior_end: str = ""
+    prior_trend_consistency: float | None = None
+
+    @property
+    def ranking_score(self) -> float:
+        # Rectangle quality keeps its original 0–100 scale; prior strength adds
+        # at most ten points. This is an ordering score, not a probability.
+        return round(self.quality + self.prior_trend_bonus, 1)
 
     @property
     def months(self) -> float:
@@ -65,7 +77,70 @@ def rectangle_from_record(row: dict[str, Any]) -> Rectangle:
     validate_interval(result.interval)
     if not (0 < result.support < result.resistance and result.tolerance > 0):
         raise ValueError("Invalid saved rectangle boundaries.")
+    if result.prior_trend not in {"Up", "Down", "Flat / mixed", "Insufficient history", "Not assessed"}:
+        raise ValueError("Invalid saved prior-trend label.")
+    if not np.isfinite(result.prior_trend_bonus) or not 0 <= result.prior_trend_bonus <= 10:
+        raise ValueError("Invalid saved prior-trend ranking bonus.")
     return result
+
+
+@dataclass(frozen=True)
+class PriorTrend:
+    direction: str = "Insufficient history"
+    return_percent: float | None = None
+    bonus: float = 0.0
+    start: str = ""
+    end: str = ""
+    consistency: float | None = None
+
+
+def analyze_prior_trend(frame: pd.DataFrame, base_start, interval="1d") -> PriorTrend:
+    """Assess six calendar months strictly before this rectangle's first candle.
+
+    Input is completed selected-timeframe OHLCV. Weekly context ends before the
+    entire first base week, never inside that week. The initial baseline is the
+    last completed candle on/before the six-month cutoff. Missing context gets no
+    bonus. Fixed thresholds are research heuristics, not a breakout forecast.
+    """
+    validate_interval(interval)
+    base_start = pd.Timestamp(base_start)
+    boundary = base_start if interval == "1d" else base_start.to_period("W-FRI").start_time
+    cutoff = boundary - pd.DateOffset(months=6)
+    left = frame.index.searchsorted(cutoff, side="right") - 1
+    right = frame.index.searchsorted(boundary, side="left")
+    if left < 0 or right <= left:
+        return PriorTrend()
+    prior = frame.iloc[left:right]
+    if interval == "1d":
+        schedule = session_schedule(prior.index[0].year, boundary.year)
+        expected = schedule.index[(schedule.index >= prior.index[0]) & (schedule.index < boundary)]
+        complete = prior.index.equals(expected) and len(prior) >= 100
+    else:
+        expected = pd.period_range(prior.index[0].to_period("W-FRI"),
+                                   base_start.to_period("W-FRI")-1, freq="W-FRI")
+        complete = prior.index.to_period("W-FRI").equals(expected) and len(prior) >= 20
+    prices = prior.Close.to_numpy(dtype=float)
+    if not complete or not np.all(np.isfinite(prices) & (prices > 0)):
+        return PriorTrend()
+    x = (prior.index-prior.index[0]).total_seconds().to_numpy(dtype=float)/86400
+    log_prices = np.log(prices)
+    slope, intercept = np.polyfit(x, log_prices, 1)
+    total = float(np.sum((log_prices-log_prices.mean())**2))
+    consistency = max(0., min(1., 1-float(np.sum((log_prices-(slope*x+intercept))**2))/total)) if total > 1e-12 else 0.
+    move = float((prices[-1]/prices[0]-1)*100)
+    direction = "Flat / mixed"
+    bonus = 0.
+    if move >= 10-1e-9 and slope > 0 and consistency >= .30:
+        direction = "Up"
+        bonus = round(10*min(move/30, 1)*min(consistency/.60, 1), 1)
+    elif move <= -10+1e-9 and slope < 0 and consistency >= .30:
+        direction = "Down"
+    return PriorTrend(direction, move, bonus, prior.index[0].strftime("%Y-%m-%d"),
+                      prior.index[-1].strftime("%Y-%m-%d"), consistency)
+
+
+def rectangle_rank_key(rectangle: Rectangle):
+    return rectangle.ranking_score, rectangle.quality, rectangle.bars
 
 
 def daily_bars(data: pd.DataFrame, now=None) -> pd.DataFrame:
@@ -166,6 +241,7 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, interval="1d", now=Non
         if drift > .5 or edge_drift > .30:
             continue
         quality = _rectangle_quality(containment, edge_drift, len(lows)+len(highs), span)
+        prior = analyze_prior_trend(frame, frame.index[start], interval)
         matches.append(Rectangle(
             symbol=str(symbol).strip().upper(), start=dates[start], end=dates[-1], bars=window,
             support=support, resistance=resistance, tolerance=tolerance, atr=atr,
@@ -173,15 +249,18 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, interval="1d", now=Non
             support_touches=tuple(dates[start+i] for i in lows),
             resistance_touches=tuple(dates[start+i] for i in highs),
             interval=interval,
+            prior_trend=prior.direction, prior_return_percent=prior.return_percent,
+            prior_trend_bonus=prior.bonus, prior_start=prior.start, prior_end=prior.end,
+            prior_trend_consistency=prior.consistency,
         ))
-    return sorted(matches, key=lambda r: (r.quality, r.bars), reverse=True)
+    return sorted(matches, key=rectangle_rank_key, reverse=True)
 
 
 def filter_rectangles(rows: list[Rectangle], months=(3, 24), location="All",
                       new_symbols: set[str] | None = None) -> list[Rectangle]:
     """Filter all detected durations, then select one best rectangle per symbol."""
     best: dict[tuple[str, str], Rectangle] = {}
-    for row in sorted(rows, key=lambda r: (r.quality, r.bars), reverse=True):
+    for row in sorted(rows, key=rectangle_rank_key, reverse=True):
         if not months[0] <= row.months <= months[1]:
             continue
         if location != "All" and row.location != location:
@@ -194,6 +273,7 @@ def filter_rectangles(rows: list[Rectangle], months=(3, 24), location="All",
 
 def rectangle_records(rows: list[Rectangle]) -> list[dict[str, Any]]:
     return [{"Ticker": r.symbol, "Timeframe": "Daily" if r.interval == "1d" else "Weekly", "Range (months)": r.months,
+             "Prior trend": r.prior_trend,
              "Support": round(r.support, 2), "Resistance": round(r.resistance, 2),
              "Price": round(r.last_close, 2), "Price location": r.location,
              "Position in range (%)": round(r.position_percent, 1)} for r in rows]

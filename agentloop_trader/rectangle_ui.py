@@ -20,7 +20,8 @@ from agentloop_trader.ui_theme import CHART_COLORS
 
 def build_rectangle_chart(frame: pd.DataFrame, rectangle: Rectangle, *, show_volume=False):
     """Draw the detector's actual saved geometry without re-detecting anything."""
-    frame = frame.loc[frame.index >= pd.Timestamp(rectangle.start)-pd.Timedelta(days=90)]
+    context_start = pd.Timestamp(rectangle.prior_start) if rectangle.prior_start else pd.Timestamp(rectangle.start)-pd.DateOffset(months=6)-pd.Timedelta(days=7)
+    frame = frame.loc[frame.index >= context_start]
     if frame.empty:
         raise ValueError("No cached candles are available for this rectangle.")
     show_volume = bool(show_volume and "Volume" in frame)
@@ -92,6 +93,7 @@ def _table_selection(records, key):
             "Resistance": st.column_config.NumberColumn(format="$%.2f"),
             "Price": st.column_config.NumberColumn(format="$%.2f"),
             "Position in range (%)": st.column_config.NumberColumn(format="%.1f%%"),
+            "Prior trend": st.column_config.TextColumn(help="Trend over the six months before this rectangle began. Up adds up to 10 ranking points; other labels do not exclude a range."),
         },
     )
     selection = event.selection.rows
@@ -135,6 +137,14 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
         st.caption("Saved history may be out of date. Run a scan to refresh it.")
     if adjustment:
         st.caption(adjustment)
+    if rectangle.prior_return_percent is not None:
+        st.caption(f"Prior trend: {rectangle.prior_trend} · {rectangle.prior_return_percent:+.1f}% "
+                   f"from {rectangle.prior_start} to {rectangle.prior_end}, before this range · "
+                   f"+{rectangle.prior_trend_bonus:g} ranking points.")
+    elif rectangle.prior_trend == "Insufficient history":
+        st.caption("Prior trend: insufficient complete history for the six months before this range; no ranking bonus applied.")
+    else:
+        st.caption("Prior trend was not assessed for this saved range. Run a new scan for updated candidate rankings.")
     show_volume = st.toggle("Show volume", value=False, key=f"rectangle_volume_{key}")
     st.plotly_chart(build_rectangle_chart(frame, rectangle, show_volume=show_volume),
                     width="stretch", theme=None, config={"scrollZoom": True}, key=f"rectangle_chart_{key}")
@@ -180,7 +190,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             timestamp = pd.Timestamp(scan["scanned_at"]).tz_convert("America/Los_Angeles")
             if scan.get("detector_version", 1) < DETECTOR_VERSION:
                 st.info("Saved results use earlier rectangle rules. Run Scan for Trading Ranges to apply "
-                        "3–24 month ranges with 90% containment and the 95% ranking preference.")
+                        "the current ranking and six-month prior-trend assessment.")
             st.caption(
                 f"Last scan {timestamp:%b %d, %Y %I:%M %p %Z} · {scan['source']} · "
                 f"{scan['successful']:,}/{scan['total']:,} histories checked · "
@@ -197,7 +207,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             if only_new and scan.get("first_scan"):
                 st.caption("This is the first scan for this data source; all matches are first discoveries.")
             filtered = filter_rectangles(results, months, location, set(scan["new_symbols"]) if only_new else None)
-            st.caption(f"{len(filtered):,} matching tickers · clearest ranges first · click a row to view its chart.")
+            st.caption(f"{len(filtered):,} matching tickers · ranked by rectangle quality + prior strength · click a row to view its chart.")
             if filtered:
                 fingerprint = hashlib.sha256(str((interval, scan["scanned_at"], location, months, only_new)).encode()).hexdigest()[:12]
                 index = _table_selection(rectangle_records(filtered), f"rectangle_results_{fingerprint}")
@@ -263,6 +273,11 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             "at least two separated, confirmed tests at each boundary; "
             "at least 90% of closes inside the drawn support/resistance box; "
             "ranges with at least 95% containment receive a ranking bonus. "
+            "Prior trend uses the six months strictly before each rectangle: Up requires at least a 10% advance, "
+            "positive log-price slope and at least 0.30 trend-fit consistency. A qualifying uptrend earns up to "
+            "10 extra ranking points based on the advance (capped at 30%) and consistency (full credit at 0.60). "
+            "Down is the corresponding decline; other complete histories are Flat / mixed. "
+            "Insufficient history earns no bonus. Prior trend never changes rectangle eligibility. "
             "Limited boundary drift and wick overshoots are allowed. "
             "Range width: 3–45% and at least three ATR on the selected timeframe. No prior uptrend is required. "
             "Weekly candles aggregate daily OHLCV using the Nasdaq trading calendar; unfinished weeks and weeks with missing sessions are excluded. "

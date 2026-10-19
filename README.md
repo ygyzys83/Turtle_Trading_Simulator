@@ -198,6 +198,28 @@ independent boundary tests are separated by at least five daily bars or two
 weekly bars. These are research heuristics, not validated trade probabilities
 or entry rules.
 
+The matching-tickers table includes **Prior trend**: Up, Flat / mixed, Down, or
+Insufficient history. For each candidate separately, six calendar months are
+measured strictly before its first candle (before the entire first week for a
+weekly range). The baseline is the last completed candle on or before the
+six-month cutoff; the ending candle is the last one before the rectangle.
+Complete context is required. Fixed research defaults classify Up with at least
+a 10% advance, positive fitted log-price slope and R-squared of at least 0.30;
+Down requires the corresponding decline and negative slope. Other complete
+histories are Flat / mixed. An Up trend adds up to 10 points, scaling the move
+to full credit at 30% and trend consistency to full credit at R-squared 0.60.
+The base rectangle-quality score stays on its original 0–100 scale. Default
+ordering uses that score plus the prior-trend bonus (maximum 110), with ties
+favoring rectangle quality and then duration. Neither missing context nor a
+flat/down prior trend excludes an otherwise valid rectangle. Prior strength
+does not certify an earlier breakout or predict future returns.
+
+The selected chart includes the six-month lead-in and explains the measured
+return, dates and bonus. Old saved research defaults to Not assessed with no
+bonus; original geometry is preserved. Older scan results prompt an explicit
+rescan for updated trend context and ranking. Viewing/filtering results never
+calculates another scan or downloads additional history.
+
 Weekly OHLCV is aggregated locally using `exchange-calendars==4.13.2` and the XNAS
 session schedule. Open is the first daily open, high/low the weekly extrema,
 close the final session close, and volume the sum. Weekly dates identify the

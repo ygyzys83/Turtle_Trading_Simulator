@@ -247,7 +247,8 @@ def test_weekly_chart_uses_aggregated_volume_and_retains_exact_boundaries():
     bars = weekly_bars(frame, NOW)
     figure = build_rectangle_chart(bars, rectangle, show_volume=True)
     assert figure.data[0].name == 'Completed weekly candles'
-    shown = bars.loc[bars.index >= pd.Timestamp(rectangle.start)-pd.Timedelta(days=90)]
+    context_start = pd.Timestamp(rectangle.prior_start) if rectangle.prior_start else pd.Timestamp(rectangle.start)-pd.DateOffset(months=6)-pd.Timedelta(days=7)
+    shown = bars.loc[bars.index >= context_start]
     assert list(figure.data[0].close) == list(shown.Close)
     volume = next(trace for trace in figure.data if trace.type == 'bar')
     assert list(volume.y) == list(shown.Volume)

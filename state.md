@@ -26,7 +26,20 @@ weeks, early closes, DST and cross-year weeks are handled explicitly. Weekly
 ATR and confirmed pivots use weekly candles. Boundary tests are separated by five
 daily bars or two weekly bars. Both modes require 90% of selected-timeframe closes
 inside the actual box; 95% earns a five-point bonus within a score capped at 100.
-Detector version is 3. Old snapshots show a rescan notice.
+Detector version is 4. Old snapshots show a rescan notice.
+
+Matching tickers now includes Prior trend: Up / Flat / mixed / Down / Insufficient
+history. It measures six calendar months strictly before each candidate's first
+candle; for weekly mode it excludes the entire first range week. Context must
+cover all expected sessions/weeks. Up requires at least +10%, positive log-price
+fit slope and R-squared >=0.30; Down uses -10% and negative slope. Up receives a
+bounded 0–10 point bonus scaled to full advance credit at +30% and consistency
+credit at R-squared 0.60. Rectangle quality remains 0–100; sorting uses quality
+plus bonus (up to 110), then quality, then duration. Qualification rules are
+unchanged: flat/down/missing prior context never excludes a rectangle. Old
+records default to Not assessed and zero bonus. Chart context includes the prior
+six months and explains return, measurement dates and ranking points. No extra
+toggle, actual prior-breakout requirement, broker action or strategy was added.
 
 Daily scan results/discovery history stay in scan.json; weekly uses
 scan_weekly.json. Watchlist identity includes timeframe, allowing one preserved
@@ -45,6 +58,10 @@ during development. Verification used synthetic and read-only cached history.
 Verification: 510 tests passed, including 43 scanner-focused checks. Dependency
 compatibility passed. The existing 39 cached daily candidates produced 6 weekly
 matches in a read-only smoke check; no saved research data was rewritten.
+
+Prior-trend verification: 527 tests passed. A read-only comparison with the prior
+detector across 89 cached ticker/timeframe combinations found no rectangle
+eligibility or geometry changes. Saved scan and watchlist data were not modified.
 
 Current recovery context for earlier features is in
 `C:\Users\godma\Documents\Codex\Trading_Simulator_Handoff_10.19.2026.md`.
