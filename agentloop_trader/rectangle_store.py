@@ -10,6 +10,8 @@ from uuid import uuid4
 
 import pandas as pd
 
+from agentloop_trader.rectangle_timeframes import validate_interval
+
 
 @contextmanager
 def exclusive_file(path: Path, timeout: float = 10):
@@ -83,21 +85,45 @@ class RectangleStore:
     def write(self, name: str, value):
         atomic_json(self.root / f"{name}.json", {"version": 1, "data": value})
 
+    def read_scan(self, interval="1d"):
+        validate_interval(interval)
+        value = self.read("scan" if interval == "1d" else "scan_weekly", {})
+        if value and value.get("interval", "1d") != interval:
+            raise ValueError("Saved rectangle scan has a different timeframe; its file was preserved.")
+        if any(row.get("interval", "1d") != interval for row in value.get("rectangles", [])):
+            raise ValueError("Saved rectangles contain mixed timeframes; their file was preserved.")
+        return value
+
+    def write_scan(self, interval: str, value):
+        validate_interval(interval)
+        if value.get("interval", "1d") != interval:
+            raise ValueError("Cannot save a rectangle scan under a different timeframe.")
+        if any(row.get("interval", "1d") != interval for row in value.get("rectangles", [])):
+            raise ValueError("Cannot mix daily and weekly rectangles in one scan.")
+        self.write("scan" if interval == "1d" else "scan_weekly", value)
+
+    @staticmethod
+    def watch_key(symbol: str, interval="1d") -> str:
+        validate_interval(interval)
+        # Preserve legacy daily identities; weekly ranges own separate records.
+        return symbol if interval == "1d" else f"{symbol}|1w"
+
     def save_watch(self, rectangle, source: str):
         with exclusive_file(self.root / "watchlist.lock"):
             rows = self.read("watchlist", {})
-            # One saved original rectangle per ticker; saving again does not redraw it.
-            if rectangle.symbol not in rows:
-                rows[rectangle.symbol] = {
+            key = self.watch_key(rectangle.symbol, rectangle.interval)
+            # One original per ticker/timeframe. Legacy daily records stay intact.
+            if key not in rows:
+                rows[key] = {
                     "rectangle": rectangle.record(), "anchor_close": rectangle.last_close,
                     "source": source, "saved_at": pd.Timestamp.now(tz="UTC").isoformat(),
                 }
                 self.write("watchlist", rows)
 
-    def remove_watch(self, symbol: str):
+    def remove_watch(self, symbol: str, interval="1d"):
         with exclusive_file(self.root / "watchlist.lock"):
             rows = self.read("watchlist", {})
-            rows.pop(symbol, None)
+            rows.pop(self.watch_key(symbol, interval), None)
             self.write("watchlist", rows)
 
     def history_path(self, symbol: str, source: str) -> Path:
@@ -115,15 +141,17 @@ class RectangleStore:
             value = json.loads(path.read_text(encoding="utf-8"))
             frame = pd.DataFrame(value["bars"]).set_index("Date")
             frame.index = pd.to_datetime(frame.index)
+            frame.attrs["history_days"] = value.get("history_days", 0)
             return frame, value["bucket"]
         except (ValueError, KeyError, TypeError):
             # A broken download cache is replaceable; durable research is not.
             return None, ""
 
-    def write_history(self, symbol: str, source: str, frame: pd.DataFrame, bucket: str):
+    def write_history(self, symbol: str, source: str, frame: pd.DataFrame, bucket: str, *, history_days=0):
         data = frame.copy()
         data.index = data.index.strftime("%Y-%m-%d")
         data.index.name = "Date"
         atomic_json(self.history_path(symbol, source), {
-            "bucket": bucket, "bars": data.reset_index().to_dict(orient="records"),
+            "bucket": bucket, "history_days": history_days,
+            "bars": data.reset_index().to_dict(orient="records"),
         })

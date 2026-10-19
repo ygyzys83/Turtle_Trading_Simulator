@@ -14,7 +14,8 @@ from test_rectangle_scanner import box_bars
 
 
 def current_bars():
-    return box_bars(end=(pd.Timestamp.now().normalize()-pd.offsets.BDay()).strftime('%Y-%m-%d'))
+    from agentloop_trader.rectangle_timeframes import latest_completed_date
+    return box_bars(end=latest_completed_date('1d').strftime('%Y-%m-%d'))
 
 
 class FakeProvider:
@@ -109,7 +110,8 @@ def test_incremental_cache_reloads_full_history_when_adjusted_prices_change(tmp_
     from agentloop_trader.rectangle_data import history_bucket
     store = RectangleStore(tmp_path)
     old = current_bars()
-    store.write_history('BOX', 'Alpaca IEX', old, 'old')
+    from agentloop_trader.rectangle_data import HISTORY_DAYS
+    store.write_history('BOX', 'Alpaca IEX', old, 'old', history_days=HISTORY_DAYS)
     adjusted = old.copy()
     adjusted[['Open', 'High', 'Low', 'Close']] /= 2
     provider = FakeProvider({'BOX': adjusted})
@@ -208,12 +210,12 @@ def test_ui_renders_saved_results_and_filters_without_running_another_scan(tmp_p
     assert any('earlier rectangle rules' in item.value for item in app.info)
     assert any('100.0% of closes inside the drawn box' in item.value for item in app.caption)
     assert app.selectbox(key='rectangle_location').value == 'All'
-    assert app.slider(key='rectangle_duration').value == (1, 18)
+    assert app.slider(key='rectangle_duration_1d').value == (3, 24)
     app.toggle(key='rectangle_only_new').set_value(True).run()
     assert not app.exception
     app.toggle(key='rectangle_volume_result').set_value(True).run()
     assert not app.exception
-    app.slider(key='rectangle_duration').set_value((17, 18)).run()
+    app.slider(key='rectangle_duration_1d').set_value((23, 24)).run()
     assert not app.exception
     app.selectbox(key='rectangle_location').set_value('Near resistance').run()
     assert not app.exception
@@ -236,10 +238,10 @@ def test_ui_renders_saved_results_and_filters_without_running_another_scan(tmp_p
     assert not any('earlier rectangle rules' in item.value for item in app.info)
 
 
-def test_one_month_rectangle_can_qualify_when_it_has_enough_independent_tests():
+def test_shorter_than_three_months_is_excluded_even_with_boundary_tests():
     import numpy as np
     frame = current_bars().iloc[-21:].copy()
     close = 100+10*np.sin(np.arange(21)*2*np.pi/8)
     for column, offset in [('Close', 0), ('Open', -.15), ('High', .55), ('Low', -.55)]:
         frame[column] = close+offset
-    assert any(row.bars == 21 for row in detect_rectangles('SHORTBOX', frame))
+    assert detect_rectangles('SHORTBOX', frame) == []

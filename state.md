@@ -4,38 +4,47 @@ Last updated: 2026-10-19 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 19, 2026 — Rectangle research scanner
+## October 19, 2026 — Rectangle research scanner (current)
 
-Containment refinement: scan eligibility now requires at least 90% of completed
-closes inside the actual drawn box, rather than inside padded boundary zones.
-At least 95% actual-box containment adds a five-point ranking bonus; it is not an
-eligibility requirement. The score stays bounded at 100. Other touch, wick,
-excursion and latest-price tolerances remain unchanged. Detector version is 2;
-older scan snapshots show a rescan notice. Chart containment is measured directly
-from the range's cached candles, including for older saved research. Original
-watchlist geometry remains preserved. No extra controls were added.
-Verification after this refinement: 495 tests passed. A read-only recheck of the
-previous 63 candidates against the same cached history retained 39 tickers; the
-user's saved scan and research watchlist were not rewritten during verification.
+Checkpoint before weekly work: `79387c3` contains the working daily scanner and
+90% actual-box containment / 95% ranking preference; 495 tests passed then. The
+user confirmed this checkpoint was saved to GitHub. Commits/pushes remain the
+user's responsibility.
 
-The approved scope is deliberately simple: Ideas → Scan for Trading Ranges,
-Nasdaq Composite-style common-stock discovery, completed daily bars, approximately
-1–18 months. One selected annotated candlestick chart, research-only save/remove
-watchlist, and four optional controls: Price location (All), Range duration (1–18),
-New candidates only (Off), Show volume (Off). No TradingView link. No required
-prior uptrend or proximity to an upside breakout. Candidates near support matter
-as much as those near resistance; no range-entry trading strategy was added.
+Ideas now offers Timeframe: Daily / Weekly, with 3–24 months for both modes
+(approximately 63–504 daily sessions or 13–104 weeks). The original four controls
+remain: Price location, Range duration, New candidates only, Show volume. No
+TradingView link, required prior uptrend, upper-range entry requirement or new
+buying-pressure/last-full-day strategy was added. Candidates near support remain
+useful research results.
 
-The public Nasdaq directory is filtered by common-stock type and basic liquidity;
-the UI explicitly states this is not a verified licensed Composite membership
-list. Alpaca IEX is used when credentials are configured, Yahoo otherwise. The
-scan is independent of sidebar inputs, batched, cancelable, persisted and cached.
-Filters and chart controls do not rerun scans. Saved original rectangles are
-preserved, with visible corporate-action basis adjustments and stale/error states.
-The existing strategy scanner remains in a collapsed section. All research state
-is separate from the Buy watchlist and broker worker. No UI or worker was started,
-no account credentials were printed, and no broker action was performed during
-development. Verification: 488 tests passed, including 21 new detector, data, persistence and Streamlit UI checks. The public directory loader returned 3,003 eligible listings during verification. The user handles commits and pushes.
+Shared daily history is downloaded in batches and cached for three years. Older
+two-year caches are backfilled once when a scan is explicitly run. Weekly bars
+are aggregated locally using the pinned exchange-calendars 4.13.2 XNAS schedule;
+only complete weeks with every expected session are eligible. Holiday-shortened
+weeks, early closes, DST and cross-year weeks are handled explicitly. Weekly
+ATR and confirmed pivots use weekly candles. Boundary tests are separated by five
+daily bars or two weekly bars. Both modes require 90% of selected-timeframe closes
+inside the actual box; 95% earns a five-point bonus within a score capped at 100.
+Detector version is 3. Old snapshots show a rescan notice.
+
+Daily scan results/discovery history stay in scan.json; weekly uses
+scan_weekly.json. Watchlist identity includes timeframe, allowing one preserved
+original per ticker per mode. Legacy records default to daily without automatic
+rewrites. Charts, containment, latest-close status and corporate-action basis
+adjustments use the saved timeframe. Switching mode or changing a result filter
+never scans or downloads by itself. Scans have progress, cancellation, explicit
+errors and independent discovery baselines for each timeframe.
+
+Universe: public Nasdaq common-stock directory, explicitly labeled Composite-style,
+not verified licensed index membership. Existing provider selection, feed-specific
+liquidity rules, manual-entry workflow, Buy watchlist, broker plans and worker
+execution are unchanged. The old strategy scanner remains in its collapsed Ideas
+section. No UI/worker was launched and no broker requests/orders were submitted
+during development. Verification used synthetic and read-only cached history.
+Verification: 510 tests passed, including 43 scanner-focused checks. Dependency
+compatibility passed. The existing 39 cached daily candidates produced 6 weekly
+matches in a read-only smoke check; no saved research data was rewritten.
 
 Current recovery context for earlier features is in
 `C:\Users\godma\Documents\Codex\Trading_Simulator_Handoff_10.19.2026.md`.

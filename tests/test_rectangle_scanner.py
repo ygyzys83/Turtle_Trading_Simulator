@@ -12,8 +12,10 @@ from agentloop_trader.rectangle_scanner import (
 NOW = pd.Timestamp('2026-10-20 22:00:00Z')
 
 
-def box_bars(length=420, end='2026-10-19', slope=0, scale=1):
-    index = pd.bdate_range(end=end, periods=length)
+def box_bars(length=756, end='2026-10-19', slope=0, scale=1):
+    from agentloop_trader.rectangle_timeframes import session_schedule
+    date = pd.Timestamp(end)
+    index = session_schedule(date.year-int(length/200)-2, date.year).loc[:date].index[-length:]
     x = np.arange(length)
     close = (100 + 10*np.sin(x*2*np.pi/20) + slope*x)*scale
     return pd.DataFrame({'Open': close-.15*scale, 'High': close+.55*scale,
@@ -24,8 +26,8 @@ def box_bars(length=420, end='2026-10-19', slope=0, scale=1):
 def test_detects_flat_ranges_at_multiple_lengths_and_counts_independent_tests():
     rows = detect_rectangles('EXAMPLE', box_bars(), now=NOW)
     assert rows
-    assert min(r.months for r in rows) <= 3
-    assert max(r.months for r in rows) == 18
+    assert min(r.months for r in rows) == 3
+    assert max(r.months for r in rows) == 24
     assert all(88 < r.support < 92 and 108 < r.resistance < 112 for r in rows)
     assert all(len(r.support_touches) >= 2 and len(r.resistance_touches) >= 2 for r in rows)
     assert all((pd.to_datetime(r.support_touches).to_series().diff().dropna().dt.days >= 5).all() for r in rows)
@@ -44,7 +46,7 @@ def test_daily_scan_does_not_use_future_or_forming_bar_or_future_pivot_confirmat
 
 @pytest.mark.parametrize('slope', [.15, -.15])
 def test_sloping_channels_do_not_qualify_as_rectangles(slope):
-    assert not detect_rectangles('CHANNEL', box_bars(slope=slope), now=NOW)
+    assert not detect_rectangles('CHANNEL', box_bars(length=420, slope=slope), now=NOW)
 
 
 def test_recent_breakdown_does_not_get_recentered_into_a_new_box():
@@ -63,14 +65,14 @@ def test_price_scale_does_not_change_detected_windows_or_score():
 
 def test_filters_choose_matching_duration_before_deduplicating_and_do_not_mutate():
     rows = detect_rectangles('BOX', box_bars(), now=NOW)
-    a, b = replace(rows[0], bars=42, quality=99), replace(rows[0], bars=252, quality=80)
+    a, b = replace(rows[0], bars=63, quality=99), replace(rows[0], bars=252, quality=80)
     assert filter_rectangles([a, b], (6, 18)) == [b]
     assert filter_rectangles([a, b], new_symbols=set()) == []
     assert filter_rectangles([a, b], new_symbols={'BOX'}) == [a]
     support = replace(a, last_close=a.support+.1*(a.resistance-a.support))
     assert filter_rectangles([support], location='Near support') == [support]
     assert not filter_rectangles([support], location='Near resistance')
-    assert a.bars == 42
+    assert a.bars == 63
 
 
 def test_watchlist_keeps_original_geometry_and_adjusts_basis_after_split():
@@ -110,7 +112,8 @@ def test_daily_timestamp_normalization_preserves_exchange_session_date():
 def _containment_fixture(outside_count):
     # Stable independent boundaries at 90/110. A short excursion is inside the
     # old padded zone, but its closes are outside the rectangle actually drawn.
-    index = pd.bdate_range(end='2026-10-19', periods=100)
+    from agentloop_trader.rectangle_timeframes import session_schedule
+    index = session_schedule(2025, 2026).loc[:'2026-10-19'].index[-100:]
     frame = pd.DataFrame({'Open': 100., 'High': 101., 'Low': 99.,
                           'Close': 100., 'Volume': 1_000_000}, index=index)
     for i in (5, 25, 45, 65, 85):

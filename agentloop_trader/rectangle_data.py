@@ -15,10 +15,11 @@ from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 
-from agentloop_trader.market_data import completed_bar_cache_bucket, completed_price_bars
+from agentloop_trader.rectangle_timeframes import latest_completed_date
 
 
 DIRECTORY_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
+HISTORY_DAYS = 1100  # Three years: 24-month ranges plus ATR and pivot warmup.
 UNIVERSE_LABEL = "Nasdaq common stocks (Composite-style)"
 UNIVERSE_NOTE = (
     "Public Nasdaq listing directory, filtered for common-stock types. "
@@ -112,7 +113,7 @@ class DailyHistoryProvider:
                 if data is not None and not data.empty and alias in data.columns.get_level_values(0):
                     frame = data[alias].dropna(subset=["Open", "High", "Low", "Close"])
                     if not frame.empty:
-                        result[symbol] = completed_price_bars(frame, "1d")
+                        result[symbol] = frame  # Session calendar excludes forming bars in the scan runner.
             return result
         params = {"symbols": ",".join(symbols), "timeframe": "1Day", "start": start,
                   "feed": "iex", "adjustment": "all", "limit": 10000}
@@ -144,11 +145,11 @@ class DailyHistoryProvider:
 
 
 def history_bucket() -> str:
-    return str(completed_bar_cache_bucket("1d", "Ticker (Alpaca)"))
+    return latest_completed_date("1d").strftime("%Y-%m-%d")
 
 
 def full_history_start() -> str:
-    return (datetime.now(UTC) - timedelta(days=740)).strftime("%Y-%m-%d")
+    return (datetime.now(UTC) - timedelta(days=HISTORY_DAYS)).strftime("%Y-%m-%d")
 
 
 def merge_history(old: pd.DataFrame | None, fresh: pd.DataFrame) -> pd.DataFrame | None:

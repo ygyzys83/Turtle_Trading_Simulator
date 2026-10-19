@@ -9,10 +9,11 @@ import pandas as pd
 
 from agentloop_trader.rectangle_data import (
     DailyHistoryProvider, ScanCancelled, fetch_nasdaq_universe,
-    full_history_start, history_bucket, merge_history,
+    HISTORY_DAYS, full_history_start, history_bucket, merge_history,
 )
 from agentloop_trader.rectangle_scanner import DETECTOR_VERSION, daily_bars, detect_rectangles
 from agentloop_trader.rectangle_store import RectangleStore, exclusive_file
+from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, validate_interval, TIMEFRAME_LABELS
 
 
 @dataclass
@@ -36,16 +37,17 @@ class ScanJob:
 
 
 def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: ScanJob,
-                   universe_loader=fetch_nasdaq_universe):
+                   universe_loader=fetch_nasdaq_universe, *, interval="1d"):
     """Commit a completed snapshot only; cancel/fatal failure keeps previous results.
 
     Per-ticker failures remain explicit. New-candidate comparison retains the last
     known result for failed symbols so an outage cannot create false new arrivals.
     """
     try:
+        validate_interval(interval)
         with exclusive_file(store.root / "scan.lock", timeout=.1):
             provider.check_cancel()
-            previous = store.read("scan", {})
+            previous = store.read_scan(interval)
             watches = store.read("watchlist", {})
             cached_universe = store.read("universe", {})
             today = datetime.now(UTC).date().isoformat()
@@ -57,7 +59,8 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
             symbols = list(dict.fromkeys(universe["symbols"]))
             if not symbols:
                 raise ValueError("Nasdaq returned no eligible stock symbols.")
-            watch_extra = [s for s, w in watches.items() if s not in symbols or w["source"] != provider.source]
+            watched = {(w["rectangle"]["symbol"], w["source"]) for w in watches.values()}
+            watch_extra = sorted((s, source) for s, source in watched if s not in symbols or source != provider.source)
             total = len(symbols) + len(watch_extra)
             finished = 0
             rectangles, errors = [], []
@@ -71,7 +74,8 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                 cached, result, missing = {}, {}, []
                 for symbol in batch:
                     old, old_bucket = store.read_history(symbol, selected_provider.source)
-                    if old is not None and old_bucket == bucket:
+                    covered = old is not None and old.attrs.get("history_days", 0) >= HISTORY_DAYS
+                    if covered and old_bucket == bucket:
                         result[symbol] = old
                     else:
                         cached[symbol] = old
@@ -81,6 +85,7 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                 # Incrementally refresh only when every requested ticker has recent history.
                 oldest = min((f.index[-1] for f in cached.values() if f is not None and not f.empty), default=None)
                 incremental = all(cached[s] is not None and not cached[s].empty for s in missing)
+                incremental &= all(cached[s] is not None and cached[s].attrs.get("history_days", 0) >= HISTORY_DAYS for s in missing)
                 incremental &= oldest is not None and (pd.Timestamp.now().normalize()-oldest).days < 25
                 start = (oldest-pd.Timedelta(days=7)).strftime("%Y-%m-%d") if incremental else full_history_start()
                 fresh = selected_provider.fetch(missing, start)
@@ -95,7 +100,8 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                         if merged is None:
                             full_refresh.append(symbol)
                             continue
-                        store.write_history(symbol, selected_provider.source, merged, bucket)
+                        actual_bucket = min(bucket, merged.index[-1].strftime("%Y-%m-%d"))
+                        store.write_history(symbol, selected_provider.source, merged, actual_bucket, history_days=HISTORY_DAYS)
                         result[symbol] = merged
                     except ValueError:
                         continue
@@ -103,14 +109,15 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                     refreshed = selected_provider.fetch(full_refresh, full_history_start())
                     for symbol, frame in refreshed.items():
                         frame = daily_bars(frame)
-                        store.write_history(symbol, selected_provider.source, frame, bucket)
+                        actual_bucket = min(bucket, frame.index[-1].strftime("%Y-%m-%d"))
+                        store.write_history(symbol, selected_provider.source, frame, actual_bucket, history_days=HISTORY_DAYS)
                         result[symbol] = frame
                 return result
 
             for offset in range(0, len(symbols), 20):
                 provider.check_cancel()
                 batch = symbols[offset:offset+20]
-                job.update(message=f"Checking {finished:,} of {total:,} stocks · {len(set(r.symbol for r in rectangles)):,} candidates",
+                job.update(message=f"{TIMEFRAME_LABELS[interval]} · Checking {finished:,} of {total:,} stocks · {len(set(r.symbol for r in rectangles)):,} candidates",
                            progress=finished/max(total, 1))
                 try:
                     frames = load_batch(batch, provider)
@@ -127,16 +134,19 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                         frame = frames.get(symbol)
                         if frame is None or frame.empty:
                             raise ValueError("No completed daily history returned.")
-                        if (pd.Timestamp.now().normalize()-frame.index[-1]).days > 7:
+                        if frame.index[-1] < latest_completed_date("1d"):
                             raise ValueError("Daily history is stale; previous result was not treated as a fresh scan.")
-                        dates.append(frame.index[-1].strftime("%Y-%m-%d"))
                         successful += 1
+                        bars = analysis_bars(frame, interval)
+                        if bars.empty or bars.index[-1] < latest_completed_date(interval):
+                            raise ValueError(f"Latest completed {TIMEFRAME_LABELS[interval].lower()} candle is missing expected trading sessions.")
+                        dates.append(bars.index[-1].strftime("%Y-%m-%d"))
                         # Feed-specific basic activity floor; not consolidated-market volume.
-                        liquid = len(frame) >= 21 and frame.Close.iloc[-1] >= 1 and "Volume" in frame
+                        liquid = len(bars) >= (63 if interval == "1d" else 13) and frame.Close.iloc[-1] >= 1 and "Volume" in frame
                         if liquid:
                             liquid = float((frame.Close*frame.Volume).tail(20).mean()) >= 100_000
                             liquid &= float((frame.Volume.tail(20) > 0).mean()) >= .9
-                        found = detect_rectangles(symbol, frame) if liquid else []
+                        found = detect_rectangles(symbol, frame, interval=interval) if liquid else []
                         if not liquid:
                             skipped += 1
                         if found and not observed.get(symbol, False):
@@ -147,9 +157,8 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                         errors.append({"Ticker": symbol, "Problem": str(exc) if isinstance(exc, ValueError) else f"Range calculation failed ({type(exc).__name__})."})
                     finished += 1
                 job.update(progress=finished/max(total, 1))
-            for symbol in watch_extra:
+            for symbol, source in watch_extra:
                 provider.check_cancel()
-                source = watches[symbol]["source"]
                 selected = provider if source == provider.source else DailyHistoryProvider(cancel=provider.cancel)
                 try:
                     if source != selected.source:
@@ -164,17 +173,17 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
                 finished += 1
                 job.update(progress=finished/max(total, 1))
             provider.check_cancel()
-            if successful == 0:
+            if not dates:
                 raise ValueError("No usable daily history was returned. Previous scan results were kept.")
             payload = {
-                "detector_version": DETECTOR_VERSION, "scanned_at": datetime.now(UTC).isoformat(),
+                "detector_version": DETECTOR_VERSION, "interval": interval, "scanned_at": datetime.now(UTC).isoformat(),
                 "source": provider.source, "universe": universe, "total": len(symbols),
                 "successful": successful, "skipped": skipped, "errors": errors,
                 "rectangles": [r.record() for r in rectangles], "new_symbols": new_symbols,
                 "observed": observed, "data_start": min(dates), "data_end": max(dates),
                 "first_scan": not bool(previous) or previous.get("source") != provider.source,
             }
-            store.write("scan", payload)
+            store.write_scan(interval, payload)
             job.update(message="Scan complete", progress=1.0)
     except ScanCancelled:
         job.update(canceled=True, message="Scan canceled; previous results were kept.")
@@ -188,8 +197,9 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
         job.update(done=True)
 
 
-def start_range_scan(store, provider) -> ScanJob:
+def start_range_scan(store, provider, *, interval="1d") -> ScanJob:
+    validate_interval(interval)
     job = ScanJob(cancel=provider.cancel)
-    threading.Thread(target=run_range_scan, args=(store, provider, job), daemon=True,
+    threading.Thread(target=run_range_scan, args=(store, provider, job), kwargs={"interval": interval}, daemon=True,
                      name="rectangle-research-scan").start()
     return job

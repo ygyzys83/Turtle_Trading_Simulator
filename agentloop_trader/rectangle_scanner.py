@@ -8,11 +8,12 @@ import numpy as np
 import pandas as pd
 
 from agentloop_trader.indicators import calc_atr
-from agentloop_trader.market_data import completed_price_bars, validate_price_bars
+from agentloop_trader.rectangle_timeframes import analysis_bars, completed_daily_bars, validate_interval
 
 
-DETECTOR_VERSION = 2
-WINDOWS = (21, 32, 42, 63, 84, 105, 126, 147, 168, 189, 210, 231, 252, 273, 294, 315, 336, 357, 378)
+DETECTOR_VERSION = 3
+WINDOWS = tuple(month*21 for month in range(3, 25))
+WEEKLY_WINDOWS = tuple(round(month*52/12) for month in range(3, 25))
 
 
 @dataclass(frozen=True)
@@ -30,10 +31,11 @@ class Rectangle:
     containment: float
     support_touches: tuple[str, ...]
     resistance_touches: tuple[str, ...]
+    interval: str = "1d"
 
     @property
     def months(self) -> float:
-        return round(self.bars / 21, 1)
+        return round(self.bars / 21 if self.interval == "1d" else self.bars*12/52, 1)
 
     @property
     def position_percent(self) -> float:
@@ -60,6 +62,7 @@ def rectangle_from_record(row: dict[str, Any]) -> Rectangle:
     for name in ("support_touches", "resistance_touches"):
         values[name] = tuple(values[name])
     result = Rectangle(**values)
+    validate_interval(result.interval)
     if not (0 < result.support < result.resistance and result.tolerance > 0):
         raise ValueError("Invalid saved rectangle boundaries.")
     return result
@@ -67,13 +70,7 @@ def rectangle_from_record(row: dict[str, Any]) -> Rectangle:
 
 def daily_bars(data: pd.DataFrame, now=None) -> pd.DataFrame:
     """Normalize daily timestamps to session dates after excluding forming bars."""
-    clean = completed_price_bars(validate_price_bars(data), "1d", now=now)
-    index = pd.DatetimeIndex(clean.index)
-    if index.tz is not None:
-        index = index.tz_convert("America/New_York").tz_localize(None)
-    clean.index = index.normalize()
-    clean = clean.loc[~clean.index.duplicated(keep="last")].sort_index()
-    return clean
+    return completed_daily_bars(data, now)
 
 
 def _separated(indices: np.ndarray, gap: int = 5) -> np.ndarray:
@@ -92,15 +89,17 @@ def _rectangle_quality(containment: float, edge_drift: float, touch_count: int, 
                  + 25*min(touch_count/10, 1) + 20*min(span/.7, 1), 1)
 
 
-def detect_rectangles(symbol: str, data: pd.DataFrame, *, now=None) -> list[Rectangle]:
-    """Evaluate bounded daily windows using only data completed at `now`.
+def detect_rectangles(symbol: str, data: pd.DataFrame, *, interval="1d", now=None) -> list[Rectangle]:
+    """Evaluate bounded 3–24 month windows using only data completed at `now`.
 
-    Months are approximately 21 trading sessions. Thresholds are fixed research
+    Months are approximately 21 trading sessions or 52/12 weeks. Thresholds are fixed research
     heuristics, not estimated breakout probabilities. Two bars confirm pivots;
     an unconfirmed recent extreme is never counted as a boundary test.
     """
-    frame = daily_bars(data, now)
-    if len(frame) < 21:
+    validate_interval(interval)
+    frame = analysis_bars(data, interval, now)
+    windows = WINDOWS if interval == "1d" else WEEKLY_WINDOWS
+    if len(frame) < min(windows):
         return []
     close = frame.Close.to_numpy(dtype=float)
     high = frame.High.to_numpy(dtype=float)
@@ -116,13 +115,15 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, now=None) -> list[Rect
         piv_low[i] = low[i] <= min(low[i-2:i+3]) and low[i] < min(low[i-2:i])
     matches: list[Rectangle] = []
     dates = frame.index.strftime("%Y-%m-%d").tolist()
-    for window in WINDOWS:
+    for window in windows:
         if window > len(frame):
             continue
         start = len(frame) - window
         c, h, l = close[start:], high[start:], low[start:]
         # Sparse histories must not turn a year-long sequence into a one-month box.
-        if (frame.index[-1] - frame.index[start]).days > window * 2:
+        if (frame.index[-1] - frame.index[start]).days > window * (2 if interval == "1d" else 8):
+            continue
+        if interval == "1w" and np.any(np.diff(frame.index[start:].to_period("W-FRI").asi8) != 1):
             continue
         support, resistance = float(np.quantile(l, .10)), float(np.quantile(h, .90))
         width = resistance - support
@@ -133,7 +134,8 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, now=None) -> list[Rect
         highs = np.flatnonzero(piv_high[start:])
         lows = lows[(lows >= 2) & (np.abs(l[lows] - support) <= 2 * tolerance)]
         highs = highs[(highs >= 2) & (np.abs(h[highs] - resistance) <= 2 * tolerance)]
-        lows, highs = _separated(lows), _separated(highs)
+        gap = 5 if interval == "1d" else 2
+        lows, highs = _separated(lows, gap), _separated(highs, gap)
         if len(lows) < 2 or len(highs) < 2:
             continue
         support, resistance = float(np.median(l[lows])), float(np.median(h[highs]))
@@ -170,14 +172,15 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, now=None) -> list[Rect
             last_close=float(c[-1]), quality=quality, containment=containment,
             support_touches=tuple(dates[start+i] for i in lows),
             resistance_touches=tuple(dates[start+i] for i in highs),
+            interval=interval,
         ))
     return sorted(matches, key=lambda r: (r.quality, r.bars), reverse=True)
 
 
-def filter_rectangles(rows: list[Rectangle], months=(1, 18), location="All",
+def filter_rectangles(rows: list[Rectangle], months=(3, 24), location="All",
                       new_symbols: set[str] | None = None) -> list[Rectangle]:
     """Filter all detected durations, then select one best rectangle per symbol."""
-    best: dict[str, Rectangle] = {}
+    best: dict[tuple[str, str], Rectangle] = {}
     for row in sorted(rows, key=lambda r: (r.quality, r.bars), reverse=True):
         if not months[0] <= row.months <= months[1]:
             continue
@@ -185,12 +188,12 @@ def filter_rectangles(rows: list[Rectangle], months=(1, 18), location="All",
             continue
         if new_symbols is not None and row.symbol not in new_symbols:
             continue
-        best.setdefault(row.symbol, row)
+        best.setdefault((row.symbol, row.interval), row)
     return list(best.values())
 
 
 def rectangle_records(rows: list[Rectangle]) -> list[dict[str, Any]]:
-    return [{"Ticker": r.symbol, "Range (months)": r.months,
+    return [{"Ticker": r.symbol, "Timeframe": "Daily" if r.interval == "1d" else "Weekly", "Range (months)": r.months,
              "Support": round(r.support, 2), "Resistance": round(r.resistance, 2),
              "Price": round(r.last_close, 2), "Price location": r.location,
              "Position in range (%)": round(r.position_percent, 1)} for r in rows]
@@ -199,7 +202,7 @@ def rectangle_records(rows: list[Rectangle]) -> list[dict[str, Any]]:
 def refresh_saved_rectangle(original: Rectangle, original_anchor: float, data: pd.DataFrame,
                             *, now=None) -> tuple[Rectangle, str]:
     """Retain saved geometry, explicitly adjusting its basis after corporate actions."""
-    frame = daily_bars(data, now)
+    frame = analysis_bars(data, original.interval, now)
     if pd.Timestamp(original.end) not in frame.index:
         raise ValueError("Original rectangle date is missing; its price basis cannot be verified.")
     anchor = float(frame.loc[pd.Timestamp(original.end), "Close"])

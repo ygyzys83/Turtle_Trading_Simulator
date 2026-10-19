@@ -6,3 +6,4 @@ yfinance==1.5.1
 pytest==9.1.1
 alpaca-py==0.43.5
 python-dotenv==1.2.2
+exchange-calendars==4.13.2

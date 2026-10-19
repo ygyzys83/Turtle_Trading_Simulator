@@ -14,6 +14,7 @@ from agentloop_trader.rectangle_scanner import (
     DETECTOR_VERSION, Rectangle, filter_rectangles, rectangle_from_record, rectangle_records, refresh_saved_rectangle,
 )
 from agentloop_trader.rectangle_store import RectangleStore
+from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, TIMEFRAME_LABELS
 from agentloop_trader.ui_theme import CHART_COLORS
 
 
@@ -29,7 +30,7 @@ def build_rectangle_chart(frame: pd.DataFrame, rectangle: Rectangle, *, show_vol
     x = frame.index.strftime("%Y-%m-%d").tolist()
     fig.add_trace(go.Candlestick(
         x=x, open=frame.Open, high=frame.High, low=frame.Low, close=frame.Close,
-        name="Completed daily candles", increasing_line_color=CHART_COLORS["entry"],
+        name=f"Completed {TIMEFRAME_LABELS[rectangle.interval].lower()} candles", increasing_line_color=CHART_COLORS["entry"],
         decreasing_line_color=CHART_COLORS["sell"],
     ), row=1, col=1)
     fig.add_shape(type="rect", x0=rectangle.start, x1=rectangle.end,
@@ -103,21 +104,23 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
         st.warning("Cached chart history is missing. Run Scan for Trading Ranges to reload it.")
         return
     adjustment = ""
-    if watch is not None:
-        try:
+    try:
+        if watch is not None:
             rectangle, adjustment = refresh_saved_rectangle(rectangle, watch["anchor_close"], frame)
-        except ValueError as exc:
-            st.warning(str(exc))
-            return
-    else:
-        # Later/canceled scans can have updated the cache. Results remain an as-of snapshot.
-        frame = frame.loc[frame.index <= pd.Timestamp(rectangle.end)]
+        else:
+            # Later/canceled scans can update history. Keep this result's as-of date.
+            frame = frame.loc[frame.index <= pd.Timestamp(rectangle.end)]
+            if frame.empty:
+                raise ValueError("The saved scan's chart history is unavailable. Run another scan.")
+            rectangle, adjustment = refresh_saved_rectangle(rectangle, rectangle.last_close, frame)
+        frame = analysis_bars(frame, rectangle.interval)
         if frame.empty:
-            st.warning("The saved scan's chart history is unavailable. Run another scan.")
-            return
-        # Back-adjustments may also have changed the downloaded cache since this result.
-        rectangle, adjustment = refresh_saved_rectangle(rectangle, rectangle.last_close, frame)
-    st.markdown(f"**{rectangle.symbol} · {rectangle.months:g}-month range · {rectangle.location}**")
+            raise ValueError("No completed candles are available for this rectangle.")
+    except (ValueError, RuntimeError) as exc:
+        st.warning(str(exc))
+        return
+    label = TIMEFRAME_LABELS[rectangle.interval]
+    st.markdown(f"**{rectangle.symbol} · {label} · {rectangle.months:g}-month range · {rectangle.location}**")
     # Calculate from original-range candles so older saved research also reports
     # actual-box containment instead of its historical padded-zone value.
     range_closes = frame.loc[rectangle.start:rectangle.end, "Close"]
@@ -126,9 +129,9 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
         f"{rectangle.start} to {rectangle.end} · {len(rectangle.support_touches)} support tests · "
         f"{len(rectangle.resistance_touches)} resistance tests · "
         f"{box_containment:.1%} of closes inside the drawn box. "
-        f"Daily candles through {frame.index[-1]:%Y-%m-%d} · {source}."
+        f"{label} candles through {frame.index[-1]:%Y-%m-%d} · {source}."
     )
-    if bucket != history_bucket():
+    if frame.index[-1] < latest_completed_date(rectangle.interval):
         st.caption("Saved history may be out of date. Run a scan to refresh it.")
     if adjustment:
         st.caption(adjustment)
@@ -140,13 +143,16 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
 def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="automation_logs/rectangle_research"):
     store = RectangleStore(store_root)
     st.markdown("#### Rectangle trading ranges")
-    st.caption(f"{UNIVERSE_LABEL} · Daily candles · 1–18 months · Research only")
+    active = st.session_state.get("rectangle_scan_job") is not None
+    label = st.radio("Timeframe", ["Daily", "Weekly"], horizontal=True,
+                     key="rectangle_timeframe", disabled=active)
+    interval = "1d" if label == "Daily" else "1w"
+    st.caption(f"{UNIVERSE_LABEL} · {label} candles · 3–24 months · Research only")
     source = "Alpaca IEX" if api_key and api_secret else "Yahoo"
     st.caption(f"New scans use {source}. Sidebar ticker, strategy and interval do not affect this scan.")
-    active = st.session_state.get("rectangle_scan_job") is not None
     if st.button("Scan for Trading Ranges", type="primary", disabled=active):
         provider = DailyHistoryProvider(api_key, api_secret)
-        st.session_state["rectangle_scan_job"] = start_range_scan(store, provider)
+        st.session_state["rectangle_scan_job"] = start_range_scan(store, provider, interval=interval)
         st.session_state.pop("rectangle_scan_notice", None)
         st.rerun()
     if active:
@@ -158,31 +164,34 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
         elif notice["canceled"]:
             st.info(notice["message"])
     try:
-        scan, watches = store.read("scan", {}), store.read("watchlist", {})
+        scan, all_watches = store.read_scan(interval), store.read("watchlist", {})
         results = [rectangle_from_record(row) for row in scan.get("rectangles", [])]
-        originals = {s: rectangle_from_record(w["rectangle"]) for s, w in watches.items()}
+        originals = {key: rectangle_from_record(w["rectangle"]) for key, w in all_watches.items()}
+        originals = {key: r for key, r in originals.items() if r.interval == interval}
+        watches = {key: all_watches[key] for key in originals}
     except (ValueError, KeyError, TypeError) as exc:
         st.error(f"Saved rectangle research could not be loaded: {exc}")
         return
     results_tab, watch_tab = st.tabs(["Scan results", f"Research watchlist ({len(watches)})"])
     with results_tab:
         if not scan:
-            st.info("Click Scan for Trading Ranges to find daily rectangles across Nasdaq stocks.")
+            st.info(f"Click Scan for Trading Ranges to find {label.lower()} rectangles across Nasdaq stocks.")
         else:
             timestamp = pd.Timestamp(scan["scanned_at"]).tz_convert("America/Los_Angeles")
             if scan.get("detector_version", 1) < DETECTOR_VERSION:
                 st.info("Saved results use earlier rectangle rules. Run Scan for Trading Ranges to apply "
-                        "90% containment inside the drawn box and the 95% ranking preference.")
+                        "3–24 month ranges with 90% containment and the 95% ranking preference.")
             st.caption(
                 f"Last scan {timestamp:%b %d, %Y %I:%M %p %Z} · {scan['source']} · "
                 f"{scan['successful']:,}/{scan['total']:,} histories checked · "
                 f"{scan['skipped']:,} excluded by price/activity/history rules · "
                 f"{len(scan['errors']):,} download/calculation problems."
             )
-            st.caption(f"Completed daily data dates: {scan['data_start']} to {scan['data_end']}.")
+            st.caption(f"Completed {label.lower()} data dates: {scan['data_start']} to {scan['data_end']}.")
             controls = st.columns([1.2, 1.8, 1])
             location = controls[0].selectbox("Price location", ["All", "Near support", "Middle", "Near resistance"], key="rectangle_location")
-            months = controls[1].slider("Range duration (months)", 1, 18, (1, 18), key="rectangle_duration")
+            duration_key = f"rectangle_duration_{interval}"
+            months = controls[1].slider("Range duration (months)", 3, 24, (3, 24), key=duration_key)
             only_new = controls[2].toggle("New candidates only", value=False, key="rectangle_only_new",
                                            help="Newly qualifying tickers compared with the previous scan using the same data source.")
             if only_new and scan.get("first_scan"):
@@ -190,11 +199,11 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             filtered = filter_rectangles(results, months, location, set(scan["new_symbols"]) if only_new else None)
             st.caption(f"{len(filtered):,} matching tickers · clearest ranges first · click a row to view its chart.")
             if filtered:
-                fingerprint = hashlib.sha256(str((scan["scanned_at"], location, months, only_new)).encode()).hexdigest()[:12]
+                fingerprint = hashlib.sha256(str((interval, scan["scanned_at"], location, months, only_new)).encode()).hexdigest()[:12]
                 index = _table_selection(rectangle_records(filtered), f"rectangle_results_{fingerprint}")
                 selected = filtered[index]
                 _render_chart(store, selected, scan["source"], "result")
-                if selected.symbol in watches:
+                if store.watch_key(selected.symbol, interval) in watches:
                     st.caption("Saved to the research watchlist. Its original rectangle is preserved.")
                 elif st.button("Save to Watchlist", key="rectangle_save", disabled=active):
                     try:
@@ -208,34 +217,40 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                 with st.expander("Stocks that could not be checked"):
                     st.dataframe(pd.DataFrame(scan["errors"]), hide_index=True, width="stretch")
     with watch_tab:
-        st.caption("Saved research only. Saving here does not enable a queued buy or change an exit plan. Prices refresh when you run a scan.")
+        st.caption(f"Showing saved {label.lower()} ranges. Switch Timeframe to view the other watchlist. "
+                   "Saving research does not enable a queued buy or change an exit plan. Prices refresh when you run a scan.")
         if not watches:
             st.info("Save a candidate from Scan results to track its original rectangle here.")
         else:
             records = []
-            for symbol, original in originals.items():
-                watch = watches[symbol]
+            watch_keys = []
+            for key, original in originals.items():
+                watch_keys.append(key)
+                watch = watches[key]
+                symbol = original.symbol
                 frame, bucket = store.read_history(symbol, watch["source"])
                 status, price, as_of = "History unavailable", None, ""
                 try:
                     if frame is not None:
                         current, _ = refresh_saved_rectangle(original, watch["anchor_close"], frame)
-                        price, as_of = current.last_close, frame.index[-1].strftime("%Y-%m-%d")
+                        bars = analysis_bars(frame, original.interval)
+                        price, as_of = current.last_close, bars.index[-1].strftime("%Y-%m-%d")
                         status = "Broke above" if current.location == "Above range" else "Broke below" if current.location == "Below range" else current.location
-                        if bucket != history_bucket():
+                        if bars.index[-1] < latest_completed_date(original.interval):
                             status += " · needs refresh"
-                except ValueError:
+                except (ValueError, RuntimeError):
                     status = "Price basis unavailable"
-                records.append({"Ticker": symbol, "Range (months)": original.months,
+                records.append({"Ticker": symbol, "Timeframe": label, "Range (months)": original.months,
                                 "Price": price, "Status": status, "Data date": as_of,
                                 "Saved": pd.Timestamp(watch["saved_at"]).strftime("%Y-%m-%d")})
-            key = hashlib.sha256(str([(r["Ticker"], r["Saved"]) for r in records]).encode()).hexdigest()[:10]
+            key = hashlib.sha256(str((interval, [(r["Ticker"], r["Saved"]) for r in records])).encode()).hexdigest()[:10]
             index = _table_selection(records, f"rectangle_watches_{key}")
             symbol = records[index]["Ticker"]
-            _render_chart(store, originals[symbol], watches[symbol]["source"], "watch", watch=watches[symbol])
+            watch_key = watch_keys[index]
+            _render_chart(store, originals[watch_key], watches[watch_key]["source"], "watch", watch=watches[watch_key])
             if st.button("Remove from Watchlist", key="rectangle_remove", disabled=active):
                 try:
-                    store.remove_watch(symbol)
+                    store.remove_watch(symbol, interval)
                     st.rerun()
                 except (OSError, ValueError, RuntimeError) as exc:
                     st.error(f"Could not remove the research candidate: {exc}")
@@ -244,11 +259,13 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
         if scan:
             st.caption(f"Nasdaq directory date: {scan['universe'].get('directory_date', 'Not supplied')}.")
         st.caption(
-            "Fixed research rules: about 21–378 trading sessions; at least two separated, confirmed tests at each boundary; "
+            "Fixed research rules: about 63–504 daily sessions or 13–104 completed trading weeks (3–24 months); "
+            "at least two separated, confirmed tests at each boundary; "
             "at least 90% of closes inside the drawn support/resistance box; "
             "ranges with at least 95% containment receive a ranking bonus. "
             "Limited boundary drift and wick overshoots are allowed. "
-            "Range width: 3–45% and at least three daily ATR. No prior uptrend is required. "
+            "Range width: 3–45% and at least three ATR on the selected timeframe. No prior uptrend is required. "
+            "Weekly candles aggregate daily OHLCV using the Nasdaq trading calendar; unfinished weeks and weeks with missing sessions are excluded. "
             "Near support is the bottom quarter; near resistance is the top quarter. "
             "Basic liquidity floor: price $1 and 20-session average dollar volume $100,000 on the displayed feed. "
             "IEX activity is not consolidated-market volume. Ranking describes range structure, not the probability of a profitable trade."

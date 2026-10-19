@@ -183,17 +183,29 @@ Shadow mode records would-have-traded decisions without submitting orders. Audit
 
 ## Rectangle Range Scanner
 
-On **Ideas**, click **Scan for Trading Ranges**. The research scanner uses daily
-OHLCV independently of the sidebar ticker, interval, risk and strategy settings.
-It searches approximately 1–18 months (21–378 trading sessions) and ranks
-horizontal rectangles by independent boundary tests, containment and flatness.
+On **Ideas**, choose **Timeframe: Daily / Weekly**, then click **Scan for Trading
+Ranges**. Both modes search approximately **3–24 months**: 63–504 daily sessions
+or 13–104 weekly candles. The scanner uses shared daily OHLCV independently of
+the sidebar ticker, interval, risk and strategy settings. It ranks horizontal
+rectangles by independent boundary tests, containment and flatness.
 Fixed defaults require two confirmed, separated tests per side, at least 90% of
-completed closes inside the actual drawn support/resistance box, a 3–45% range
-width and at least three daily ATR of width. At least 95% actual-box containment
+completed closes on the selected timeframe inside the actual drawn support/
+resistance box, a 3–45% range width and at least three selected-timeframe ATR of width. At least 95% actual-box containment
 earns a five-point ranking bonus; it is not required to qualify. Quality remains
 bounded at 100 and still rewards boundary flatness, independent tests and time
-coverage. Touch/wick tolerances and the latest-price zone check are unchanged. These are
-research heuristics, not validated trade probabilities or entry rules.
+coverage. Both modes confirm pivots with two subsequent completed candles;
+independent boundary tests are separated by at least five daily bars or two
+weekly bars. These are research heuristics, not validated trade probabilities
+or entry rules.
+
+Weekly OHLCV is aggregated locally using `exchange-calendars==4.13.2` and the XNAS
+session schedule. Open is the first daily open, high/low the weekly extrema,
+close the final session close, and volume the sum. Weekly dates identify the
+actual last session, including Thursday-ending holiday weeks. Unfinished weeks,
+partial initial weeks and weeks missing expected sessions are excluded. A detected
+weekly range cannot bridge a missing week. Early closes and daylight-saving time
+are handled by the calendar. The chart and containment measurement use the same
+selected-timeframe candles. An unfinished week does not affect a weekly signal.
 
 The universe comes from Nasdaq's public listing directory, excluding ETFs,
 test issues, non-normal financial status, and names identifying non-common
@@ -205,7 +217,10 @@ selected feed. At least 90% of those sessions must have positive reported volume
 
 Configured Alpaca credentials select **Alpaca IEX**; otherwise scans use **Yahoo**.
 Authentication failures do not silently switch feeds. IEX volume is feed-specific,
-not consolidated-market volume. Scans are batched, cancelable and cached on disk;
+not consolidated-market volume. A shared three-year daily cache provides 24-month
+ranges plus indicator warmup; older two-year caches are backfilled once on the next
+scan. Switching timeframe alone never downloads data. Scans are batched, cancelable
+and cached on disk;
 incremental refreshes that detect changed overlapping prices reload full history
 to handle corporate actions and provider corrections. Canceled/fatal scans retain
 the prior results; per-stock failures are reported and preserve discovery history.
@@ -215,10 +230,15 @@ only** filter saved results without downloading prices or scanning again. Click 
 row for the exact detected rectangle; **Show volume** only changes the chart.
 One best matching range is shown per ticker after filtering all detected lengths.
 New means newly qualifying versus that ticker's previous successful scan on the
-same feed; the first scan treats every match as a first discovery.
+same feed and timeframe; each mode's first scan treats every match as a first
+discovery. Daily results and discovery history remain in `scan.json`; weekly results
+use `scan_weekly.json`. Switching timeframe shows that mode's last saved scan and
+watchlist. Running one mode never replaces the other mode's results.
 
 **Save to Watchlist** creates research only, separate from the executable Buy
-watchlist. Original geometry is preserved. Later scans refresh cached prices,
+watchlist. Original geometry and timeframe are preserved. A ticker can have a
+separate daily and weekly saved range. Legacy records without a timeframe are
+read as daily; they are not automatically rewritten or reinterpreted as weekly. Later scans refresh cached prices,
 including saved symbols no longer in the universe. Corporate-action basis changes
 are explicitly reflected when plotting/evaluating original levels; missing basis
 data and stale history remain visible. **Remove from Watchlist** removes only the
