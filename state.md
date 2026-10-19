@@ -1,8 +1,45 @@
 # Trading Simulator - Conversation State Handoff
 
-Last updated: 2026-07-16 (Pacific Time)
+Last updated: 2026-10-19 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
+
+## October 19, 2026 — Rectangle research scanner
+
+Containment refinement: scan eligibility now requires at least 90% of completed
+closes inside the actual drawn box, rather than inside padded boundary zones.
+At least 95% actual-box containment adds a five-point ranking bonus; it is not an
+eligibility requirement. The score stays bounded at 100. Other touch, wick,
+excursion and latest-price tolerances remain unchanged. Detector version is 2;
+older scan snapshots show a rescan notice. Chart containment is measured directly
+from the range's cached candles, including for older saved research. Original
+watchlist geometry remains preserved. No extra controls were added.
+Verification after this refinement: 495 tests passed. A read-only recheck of the
+previous 63 candidates against the same cached history retained 39 tickers; the
+user's saved scan and research watchlist were not rewritten during verification.
+
+The approved scope is deliberately simple: Ideas → Scan for Trading Ranges,
+Nasdaq Composite-style common-stock discovery, completed daily bars, approximately
+1–18 months. One selected annotated candlestick chart, research-only save/remove
+watchlist, and four optional controls: Price location (All), Range duration (1–18),
+New candidates only (Off), Show volume (Off). No TradingView link. No required
+prior uptrend or proximity to an upside breakout. Candidates near support matter
+as much as those near resistance; no range-entry trading strategy was added.
+
+The public Nasdaq directory is filtered by common-stock type and basic liquidity;
+the UI explicitly states this is not a verified licensed Composite membership
+list. Alpaca IEX is used when credentials are configured, Yahoo otherwise. The
+scan is independent of sidebar inputs, batched, cancelable, persisted and cached.
+Filters and chart controls do not rerun scans. Saved original rectangles are
+preserved, with visible corporate-action basis adjustments and stale/error states.
+The existing strategy scanner remains in a collapsed section. All research state
+is separate from the Buy watchlist and broker worker. No UI or worker was started,
+no account credentials were printed, and no broker action was performed during
+development. Verification: 488 tests passed, including 21 new detector, data, persistence and Streamlit UI checks. The public directory loader returned 3,003 eligible listings during verification. The user handles commits and pushes.
+
+Current recovery context for earlier features is in
+`C:\Users\godma\Documents\Codex\Trading_Simulator_Handoff_10.19.2026.md`.
+The older sections below are historical and may describe superseded behavior.
 
 ## Project Location
 

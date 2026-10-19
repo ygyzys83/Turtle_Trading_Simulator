@@ -234,6 +234,7 @@ from agentloop_trader.safety import (
     write_live_mode_lockfile,
 )
 from agentloop_trader.scanner import DEFAULT_SCAN_SYMBOLS, ScannerCandidateStore, scan_universe, scanner_records
+from agentloop_trader.rectangle_ui import render_rectangle_scanner
 from agentloop_trader.session_journal import (
     PaperSessionSnapshot,
     alpaca_paper_activity_records,
@@ -285,7 +286,6 @@ active_page_for_startup = st.session_state.get(
     "Positions & Queue",
 )
 load_sidebar_ticker_history = active_page_for_startup in {
-    "Ideas",
     "New Trade",
     "Alpaca",
 }
@@ -2509,7 +2509,7 @@ if data_source in ("Ticker (Alpaca)", "Ticker (yfinance)", "Crypto (Alpaca)"):
             st.stop()
     else:
         source_caption = (
-            f"{ticker} is selected; historical bars are deferred until Ideas, New Trade, or Alpaca is opened."
+            f"{ticker} is selected; historical bars are deferred until New Trade or Alpaca is opened."
         )
         st.sidebar.caption("Historical ticker data is paused on this page for faster startup.")
 st.session_state["last_loaded_symbol"] = ticker
@@ -5307,78 +5307,80 @@ if command_center_view == "Positions & Queue":
     sub_section("Positions & queue", "Manage open paper positions, saved exit plans, and queued BUY setups.")
     render_open_positions_panel()
 elif command_center_view == "Ideas":
-    sub_section("Ideas", "Scan tickers, compare strategy fit, and create a simple research read.")
-    scanner_store = ScannerCandidateStore()
-    default_scan_text = ", ".join(DEFAULT_SCAN_SYMBOLS)
-    scan_symbols_text = st.text_input("Tickers to scan", value=default_scan_text)
-    scan_source = data_source if data_source in {"Ticker (Alpaca)", "Ticker (yfinance)"} else "Ticker (Alpaca)"
-    st.caption(f"Scanner uses {scan_source}, {period if period != 'synthetic' else '1y'}, {interval if interval != '1d' or data_source != 'Synthetic' else '1h'}.")
+    sub_section("Ideas", "Find daily trading ranges and save research candidates.")
+    render_rectangle_scanner(alpaca_config.api_key, alpaca_config.api_secret)
+    with st.expander("Strategy scanner and research", expanded=False):
+        scanner_store = ScannerCandidateStore()
+        default_scan_text = ", ".join(DEFAULT_SCAN_SYMBOLS)
+        scan_symbols_text = st.text_input("Tickers to scan", value=default_scan_text)
+        scan_source = data_source if data_source in {"Ticker (Alpaca)", "Ticker (yfinance)"} else "Ticker (Alpaca)"
+        st.caption(f"Scanner uses {scan_source}, {period if period != 'synthetic' else '1y'}, {interval if interval != '1d' or data_source != 'Synthetic' else '1h'}.")
 
-    if st.button("Scan Tickers", type="primary"):
-        scan_symbols = [item.strip().upper() for item in scan_symbols_text.split(",") if item.strip()]
-        scan_period = period if period != "synthetic" else "1y"
-        scan_interval = interval if data_source != "Synthetic" else "1h"
+        if st.button("Scan Tickers", type="primary"):
+            scan_symbols = [item.strip().upper() for item in scan_symbols_text.split(",") if item.strip()]
+            scan_period = period if period != "synthetic" else "1y"
+            scan_interval = interval if data_source != "Synthetic" else "1h"
 
-        def scan_fetch(symbol: str) -> pd.DataFrame:
-            return fetch_price_data_for_source(symbol, scan_period, scan_interval, scan_source)
+            def scan_fetch(symbol: str) -> pd.DataFrame:
+                return fetch_price_data_for_source(symbol, scan_period, scan_interval, scan_source)
 
-        with st.spinner("Scanning tickers..."):
-            candidates, scan_errors = scan_universe(
-                scan_symbols,
-                scan_fetch,
-                current_strategy_settings | {"history": scan_period, "interval": scan_interval, "price_data_source": scan_source},
-                float(paper_order_risk_equity),
-                risk_limits,
-                max_symbols=30,
-            )
-        scanner_store.save(candidates, scan_errors)
-        st.session_state["selected_scan_symbol"] = candidates[0].symbol if candidates else ""
-        st.rerun()
-    saved_candidates, saved_scan_errors = scanner_store.read()
-    if saved_candidates:
-        st.markdown("#### Current ideas")
-        st.dataframe(pd.DataFrame(scanner_records(saved_candidates)), width="stretch", hide_index=True)
-        selected_scan_symbol = st.selectbox(
-            "Research one ticker",
-            [candidate.symbol for candidate in saved_candidates],
-            index=max(0, [candidate.symbol for candidate in saved_candidates].index(st.session_state.get("selected_scan_symbol", saved_candidates[0].symbol))) if st.session_state.get("selected_scan_symbol") in [candidate.symbol for candidate in saved_candidates] else 0,
-        )
-        selected_candidate = next(candidate for candidate in saved_candidates if candidate.symbol == selected_scan_symbol)
-        research_provider = st.selectbox("Research writer", ["Built-in", "Ollama", "Gemini"], index=0)
-        if st.button("Analyze Selected Ticker"):
-            config = LLMResearchConfig.from_env(research_provider.lower().replace("built-in", "deterministic"))
-            with st.spinner("Building research read..."):
-                context = build_company_research_context(selected_candidate.symbol, alpaca_config.api_key, alpaca_config.api_secret)
-                result = analyze_candidate(selected_candidate, context, config)
-            st.session_state["latest_llm_research"] = asdict(result)
-            st.session_state["latest_company_context"] = {
-                "Ticker": context.symbol,
-                "Event risk": context.event_risk,
-                "Event detail": context.event_detail,
-                "News": context.news_status,
-                "Fundamentals": context.fundamentals_status,
-                "Headlines": " | ".join(item.headline for item in context.headlines[:5]) or "None loaded",
-            }
+            with st.spinner("Scanning tickers..."):
+                candidates, scan_errors = scan_universe(
+                    scan_symbols,
+                    scan_fetch,
+                    current_strategy_settings | {"history": scan_period, "interval": scan_interval, "price_data_source": scan_source},
+                    float(paper_order_risk_equity),
+                    risk_limits,
+                    max_symbols=30,
+                )
+            scanner_store.save(candidates, scan_errors)
+            st.session_state["selected_scan_symbol"] = candidates[0].symbol if candidates else ""
             st.rerun()
-        if st.session_state.get("latest_llm_research"):
-            st.markdown(
-                "#### Research read",
-                help=(
-                    "Summarizes the selected ticker from the scanner, deterministic research, and the optional research writer. "
-                    "Use it to understand the idea before opening the ticker in New Trade. It cannot send an order."
-                ),
+        saved_candidates, saved_scan_errors = scanner_store.read()
+        if saved_candidates:
+            st.markdown("#### Current ideas")
+            st.dataframe(pd.DataFrame(scanner_records(saved_candidates)), width="stretch", hide_index=True)
+            selected_scan_symbol = st.selectbox(
+                "Research one ticker",
+                [candidate.symbol for candidate in saved_candidates],
+                index=max(0, [candidate.symbol for candidate in saved_candidates].index(st.session_state.get("selected_scan_symbol", saved_candidates[0].symbol))) if st.session_state.get("selected_scan_symbol") in [candidate.symbol for candidate in saved_candidates] else 0,
             )
-            latest_result = LLMResearchResult(**st.session_state["latest_llm_research"])
-            st.dataframe(pd.DataFrame(llm_research_records(latest_result)), width="stretch", hide_index=True)
-            if st.session_state.get("latest_company_context"):
-                st.markdown("#### Company context")
-                st.dataframe(pd.DataFrame([{"Item": key, "Value": value} for key, value in st.session_state["latest_company_context"].items()]), width="stretch", hide_index=True)
-            st.caption("This research read cannot send orders. Open the ticker in New Trade before placing a paper buy.")
-    else:
-        st.info("No ideas scanned yet. Enter tickers above and click Scan Tickers.")
-    if saved_scan_errors and show_portfolio_evidence:
-        with st.expander("Scanner errors *", expanded=False):
-            st.dataframe(pd.DataFrame(saved_scan_errors), width="stretch", hide_index=True)
+            selected_candidate = next(candidate for candidate in saved_candidates if candidate.symbol == selected_scan_symbol)
+            research_provider = st.selectbox("Research writer", ["Built-in", "Ollama", "Gemini"], index=0)
+            if st.button("Analyze Selected Ticker"):
+                config = LLMResearchConfig.from_env(research_provider.lower().replace("built-in", "deterministic"))
+                with st.spinner("Building research read..."):
+                    context = build_company_research_context(selected_candidate.symbol, alpaca_config.api_key, alpaca_config.api_secret)
+                    result = analyze_candidate(selected_candidate, context, config)
+                st.session_state["latest_llm_research"] = asdict(result)
+                st.session_state["latest_company_context"] = {
+                    "Ticker": context.symbol,
+                    "Event risk": context.event_risk,
+                    "Event detail": context.event_detail,
+                    "News": context.news_status,
+                    "Fundamentals": context.fundamentals_status,
+                    "Headlines": " | ".join(item.headline for item in context.headlines[:5]) or "None loaded",
+                }
+                st.rerun()
+            if st.session_state.get("latest_llm_research"):
+                st.markdown(
+                    "#### Research read",
+                    help=(
+                        "Summarizes the selected ticker from the scanner, deterministic research, and the optional research writer. "
+                        "Use it to understand the idea before opening the ticker in New Trade. It cannot send an order."
+                    ),
+                )
+                latest_result = LLMResearchResult(**st.session_state["latest_llm_research"])
+                st.dataframe(pd.DataFrame(llm_research_records(latest_result)), width="stretch", hide_index=True)
+                if st.session_state.get("latest_company_context"):
+                    st.markdown("#### Company context")
+                    st.dataframe(pd.DataFrame([{"Item": key, "Value": value} for key, value in st.session_state["latest_company_context"].items()]), width="stretch", hide_index=True)
+                st.caption("This research read cannot send orders. Open the ticker in New Trade before placing a paper buy.")
+        else:
+            st.info("No ideas scanned yet. Enter tickers above and click Scan Tickers.")
+        if saved_scan_errors and show_portfolio_evidence:
+            with st.expander("Scanner errors *", expanded=False):
+                st.dataframe(pd.DataFrame(saved_scan_errors), width="stretch", hide_index=True)
 elif command_center_view == "New Trade":
     with st.expander(f"New Trade Research - {ticker}", expanded=True):
         desk_cols = st.columns(4)

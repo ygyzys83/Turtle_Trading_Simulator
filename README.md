@@ -179,3 +179,52 @@ Shadow mode records would-have-traded decisions without submitting orders. Audit
 
 - `docs/PRODUCTION_SAFETY.md`
 - `docs/LIVE_DEPLOYMENT_CHECKLIST.md`
+
+
+## Rectangle Range Scanner
+
+On **Ideas**, click **Scan for Trading Ranges**. The research scanner uses daily
+OHLCV independently of the sidebar ticker, interval, risk and strategy settings.
+It searches approximately 1–18 months (21–378 trading sessions) and ranks
+horizontal rectangles by independent boundary tests, containment and flatness.
+Fixed defaults require two confirmed, separated tests per side, at least 90% of
+completed closes inside the actual drawn support/resistance box, a 3–45% range
+width and at least three daily ATR of width. At least 95% actual-box containment
+earns a five-point ranking bonus; it is not required to qualify. Quality remains
+bounded at 100 and still rewards boundary flatness, independent tests and time
+coverage. Touch/wick tolerances and the latest-price zone check are unchanged. These are
+research heuristics, not validated trade probabilities or entry rules.
+
+The universe comes from Nasdaq's public listing directory, excluding ETFs,
+test issues, non-normal financial status, and names identifying non-common
+security types. It is explicitly labeled **Nasdaq common stocks (Composite-style)**;
+it is not a licensed, verified Composite constituent list. Directory metadata,
+data dates, skipped stocks and failures remain visible. The fixed activity floor
+is $1 price and $100,000 average daily dollar volume over 20 sessions on the
+selected feed. At least 90% of those sessions must have positive reported volume.
+
+Configured Alpaca credentials select **Alpaca IEX**; otherwise scans use **Yahoo**.
+Authentication failures do not silently switch feeds. IEX volume is feed-specific,
+not consolidated-market volume. Scans are batched, cancelable and cached on disk;
+incremental refreshes that detect changed overlapping prices reload full history
+to handle corporate actions and provider corrections. Canceled/fatal scans retain
+the prior results; per-stock failures are reported and preserve discovery history.
+
+After a scan, **Price location**, **Range duration (months)** and **New candidates
+only** filter saved results without downloading prices or scanning again. Click a
+row for the exact detected rectangle; **Show volume** only changes the chart.
+One best matching range is shown per ticker after filtering all detected lengths.
+New means newly qualifying versus that ticker's previous successful scan on the
+same feed; the first scan treats every match as a first discovery.
+
+**Save to Watchlist** creates research only, separate from the executable Buy
+watchlist. Original geometry is preserved. Later scans refresh cached prices,
+including saved symbols no longer in the universe. Corporate-action basis changes
+are explicitly reflected when plotting/evaluating original levels; missing basis
+data and stale history remain visible. **Remove from Watchlist** removes only the
+research record. Scans never create broker orders, Buy watchlist entries or exit
+plans, and no periodic unattended scan is scheduled. The existing strategy scanner
+remains under **Strategy scanner and research**.
+
+Rectangle research state and downloaded histories live under
+`automation_logs/rectangle_research/`, already excluded from Git.
