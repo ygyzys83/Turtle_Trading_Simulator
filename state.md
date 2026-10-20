@@ -1,10 +1,47 @@
 # Trading Simulator - Conversation State Handoff
 
-Last updated: 2026-10-19 (Pacific Time)
+Last updated: 2026-10-20 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 19, 2026 — Rectangle research scanner (current)
+## October 20, 2026 — Optional setup filters (current)
+
+User preference changed: now favors higher lows and tightening above midpoint
+toward resistance, rather than buying near the range floor. The scanner still
+finds all qualifying rectangles. Three optional post-scan checkboxes refine the
+matching table: Higher lows, Tight near resistance, Supportive volume. Defaults
+are off; selected factors combine with AND. Unknown never passes an enabled
+filter. Status columns show ✓ / — / Unknown; chart adds midpoint and confirmed
+pullback-low markers, with explanations and assessment date in Setup details.
+
+Fixed rules are documented in README.md and rectangle_signals.py. Daily/weekly
+higher-low windows: 60 sessions / 13 weeks, latest two two-candle-confirmed lows
+separated by 5 / 2 candles, rising >=max(0.25 ATR, 2% box height), no later undercut,
+latest close above latest low. Tightness: last 10 / 4 candles, >=80% closes above
+midpoint, latest inside upper third, median true range <=80% of preceding equal
+block and <=20% / 35% box height. Volume: last 20 / 8 candles, >=3 / 2 advancing
+and declining observations, median down volume <=80% of up volume. Weekly volume
+is divided by scheduled session count for holiday comparisons. Gaps/missing
+evidence return Unknown. Only completed candles inside the saved range are used.
+
+Detector version is now 5; legacy fields default to Unknown. Old snapshots show
+a rescan notice. Filter before duration deduplication; preserve original rectangle
+eligibility, quality and prior-trend ranking. No extra ranking bonus was added.
+Watchlist assessments remain as of the original saved scan, even when newer price
+status is shown. Corporate-action adjustments also rebase low markers; explanatory
+price magnitudes use box-height percentages. No real scan, UI, worker, broker,
+commit or push was started during development; saved research data is untouched.
+
+Verification: 564 tests passed, including 37 new setup-assessment checks. A
+read-only baseline comparison across 89 cached ticker/timeframe combinations
+and 184 candidate windows found no rectangle eligibility, geometry or ranking
+changes. Post-scan filters were verified in Daily and Weekly AppTest sessions
+without starting a scan, downloading data or modifying saved research.
+
+The October 19 section below describes the previous checkpoint; its control count
+and detector version have been superseded by this section.
+
+## October 19, 2026 — Rectangle research scanner
 
 Checkpoint before weekly work: `79387c3` contains the working daily scanner and
 90% actual-box containment / 95% ranking preference; 495 tests passed then. The

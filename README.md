@@ -220,6 +220,44 @@ bonus; original geometry is preserved. Older scan results prompt an explicit
 rescan for updated trend context and ranking. Viewing/filtering results never
 calculates another scan or downloads additional history.
 
+Three optional post-scan checkboxes refine **matching tickers**: **Higher lows**,
+**Tight near resistance**, and **Supportive volume**. All start off; every selected
+factor must pass. The table shows each factor as **✓**, **—**, or **Unknown**.
+Unknown means insufficient evidence or not assessed, and never passes an enabled
+filter. With filters off, all qualifying rectangles remain available. The existing
+rectangle-quality plus prior-trend ordering is retained; there is no new score.
+Filters are applied to every detected duration before choosing one best range
+per ticker. Fixed starting research rules (no threshold controls):
+
+- **Higher lows:** latest two separated, confirmed pullback lows within the last
+  60 daily sessions / 13 weekly candles. Each needs two later completed candles
+  for confirmation. Their separation is at least five daily / two weekly candles.
+  The rise must reach the greater of 0.25 ATR and 2% of rectangle height. No later
+  candle may undercut the latest low, and the latest close must be above it.
+- **Tight near resistance:** last 10 daily / 4 weekly candles have at least 80%
+  of closes above midpoint, latest close inside the upper third, and median true
+  range at least 20% smaller than the preceding equal block. Median true range
+  must also be at most 20% / 35% of rectangle height. True range includes full
+  wicks and gaps; small bodies alone do not count as tight trading.
+- **Supportive volume:** over the last 20 daily / 8 weekly candles, median volume
+  on close-to-close declines is at most 80% of median advancing-candle volume.
+  At least three daily / two weekly candles on each side are required. Unchanged
+  closes are excluded. Weekly volume is normalized per scheduled trading session
+  to avoid holiday-week bias. Missing, zero, or invalid recent volume is Unknown;
+  one event spike cannot determine the median comparison. Volume uses the same
+  displayed feed as the scan, not inferred consolidated-market activity.
+
+These assessments use consecutive completed candles inside the candidate range,
+strictly through its saved scan date. Missing required candles or confirmed lows
+produce Unknown rather than invented evidence. The chart marks the assessed
+pullback lows and midpoint; **Setup details** explains each result and its date.
+Saved watchlist assessments retain their original scan date even if cached price
+history is refreshed later. Split adjustments also rebase plotted low markers.
+Old records remain readable with Unknown factors until a new scan produces new
+matches; original watchlist entries are not rewritten. These optional filters do
+not alter rectangle qualification, discovery history, or ranking, and do not
+estimate breakout probabilities.
+
 Weekly OHLCV is aggregated locally using `exchange-calendars==4.13.2` and the XNAS
 session schedule. Open is the first daily open, high/low the weekly extrema,
 close the final session close, and volume the sum. Weekly dates identify the

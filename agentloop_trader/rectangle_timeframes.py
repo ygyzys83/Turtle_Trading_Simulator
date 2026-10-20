@@ -89,6 +89,12 @@ def weekly_bars(data: pd.DataFrame, now=None) -> pd.DataFrame:
     result = result.loc[complete]
     result.index = pd.DatetimeIndex(metadata.loc[complete, "last_session"], name=frame.index.name)
     result.attrs.update(frame.attrs)
+    if "Volume" in frame:
+        # Keep OHLCV totals intact, but do not let an absent daily volume value
+        # masquerade as a light-volume weekly pullback after aggregation.
+        usable = (frame.Volume > 0) & (frame.Volume < float("inf"))
+        valid_weeks = usable.groupby(frame.index.to_period("W-FRI")).all()
+        result.attrs["incomplete_volume_weeks"] = tuple(str(w) for w in valid_weeks.index[~valid_weeks])
     return result
 
 

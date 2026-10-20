@@ -8,10 +8,11 @@ import numpy as np
 import pandas as pd
 
 from agentloop_trader.indicators import calc_atr
+from agentloop_trader.rectangle_signals import analyze_breakout_signals, signal_label
 from agentloop_trader.rectangle_timeframes import analysis_bars, completed_daily_bars, session_schedule, validate_interval
 
 
-DETECTOR_VERSION = 4
+DETECTOR_VERSION = 5
 WINDOWS = tuple(month*21 for month in range(3, 25))
 WEEKLY_WINDOWS = tuple(round(month*52/12) for month in range(3, 25))
 
@@ -38,6 +39,13 @@ class Rectangle:
     prior_start: str = ""
     prior_end: str = ""
     prior_trend_consistency: float | None = None
+    higher_lows: bool | None = None
+    tight_near_resistance: bool | None = None
+    supportive_volume: bool | None = None
+    signal_details: tuple[str, ...] = ()
+    higher_low_dates: tuple[str, ...] = ()
+    higher_low_prices: tuple[float, ...] = ()
+    signals_as_of: str = ""
 
     @property
     def ranking_score(self) -> float:
@@ -73,6 +81,8 @@ def rectangle_from_record(row: dict[str, Any]) -> Rectangle:
     values = dict(row)
     for name in ("support_touches", "resistance_touches"):
         values[name] = tuple(values[name])
+    for name in ("signal_details", "higher_low_dates", "higher_low_prices"):
+        values[name] = tuple(values.get(name, ()))
     result = Rectangle(**values)
     validate_interval(result.interval)
     if not (0 < result.support < result.resistance and result.tolerance > 0):
@@ -81,6 +91,13 @@ def rectangle_from_record(row: dict[str, Any]) -> Rectangle:
         raise ValueError("Invalid saved prior-trend label.")
     if not np.isfinite(result.prior_trend_bonus) or not 0 <= result.prior_trend_bonus <= 10:
         raise ValueError("Invalid saved prior-trend ranking bonus.")
+    for name in ("higher_lows", "tight_near_resistance", "supportive_volume"):
+        if getattr(result, name) is not None and type(getattr(result, name)) is not bool:
+            raise ValueError("Invalid saved setup assessment.")
+    if (len(result.higher_low_dates) != len(result.higher_low_prices)
+            or len(result.higher_low_dates) not in (0, 2)
+            or any(not np.isfinite(p) or p <= 0 for p in result.higher_low_prices)):
+        raise ValueError("Invalid saved pullback-low markers.")
     return result
 
 
@@ -242,6 +259,8 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, interval="1d", now=Non
             continue
         quality = _rectangle_quality(containment, edge_drift, len(lows)+len(highs), span)
         prior = analyze_prior_trend(frame, frame.index[start], interval)
+        signals = analyze_breakout_signals(frame, start=dates[start], end=dates[-1],
+                                          support=support, resistance=resistance, atr=atr, interval=interval)
         matches.append(Rectangle(
             symbol=str(symbol).strip().upper(), start=dates[start], end=dates[-1], bars=window,
             support=support, resistance=resistance, tolerance=tolerance, atr=atr,
@@ -252,12 +271,14 @@ def detect_rectangles(symbol: str, data: pd.DataFrame, *, interval="1d", now=Non
             prior_trend=prior.direction, prior_return_percent=prior.return_percent,
             prior_trend_bonus=prior.bonus, prior_start=prior.start, prior_end=prior.end,
             prior_trend_consistency=prior.consistency,
+            **signals,
         ))
     return sorted(matches, key=rectangle_rank_key, reverse=True)
 
 
 def filter_rectangles(rows: list[Rectangle], months=(3, 24), location="All",
-                      new_symbols: set[str] | None = None) -> list[Rectangle]:
+                      new_symbols: set[str] | None = None, *, higher_lows=False,
+                      tight_near_resistance=False, supportive_volume=False) -> list[Rectangle]:
     """Filter all detected durations, then select one best rectangle per symbol."""
     best: dict[tuple[str, str], Rectangle] = {}
     for row in sorted(rows, key=rectangle_rank_key, reverse=True):
@@ -267,6 +288,11 @@ def filter_rectangles(rows: list[Rectangle], months=(3, 24), location="All",
             continue
         if new_symbols is not None and row.symbol not in new_symbols:
             continue
+        if any(required and getattr(row, name) is not True for name, required in (
+            ("higher_lows", higher_lows), ("tight_near_resistance", tight_near_resistance),
+            ("supportive_volume", supportive_volume),
+        )):
+            continue
         best.setdefault((row.symbol, row.interval), row)
     return list(best.values())
 
@@ -274,6 +300,9 @@ def filter_rectangles(rows: list[Rectangle], months=(3, 24), location="All",
 def rectangle_records(rows: list[Rectangle]) -> list[dict[str, Any]]:
     return [{"Ticker": r.symbol, "Timeframe": "Daily" if r.interval == "1d" else "Weekly", "Range (months)": r.months,
              "Prior trend": r.prior_trend,
+             "Higher lows": signal_label(r.higher_lows),
+             "Tight near resistance": signal_label(r.tight_near_resistance),
+             "Supportive volume": signal_label(r.supportive_volume),
              "Support": round(r.support, 2), "Resistance": round(r.resistance, 2),
              "Price": round(r.last_close, 2), "Price location": r.location,
              "Position in range (%)": round(r.position_percent, 1)} for r in rows]
@@ -291,6 +320,7 @@ def refresh_saved_rectangle(original: Rectangle, original_anchor: float, data: p
     factor = anchor / original_anchor
     current = replace(original, support=original.support*factor,
                       resistance=original.resistance*factor, tolerance=original.tolerance*factor,
-                      atr=original.atr*factor, last_close=float(frame.Close.iloc[-1]))
+                      atr=original.atr*factor, last_close=float(frame.Close.iloc[-1]),
+                      higher_low_prices=tuple(p*factor for p in original.higher_low_prices))
     adjustment = "Price basis adjusted for corporate actions." if abs(factor-1) > .00001 else ""
     return current, adjustment

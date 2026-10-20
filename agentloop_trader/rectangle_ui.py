@@ -14,6 +14,7 @@ from agentloop_trader.rectangle_scanner import (
     DETECTOR_VERSION, Rectangle, filter_rectangles, rectangle_from_record, rectangle_records, refresh_saved_rectangle,
 )
 from agentloop_trader.rectangle_store import RectangleStore
+from agentloop_trader.rectangle_signals import SIGNAL_LABELS, signal_label
 from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, TIMEFRAME_LABELS
 from agentloop_trader.ui_theme import CHART_COLORS
 
@@ -51,6 +52,18 @@ def build_rectangle_chart(frame: pd.DataFrame, rectangle: Rectangle, *, show_vol
     ):
         fig.add_trace(go.Scatter(x=list(touches), y=[level]*len(touches), mode="markers",
                                  name=label, marker=dict(size=7, color=color, symbol="circle-open")), row=1, col=1)
+    if rectangle.higher_low_dates:
+        fig.add_trace(go.Scatter(
+            x=list(rectangle.higher_low_dates), y=list(rectangle.higher_low_prices),
+            mode="lines+markers", name="Confirmed pullback lows",
+            line=dict(color=CHART_COLORS["entry"] if rectangle.higher_lows else CHART_COLORS["trend"], dash="dot"),
+            marker=dict(size=9, symbol="triangle-up"),
+            hovertemplate="Confirmed pullback low<br>%{x}: $%{y:.2f}<extra></extra>",
+        ), row=1, col=1)
+    fig.add_trace(go.Scatter(x=[rectangle.start, x[-1]],
+                             y=[(rectangle.support+rectangle.resistance)/2]*2,
+                             mode="lines", name="Range midpoint",
+                             line=dict(color=CHART_COLORS["trend"], width=1, dash="dot")), row=1, col=1)
     if show_volume:
         colors = [CHART_COLORS["entry"] if c >= o else CHART_COLORS["sell"] for c, o in zip(frame.Close, frame.Open)]
         fig.add_trace(go.Bar(x=x, y=frame.Volume, name="Volume", marker_color=colors, opacity=.5), row=2, col=1)
@@ -94,6 +107,9 @@ def _table_selection(records, key):
             "Price": st.column_config.NumberColumn(format="$%.2f"),
             "Position in range (%)": st.column_config.NumberColumn(format="%.1f%%"),
             "Prior trend": st.column_config.TextColumn(help="Trend over the six months before this rectangle began. Up adds up to 10 ranking points; other labels do not exclude a range."),
+            "Higher lows": st.column_config.TextColumn(help="✓ Two confirmed pullback lows are meaningfully rising and the latest still holds. — Does not pass. Unknown means insufficient evidence or not assessed."),
+            "Tight near resistance": st.column_config.TextColumn(help="✓ Mostly above midpoint, latest close in upper third, and smaller recent candle ranges including wicks/gaps. Details appear below the chart."),
+            "Supportive volume": st.column_config.TextColumn(help="✓ Median volume on pullbacks is at least 20% lighter than on advances. Unknown means insufficient evidence or not assessed. Uses the displayed scan feed."),
         },
     )
     selection = event.selection.rows
@@ -148,6 +164,16 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
     show_volume = st.toggle("Show volume", value=False, key=f"rectangle_volume_{key}")
     st.plotly_chart(build_rectangle_chart(frame, rectangle, show_volume=show_volume),
                     width="stretch", theme=None, config={"scrollZoom": True}, key=f"rectangle_chart_{key}")
+    with st.expander("Setup details"):
+        if rectangle.signal_details:
+            st.caption(f"Setup assessed through {rectangle.signals_as_of} · saved scan assessment. "
+                       "✓ Passes · — Does not pass · Unknown: insufficient evidence. These factors do not change the ranking.")
+            if watch is not None:
+                st.caption("These setup factors describe the saved candidate; the latest price status above can be newer.")
+            for (name, label), reason in zip(SIGNAL_LABELS.items(), rectangle.signal_details):
+                st.write(f"**{label}: {signal_label(getattr(rectangle, name))}** · {reason}")
+        else:
+            st.caption("Setup factors were not assessed for this saved range. Run a new scan to assess current matches.")
 
 
 def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="automation_logs/rectangle_research"):
@@ -190,7 +216,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             timestamp = pd.Timestamp(scan["scanned_at"]).tz_convert("America/Los_Angeles")
             if scan.get("detector_version", 1) < DETECTOR_VERSION:
                 st.info("Saved results use earlier rectangle rules. Run Scan for Trading Ranges to apply "
-                        "the current ranking and six-month prior-trend assessment.")
+                        "the current assessments, including the three optional setup filters.")
             st.caption(
                 f"Last scan {timestamp:%b %d, %Y %I:%M %p %Z} · {scan['source']} · "
                 f"{scan['successful']:,}/{scan['total']:,} histories checked · "
@@ -206,10 +232,20 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                                            help="Newly qualifying tickers compared with the previous scan using the same data source.")
             if only_new and scan.get("first_scan"):
                 st.caption("This is the first scan for this data source; all matches are first discoveries.")
-            filtered = filter_rectangles(results, months, location, set(scan["new_symbols"]) if only_new else None)
+            st.caption("Optional setup filters · selected factors must all pass · ✓ Passes · — Does not pass · Unknown: insufficient evidence or not assessed")
+            setup_controls = st.columns(3)
+            higher_lows = setup_controls[0].checkbox("Higher lows", key=f"rectangle_higher_lows_{interval}",
+                help="Two recent confirmed pullback lows are meaningfully rising, and the latest still holds.")
+            tight = setup_controls[1].checkbox("Tight near resistance", key=f"rectangle_tight_{interval}",
+                help="Mostly above midpoint, latest close in the upper third, and contracting candles including wicks/gaps.")
+            volume = setup_controls[2].checkbox("Supportive volume", key=f"rectangle_supportive_volume_{interval}",
+                help="Pullbacks have lighter typical volume than advances. Unknown assessments do not pass this filter.")
+            filtered = filter_rectangles(results, months, location, set(scan["new_symbols"]) if only_new else None,
+                                         higher_lows=higher_lows, tight_near_resistance=tight, supportive_volume=volume)
             st.caption(f"{len(filtered):,} matching tickers · ranked by rectangle quality + prior strength · click a row to view its chart.")
             if filtered:
-                fingerprint = hashlib.sha256(str((interval, scan["scanned_at"], location, months, only_new)).encode()).hexdigest()[:12]
+                fingerprint = hashlib.sha256(str((interval, scan["scanned_at"], location, months, only_new,
+                                                   higher_lows, tight, volume)).encode()).hexdigest()[:12]
                 index = _table_selection(rectangle_records(filtered), f"rectangle_results_{fingerprint}")
                 selected = filtered[index]
                 _render_chart(store, selected, scan["source"], "result")
@@ -278,6 +314,16 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             "10 extra ranking points based on the advance (capped at 30%) and consistency (full credit at 0.60). "
             "Down is the corresponding decline; other complete histories are Flat / mixed. "
             "Insufficient history earns no bonus. Prior trend never changes rectangle eligibility. "
+            "Optional setup filters require every selected factor to pass; Unknown never passes an enabled filter. "
+            "Higher lows uses the latest two separated, two-candle-confirmed lows within 60 daily sessions / 13 weeks, "
+            "rising by at least the greater of 0.25 ATR and 2% of box height, without a later undercut. "
+            "Tight near resistance uses the last 10 daily / 4 weekly candles: at least 80% of closes above midpoint, "
+            "latest close inside the upper third, median true range at least 20% smaller than the preceding equal block "
+            "and no more than 20% / 35% of box height. True range includes wicks and gaps. "
+            "Supportive volume uses 20 daily / 8 weekly candles, comparing median volume on close-to-close declines "
+            "with advances (at most 80%, with at least 3 / 2 observations on each side). "
+            "Weekly volume is normalized per scheduled trading session. Missing or zero recent volume is Unknown. "
+            "Setup factors do not affect rectangle qualification or ranking. "
             "Limited boundary drift and wick overshoots are allowed. "
             "Range width: 3–45% and at least three ATR on the selected timeframe. No prior uptrend is required. "
             "Weekly candles aggregate daily OHLCV using the Nasdaq trading calendar; unfinished weeks and weeks with missing sessions are excluded. "
