@@ -8,12 +8,13 @@ from datetime import UTC, datetime, timedelta
 import pandas as pd
 
 from agentloop_trader.rectangle_data import (
-    DailyHistoryProvider, ScanCancelled, fetch_nasdaq_universe,
+    DailyHistoryProvider, ScanCancelled, fetch_universe,
     HISTORY_DAYS, full_history_start, history_bucket, merge_history,
 )
 from agentloop_trader.rectangle_scanner import DETECTOR_VERSION, daily_bars, detect_rectangles
 from agentloop_trader.rectangle_store import RectangleStore, exclusive_file
 from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, validate_interval, TIMEFRAME_LABELS
+from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, universe_cache_name, validate_universe_id
 
 
 @dataclass
@@ -21,7 +22,7 @@ class ScanJob:
     cancel: threading.Event = field(default_factory=threading.Event)
     lock: threading.Lock = field(default_factory=threading.Lock)
     done: bool = False
-    message: str = "Loading Nasdaq listings..."
+    message: str = "Loading stock universe..."
     progress: float = 0.0
     error: str = ""
     canceled: bool = False
@@ -37,7 +38,7 @@ class ScanJob:
 
 
 def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: ScanJob,
-                   universe_loader=fetch_nasdaq_universe, *, interval="1d"):
+                   universe_loader=None, *, interval="1d", universe_id="nasdaq"):
     """Commit a completed snapshot only; cancel/fatal failure keeps previous results.
 
     Per-ticker failures remain explicit. New-candidate comparison retains the last
@@ -45,20 +46,27 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
     """
     try:
         validate_interval(interval)
+        validate_universe_id(universe_id)
         with exclusive_file(store.root / "scan.lock", timeout=.1):
             provider.check_cancel()
-            previous = store.read_scan(interval)
+            previous = store.read_scan(interval, universe_id)
             watches = store.read("watchlist", {})
-            cached_universe = store.read("universe", {})
+            cache_name = universe_cache_name(universe_id)
+            cached_universe = store.read(cache_name, {})
+            if cached_universe and cached_universe.get("universe_id", "nasdaq") != universe_id:
+                raise ValueError("Cached stock universe has a different identity; previous results were kept.")
             today = datetime.now(UTC).date().isoformat()
             if cached_universe.get("fetched_at", "")[:10] == today:
                 universe = cached_universe
             else:
-                universe = universe_loader()
-                store.write("universe", universe)
+                universe = universe_loader() if universe_loader is not None else fetch_universe(universe_id)
+                if universe.get("universe_id", universe_id) != universe_id:
+                    raise ValueError("Downloaded stock universe has a different identity; previous results were kept.")
+                universe = {**universe, "universe_id": universe_id}
+                store.write(cache_name, universe)
             symbols = list(dict.fromkeys(universe["symbols"]))
             if not symbols:
-                raise ValueError("Nasdaq returned no eligible stock symbols.")
+                raise ValueError(f"{UNIVERSE_LABELS[universe_id]} returned no eligible stock symbols.")
             watched = {(w["rectangle"]["symbol"], w["source"]) for w in watches.values()}
             watch_extra = sorted((s, source) for s, source in watched if s not in symbols or source != provider.source)
             total = len(symbols) + len(watch_extra)
@@ -117,7 +125,7 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
             for offset in range(0, len(symbols), 20):
                 provider.check_cancel()
                 batch = symbols[offset:offset+20]
-                job.update(message=f"{TIMEFRAME_LABELS[interval]} · Checking {finished:,} of {total:,} stocks · {len(set(r.symbol for r in rectangles)):,} candidates",
+                job.update(message=f"{UNIVERSE_LABELS[universe_id]} · {TIMEFRAME_LABELS[interval]} · Checking {finished:,} of {total:,} stocks · {len(set(r.symbol for r in rectangles)):,} candidates",
                            progress=finished/max(total, 1))
                 try:
                     frames = load_batch(batch, provider)
@@ -176,14 +184,15 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
             if not dates:
                 raise ValueError("No usable daily history was returned. Previous scan results were kept.")
             payload = {
-                "detector_version": DETECTOR_VERSION, "interval": interval, "scanned_at": datetime.now(UTC).isoformat(),
+                "detector_version": DETECTOR_VERSION, "interval": interval, "universe_id": universe_id,
+                "scanned_at": datetime.now(UTC).isoformat(),
                 "source": provider.source, "universe": universe, "total": len(symbols),
                 "successful": successful, "skipped": skipped, "errors": errors,
                 "rectangles": [r.record() for r in rectangles], "new_symbols": new_symbols,
                 "observed": observed, "data_start": min(dates), "data_end": max(dates),
                 "first_scan": not bool(previous) or previous.get("source") != provider.source,
             }
-            store.write_scan(interval, payload)
+            store.write_scan(interval, payload, universe_id)
             job.update(message="Scan complete", progress=1.0)
     except ScanCancelled:
         job.update(canceled=True, message="Scan canceled; previous results were kept.")
@@ -197,9 +206,11 @@ def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: S
         job.update(done=True)
 
 
-def start_range_scan(store, provider, *, interval="1d") -> ScanJob:
+def start_range_scan(store, provider, *, interval="1d", universe_id="nasdaq") -> ScanJob:
     validate_interval(interval)
+    validate_universe_id(universe_id)
     job = ScanJob(cancel=provider.cancel)
-    threading.Thread(target=run_range_scan, args=(store, provider, job), kwargs={"interval": interval}, daemon=True,
+    threading.Thread(target=run_range_scan, args=(store, provider, job),
+                     kwargs={"interval": interval, "universe_id": universe_id}, daemon=True,
                      name="rectangle-research-scan").start()
     return job

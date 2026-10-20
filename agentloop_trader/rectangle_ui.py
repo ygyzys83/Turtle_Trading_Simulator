@@ -8,13 +8,14 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
-from agentloop_trader.rectangle_data import DailyHistoryProvider, UNIVERSE_LABEL, UNIVERSE_NOTE, history_bucket
+from agentloop_trader.rectangle_data import DailyHistoryProvider, history_bucket
 from agentloop_trader.rectangle_jobs import start_range_scan
 from agentloop_trader.rectangle_scanner import (
     DETECTOR_VERSION, Rectangle, filter_rectangles, rectangle_from_record, rectangle_records, refresh_saved_rectangle,
 )
 from agentloop_trader.rectangle_store import RectangleStore
 from agentloop_trader.rectangle_signals import SIGNAL_LABELS, signal_label
+from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, UNIVERSE_NOTES
 from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, TIMEFRAME_LABELS
 from agentloop_trader.ui_theme import CHART_COLORS
 
@@ -108,7 +109,7 @@ def _table_selection(records, key):
             "Position in range (%)": st.column_config.NumberColumn(format="%.1f%%"),
             "Prior trend": st.column_config.TextColumn(help="Trend over the six months before this rectangle began. Up adds up to 10 ranking points; other labels do not exclude a range."),
             "Higher lows": st.column_config.TextColumn(help="✓ Two confirmed pullback lows are meaningfully rising and the latest still holds. — Does not pass. Unknown means insufficient evidence or not assessed."),
-            "Tight near resistance": st.column_config.TextColumn(help="✓ Mostly above midpoint, latest close in upper third, and smaller recent candle ranges including wicks/gaps. Details appear below the chart."),
+            "Tight near resistance": st.column_config.TextColumn(help="✓ At least 60% of recent closes above midpoint, latest close in upper third, and small candle ranges including wicks/gaps. Further contraction is not required. Details appear below the chart."),
             "Supportive volume": st.column_config.TextColumn(help="✓ Median volume on pullbacks is at least 20% lighter than on advances. Unknown means insufficient evidence or not assessed. Uses the displayed scan feed."),
         },
     )
@@ -180,15 +181,18 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
     store = RectangleStore(store_root)
     st.markdown("#### Rectangle trading ranges")
     active = st.session_state.get("rectangle_scan_job") is not None
-    label = st.radio("Timeframe", ["Daily", "Weekly"], horizontal=True,
-                     key="rectangle_timeframe", disabled=active)
+    selectors = st.columns([2, 1])
+    universe_id = selectors[0].selectbox("Universe", list(UNIVERSE_LABELS),
+                                       format_func=UNIVERSE_LABELS.get, key="rectangle_universe", disabled=active)
+    label = selectors[1].radio("Timeframe", ["Daily", "Weekly"], horizontal=True,
+                              key="rectangle_timeframe", disabled=active)
     interval = "1d" if label == "Daily" else "1w"
-    st.caption(f"{UNIVERSE_LABEL} · {label} candles · 3–24 months · Research only")
+    st.caption(f"{UNIVERSE_LABELS[universe_id]} · {label} candles · 3–24 months · Research only")
     source = "Alpaca IEX" if api_key and api_secret else "Yahoo"
     st.caption(f"New scans use {source}. Sidebar ticker, strategy and interval do not affect this scan.")
     if st.button("Scan for Trading Ranges", type="primary", disabled=active):
         provider = DailyHistoryProvider(api_key, api_secret)
-        st.session_state["rectangle_scan_job"] = start_range_scan(store, provider, interval=interval)
+        st.session_state["rectangle_scan_job"] = start_range_scan(store, provider, interval=interval, universe_id=universe_id)
         st.session_state.pop("rectangle_scan_notice", None)
         st.rerun()
     if active:
@@ -200,7 +204,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
         elif notice["canceled"]:
             st.info(notice["message"])
     try:
-        scan, all_watches = store.read_scan(interval), store.read("watchlist", {})
+        scan, all_watches = store.read_scan(interval, universe_id), store.read("watchlist", {})
         results = [rectangle_from_record(row) for row in scan.get("rectangles", [])]
         originals = {key: rectangle_from_record(w["rectangle"]) for key, w in all_watches.items()}
         originals = {key: r for key, r in originals.items() if r.interval == interval}
@@ -211,7 +215,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
     results_tab, watch_tab = st.tabs(["Scan results", f"Research watchlist ({len(watches)})"])
     with results_tab:
         if not scan:
-            st.info(f"Click Scan for Trading Ranges to find {label.lower()} rectangles across Nasdaq stocks.")
+            st.info(f"Click Scan for Trading Ranges to find {label.lower()} rectangles in {UNIVERSE_LABELS[universe_id]}.")
         else:
             timestamp = pd.Timestamp(scan["scanned_at"]).tz_convert("America/Los_Angeles")
             if scan.get("detector_version", 1) < DETECTOR_VERSION:
@@ -229,22 +233,22 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             duration_key = f"rectangle_duration_{interval}"
             months = controls[1].slider("Range duration (months)", 3, 24, (3, 24), key=duration_key)
             only_new = controls[2].toggle("New candidates only", value=False, key="rectangle_only_new",
-                                           help="Newly qualifying tickers compared with the previous scan using the same data source.")
+                                           help="Newly qualifying tickers compared with the previous scan of this universe and timeframe using the same data source.")
             if only_new and scan.get("first_scan"):
-                st.caption("This is the first scan for this data source; all matches are first discoveries.")
+                st.caption("This is the first scan for this universe, timeframe and data source; all matches are first discoveries.")
             st.caption("Optional setup filters · selected factors must all pass · ✓ Passes · — Does not pass · Unknown: insufficient evidence or not assessed")
             setup_controls = st.columns(3)
             higher_lows = setup_controls[0].checkbox("Higher lows", key=f"rectangle_higher_lows_{interval}",
                 help="Two recent confirmed pullback lows are meaningfully rising, and the latest still holds.")
             tight = setup_controls[1].checkbox("Tight near resistance", key=f"rectangle_tight_{interval}",
-                help="Mostly above midpoint, latest close in the upper third, and contracting candles including wicks/gaps.")
+                help="Daily: at least 6 of 10 closes above midpoint and median candle range ≤25% of box height. Weekly: 3 of 4 and ≤35%. Latest close inside upper third; further contraction is not required.")
             volume = setup_controls[2].checkbox("Supportive volume", key=f"rectangle_supportive_volume_{interval}",
                 help="Pullbacks have lighter typical volume than advances. Unknown assessments do not pass this filter.")
             filtered = filter_rectangles(results, months, location, set(scan["new_symbols"]) if only_new else None,
                                          higher_lows=higher_lows, tight_near_resistance=tight, supportive_volume=volume)
             st.caption(f"{len(filtered):,} matching tickers · ranked by rectangle quality + prior strength · click a row to view its chart.")
             if filtered:
-                fingerprint = hashlib.sha256(str((interval, scan["scanned_at"], location, months, only_new,
+                fingerprint = hashlib.sha256(str((universe_id, interval, scan["scanned_at"], location, months, only_new,
                                                    higher_lows, tight, volume)).encode()).hexdigest()[:12]
                 index = _table_selection(rectangle_records(filtered), f"rectangle_results_{fingerprint}")
                 selected = filtered[index]
@@ -253,7 +257,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                     st.caption("Saved to the research watchlist. Its original rectangle is preserved.")
                 elif st.button("Save to Watchlist", key="rectangle_save", disabled=active):
                     try:
-                        store.save_watch(selected, scan["source"])
+                        store.save_watch(selected, scan["source"], universe_id)
                         st.rerun()
                     except (OSError, ValueError, RuntimeError) as exc:
                         st.error(f"Could not save the research candidate: {exc}")
@@ -263,7 +267,8 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                 with st.expander("Stocks that could not be checked"):
                     st.dataframe(pd.DataFrame(scan["errors"]), hide_index=True, width="stretch")
     with watch_tab:
-        st.caption(f"Showing saved {label.lower()} ranges. Switch Timeframe to view the other watchlist. "
+        st.caption(f"Showing saved {label.lower()} ranges from both universes. The research watchlist is shared; "
+                   "switching Universe only changes scan results. Switch Timeframe to view the other saved ranges. "
                    "Saving research does not enable a queued buy or change an exit plan. Prices refresh when you run a scan.")
         if not watches:
             st.info("Save a candidate from Scan results to track its original rectangle here.")
@@ -287,6 +292,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                 except (ValueError, RuntimeError):
                     status = "Price basis unavailable"
                 records.append({"Ticker": symbol, "Timeframe": label, "Range (months)": original.months,
+                                "Found in": "S&P 500" if watch.get("universe_id", "nasdaq") == "sp500" else "Nasdaq",
                                 "Price": price, "Status": status, "Data date": as_of,
                                 "Saved": pd.Timestamp(watch["saved_at"]).strftime("%Y-%m-%d")})
             key = hashlib.sha256(str((interval, [(r["Ticker"], r["Saved"]) for r in records])).encode()).hexdigest()[:10]
@@ -301,9 +307,12 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                 except (OSError, ValueError, RuntimeError) as exc:
                     st.error(f"Could not remove the research candidate: {exc}")
     with st.expander("Scan details"):
-        st.caption(UNIVERSE_NOTE)
+        st.caption(UNIVERSE_NOTES[universe_id])
+        st.caption("Only the selected universe is screened. Scan results and new-candidate history are separate "
+                   "for each universe/timeframe. Price history is shared; saved watchlist prices can also refresh during a scan.")
         if scan:
-            st.caption(f"Nasdaq directory date: {scan['universe'].get('directory_date', 'Not supplied')}.")
+            st.caption(f"Universe as-of date: {scan['universe'].get('directory_date', 'Not supplied')}.")
+            st.caption(f"Universe source: {scan['universe'].get('source', 'Not supplied')}")
         st.caption(
             "Fixed research rules: about 63–504 daily sessions or 13–104 completed trading weeks (3–24 months); "
             "at least two separated, confirmed tests at each boundary; "
@@ -317,9 +326,10 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             "Optional setup filters require every selected factor to pass; Unknown never passes an enabled filter. "
             "Higher lows uses the latest two separated, two-candle-confirmed lows within 60 daily sessions / 13 weeks, "
             "rising by at least the greater of 0.25 ATR and 2% of box height, without a later undercut. "
-            "Tight near resistance uses the last 10 daily / 4 weekly candles: at least 80% of closes above midpoint, "
-            "latest close inside the upper third, median true range at least 20% smaller than the preceding equal block "
-            "and no more than 20% / 35% of box height. True range includes wicks and gaps. "
+            "Tight near resistance uses the last 10 daily / 4 weekly candles: at least 60% of closes above midpoint "
+            "(6 of 10 daily / 3 of 4 weekly), latest close inside the upper third, "
+            "and median true range no more than 25% / 35% of box height. Further contraction is not required. "
+            "True range includes wicks and gaps. "
             "Supportive volume uses 20 daily / 8 weekly candles, comparing median volume on close-to-close declines "
             "with advances (at most 80%, with at least 3 / 2 observations on each side). "
             "Weekly volume is normalized per scheduled trading session. Missing or zero recent volume is Unknown. "

@@ -4,7 +4,52 @@ Last updated: 2026-10-20 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 20, 2026 — Optional setup filters (current)
+## October 20, 2026 — Universe selection and revised tightness (current)
+
+User approved the revised Daily tightness rule: >=6 of last 10 closes above
+midpoint, latest close inside upper third, median true range <=25% of box height.
+The mandatory >=20% contraction versus the previous block was removed. Weekly
+now allows 3 of 4 closes above midpoint and also removes mandatory contraction;
+its existing 35% true-range/box-height cap remains. Higher lows and supportive
+volume rules, rectangle qualification and ranking are unchanged. Detector
+version is 6; old snapshots prompt an explicit rescan for updated assessments.
+
+Ideas has Universe selector: Nasdaq common stocks (Composite-style) / S&P 500.
+Only the selected universe is screened. Each universe/timeframe has independent
+results and new-candidate history. Nasdaq keeps scan.json / scan_weekly.json and
+universe.json; S&P uses scan_sp500.json / scan_sp500_weekly.json and
+universe_sp500.json. Price history is shared across universes and timeframes.
+Switching selection never scans/downloads or migrates existing research.
+
+S&P membership uses iShares IVV's published holdings CSV as an explicitly labeled
+holdings-based proxy, not licensed S&P constituent data. Source/as-of date is in
+Scan details. Keep tradable equity rows, including share classes and Cboe BZX;
+exclude cash/funds/futures and unlisted residual holdings. Normalize BRK B / BF B
+to BRK.B / BF.B. Require full plausible count (490–520) and date within 10 days;
+malformed, incomplete or stale downloads fail with previous results preserved.
+No silent fallback to Nasdaq. Public download was checked successfully: 503
+listed equity symbols, holdings dated 2026-10-16; share classes retained.
+
+Research watchlist remains shared across universes, with one original rectangle
+per ticker/timeframe. Found in shows original universe. Saving the same ticker
+from another universe neither duplicates it nor changes its original geometry.
+Legacy records default to Nasdaq provenance without rewrites. Watchlist prices
+can refresh during any explicit scan, even for symbols outside the selected
+universe; those refreshes never add extra symbols to matching results.
+
+No live research scan, UI, worker, broker operation, commit or push was started.
+Only the public membership download and synthetic/read-only checks were used.
+
+Verification: 593 tests passed, including universe/timeframe isolation, shared
+cache reuse, shared-watchlist preservation, UI switching without downloads,
+source/parser guards, and revised Daily/Weekly tightness boundaries. Final live
+membership fetch through installed application code succeeded with 503 symbols.
+Existing runtime scan and watchlist files were not changed during development.
+
+The sections below describe prior checkpoints; their old rule values and storage
+scope are superseded by this section.
+
+## October 20, 2026 — Optional setup filters
 
 User preference changed: now favors higher lows and tightening above midpoint
 toward resistance, rather than buying near the range floor. The scanner still

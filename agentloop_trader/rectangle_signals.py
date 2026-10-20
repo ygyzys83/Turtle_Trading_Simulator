@@ -39,9 +39,9 @@ def analyze_breakout_signals(frame: pd.DataFrame, *, start, end, support: float,
 
     Higher lows: latest two separated 2-left/2-right confirmed lows in 60 daily
     sessions / 13 weeks, rising by max(0.25 ATR, 2% of box height), with no later
-    undercut. Tightness: last 10 daily / 4 weekly candles vs preceding equal
-    block; 80% above midpoint, latest close inside upper third, median true range
-    at least 20% smaller and <=20% / 35% of box height. Volume: last 20 daily /
+    undercut. Tightness: last 10 daily / 4 weekly candles; >=60% above midpoint,
+    latest close inside upper third, median true range <=25% / 35% of box height.
+    Further contraction is not required. Volume: last 20 daily /
     8 weekly bars; median declining-bar volume <=80% of advancing-bar volume,
     with >=3 / >=2 observations per side. Direction uses close-to-close change.
     Weekly volume is normalized per scheduled session to avoid holiday bias.
@@ -87,24 +87,24 @@ def analyze_breakout_signals(frame: pd.DataFrame, *, start, end, support: float,
                            + ("Latest low still holds." if intact else "Latest low has been undercut or lost on the close."))
 
     count = 10 if daily else 4
-    context = base.tail(2*count+1)
-    if not _complete(context, 2*count+1, interval):
-        reasons.append(f"Need {2*count+1} consecutive completed candles to assess tightening.")
+    context = base.tail(count+1)
+    if not _complete(context, count+1, interval):
+        reasons.append(f"Need {count+1} consecutive completed candles to assess tight trading.")
     else:
         current = context.tail(count)
         previous_close = context.Close.shift(1)
         ranges = pd.concat([context.High-context.Low, (context.High-previous_close).abs(),
                             (context.Low-previous_close).abs()], axis=1).max(axis=1).iloc[1:]
-        before, after = float(ranges.iloc[:count].median()), float(ranges.iloc[count:].median())
+        after = float(ranges.median())
         held = float((current.Close > (support+resistance)/2).mean())
         position = (float(current.Close.iloc[-1])-support)/width
         result["tight_near_resistance"] = bool(
-            held >= .8 and 2/3 <= position <= 1 and before > 0
-            and after <= .8*before+1e-10*width and after <= (.20 if daily else .35)*width)
+            held >= .6 and 2/3 <= position <= 1
+            and after <= (.25 if daily else .35)*width+1e-10*width)
         reasons.append(f"Last {count} candles: {held:.0%} of closes above midpoint; "
                        f"latest at {position:.0%} of box height. Median candle range including wicks/gaps "
-                       f"{after/width:.1%} of box height vs {before/width:.1%} previously (requires ≥20% contraction "
-                       f"and ≤{20 if daily else 35}% of box height).")
+                       f"{after/width:.1%} of box height (requires ≤{25 if daily else 35}%). "
+                       "Further contraction is not required.")
 
     count, minimum = (20, 3) if daily else (8, 2)
     context = base.tail(count+1)

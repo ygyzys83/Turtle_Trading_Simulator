@@ -11,6 +11,7 @@ from uuid import uuid4
 import pandas as pd
 
 from agentloop_trader.rectangle_timeframes import validate_interval
+from agentloop_trader.rectangle_universes import validate_universe_id
 
 
 @contextmanager
@@ -85,22 +86,32 @@ class RectangleStore:
     def write(self, name: str, value):
         atomic_json(self.root / f"{name}.json", {"version": 1, "data": value})
 
-    def read_scan(self, interval="1d"):
+    @staticmethod
+    def _scan_name(interval="1d", universe_id="nasdaq"):
         validate_interval(interval)
-        value = self.read("scan" if interval == "1d" else "scan_weekly", {})
+        validate_universe_id(universe_id)
+        prefix = "scan" if universe_id == "nasdaq" else "scan_sp500"
+        return prefix if interval == "1d" else prefix+"_weekly"
+
+    def read_scan(self, interval="1d", universe_id="nasdaq"):
+        value = self.read(self._scan_name(interval, universe_id), {})
+        if value and value.get("universe_id", "nasdaq") != universe_id:
+            raise ValueError("Saved rectangle scan has a different universe; its file was preserved.")
         if value and value.get("interval", "1d") != interval:
             raise ValueError("Saved rectangle scan has a different timeframe; its file was preserved.")
         if any(row.get("interval", "1d") != interval for row in value.get("rectangles", [])):
             raise ValueError("Saved rectangles contain mixed timeframes; their file was preserved.")
         return value
 
-    def write_scan(self, interval: str, value):
-        validate_interval(interval)
+    def write_scan(self, interval: str, value, universe_id="nasdaq"):
+        name = self._scan_name(interval, universe_id)
+        if value.get("universe_id", "nasdaq") != universe_id:
+            raise ValueError("Cannot save a rectangle scan under a different universe.")
         if value.get("interval", "1d") != interval:
             raise ValueError("Cannot save a rectangle scan under a different timeframe.")
         if any(row.get("interval", "1d") != interval for row in value.get("rectangles", [])):
             raise ValueError("Cannot mix daily and weekly rectangles in one scan.")
-        self.write("scan" if interval == "1d" else "scan_weekly", value)
+        self.write(name, value)
 
     @staticmethod
     def watch_key(symbol: str, interval="1d") -> str:
@@ -108,7 +119,8 @@ class RectangleStore:
         # Preserve legacy daily identities; weekly ranges own separate records.
         return symbol if interval == "1d" else f"{symbol}|1w"
 
-    def save_watch(self, rectangle, source: str):
+    def save_watch(self, rectangle, source: str, universe_id="nasdaq"):
+        validate_universe_id(universe_id)
         with exclusive_file(self.root / "watchlist.lock"):
             rows = self.read("watchlist", {})
             key = self.watch_key(rectangle.symbol, rectangle.interval)
@@ -117,6 +129,7 @@ class RectangleStore:
                 rows[key] = {
                     "rectangle": rectangle.record(), "anchor_close": rectangle.last_close,
                     "source": source, "saved_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                    "universe_id": universe_id,
                 }
                 self.write("watchlist", rows)
 

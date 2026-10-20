@@ -183,8 +183,9 @@ Shadow mode records would-have-traded decisions without submitting orders. Audit
 
 ## Rectangle Range Scanner
 
-On **Ideas**, choose **Timeframe: Daily / Weekly**, then click **Scan for Trading
-Ranges**. Both modes search approximately **3–24 months**: 63–504 daily sessions
+On **Ideas**, choose **Universe: Nasdaq common stocks (Composite-style) / S&P 500**
+and **Timeframe: Daily / Weekly**, then click **Scan for Trading Ranges**.
+Only the selected universe is screened. Both modes search approximately **3–24 months**: 63–504 daily sessions
 or 13–104 weekly candles. The scanner uses shared daily OHLCV independently of
 the sidebar ticker, interval, risk and strategy settings. It ranks horizontal
 rectangles by independent boundary tests, containment and flatness.
@@ -234,11 +235,12 @@ per ticker. Fixed starting research rules (no threshold controls):
   for confirmation. Their separation is at least five daily / two weekly candles.
   The rise must reach the greater of 0.25 ATR and 2% of rectangle height. No later
   candle may undercut the latest low, and the latest close must be above it.
-- **Tight near resistance:** last 10 daily / 4 weekly candles have at least 80%
-  of closes above midpoint, latest close inside the upper third, and median true
-  range at least 20% smaller than the preceding equal block. Median true range
-  must also be at most 20% / 35% of rectangle height. True range includes full
-  wicks and gaps; small bodies alone do not count as tight trading.
+- **Tight near resistance:** at least 6 of the last 10 daily closes / 3 of the last
+  4 weekly closes above midpoint, latest close inside the upper third, and median
+  true range at most 25% / 35% of rectangle height. Further contraction compared
+  with preceding candles is not required: already-tight trading qualifies.
+  True range includes full wicks and gaps; small bodies alone do not count as
+  tight trading. The weekly cap remains larger to account for weekly candles.
 - **Supportive volume:** over the last 20 daily / 8 weekly candles, median volume
   on close-to-close declines is at most 80% of median advancing-candle volume.
   At least three daily / two weekly candles on each side are required. Unchanged
@@ -267,7 +269,7 @@ weekly range cannot bridge a missing week. Early closes and daylight-saving time
 are handled by the calendar. The chart and containment measurement use the same
 selected-timeframe candles. An unfinished week does not affect a weekly signal.
 
-The universe comes from Nasdaq's public listing directory, excluding ETFs,
+The Nasdaq universe comes from its public listing directory, excluding ETFs,
 test issues, non-normal financial status, and names identifying non-common
 security types. It is explicitly labeled **Nasdaq common stocks (Composite-style)**;
 it is not a licensed, verified Composite constituent list. Directory metadata,
@@ -275,11 +277,24 @@ data dates, skipped stocks and failures remain visible. The fixed activity floor
 is $1 price and $100,000 average daily dollar volume over 20 sessions on the
 selected feed. At least 90% of those sessions must have positive reported volume.
 
+The **S&P 500** choice uses published equity holdings of the
+[iShares Core S&P 500 ETF (IVV)](https://www.ishares.com/us/products/239726/ishares-core-sp-500-etf).
+This is explicitly described in **Scan details** as a holdings-based proxy, not
+a licensed index constituent feed; temporary differences can occur around index
+changes. Cash, money-market funds, derivatives and unlisted residual positions
+are excluded. Separate listed share classes are retained (e.g. BRK.B and BF.B),
+with provider-specific Yahoo aliases applied only during download. Membership
+is refreshed when explicitly scanning, cached separately for each universe for
+the UTC day, and its source/as-of date stays visible. Malformed, partial-count
+(outside 490–520 stocks), or stale (over 10 days) S&P holdings fail clearly and
+preserve previous results; there is no silent substitution of another universe.
+
 Configured Alpaca credentials select **Alpaca IEX**; otherwise scans use **Yahoo**.
 Authentication failures do not silently switch feeds. IEX volume is feed-specific,
 not consolidated-market volume. A shared three-year daily cache provides 24-month
 ranges plus indicator warmup; older two-year caches are backfilled once on the next
-scan. Switching timeframe alone never downloads data. Scans are batched, cancelable
+scan. Switching universe or timeframe alone never downloads data. Overlapping
+tickers reuse the same price cache. Scans are batched, cancelable
 and cached on disk;
 incremental refreshes that detect changed overlapping prices reload full history
 to handle corporate actions and provider corrections. Canceled/fatal scans retain
@@ -290,14 +305,20 @@ only** filter saved results without downloading prices or scanning again. Click 
 row for the exact detected rectangle; **Show volume** only changes the chart.
 One best matching range is shown per ticker after filtering all detected lengths.
 New means newly qualifying versus that ticker's previous successful scan on the
-same feed and timeframe; each mode's first scan treats every match as a first
-discovery. Daily results and discovery history remain in `scan.json`; weekly results
-use `scan_weekly.json`. Switching timeframe shows that mode's last saved scan and
-watchlist. Running one mode never replaces the other mode's results.
+same universe, feed and timeframe; each combination's first scan treats every
+match as a first discovery. Nasdaq daily results and discovery history remain
+in `scan.json`; Nasdaq weekly uses `scan_weekly.json`. S&P daily/weekly use
+`scan_sp500.json` / `scan_sp500_weekly.json`. Universe membership caches remain
+`universe.json` for Nasdaq and `universe_sp500.json` for S&P. Legacy scans default
+to Nasdaq without automatic migration. Switching universe/timeframe shows only
+that combination's saved results. Running one never replaces another's results.
 
 **Save to Watchlist** creates research only, separate from the executable Buy
-watchlist. Original geometry and timeframe are preserved. A ticker can have a
-separate daily and weekly saved range. Legacy records without a timeframe are
+watchlist. It is shared across both universes, filtered only by timeframe;
+**Found in** identifies the original discovery universe. One original rectangle
+per ticker/timeframe is preserved, so overlap does not create duplicate entries
+or replace an existing saved box. A ticker can have separate daily and weekly
+saved ranges. Legacy entries default to Nasdaq provenance. Legacy records without a timeframe are
 read as daily; they are not automatically rewritten or reinterpreted as weekly. Later scans refresh cached prices,
 including saved symbols no longer in the universe. Corporate-action basis changes
 are explicitly reflected when plotting/evaluating original levels; missing basis

@@ -12,7 +12,7 @@ from agentloop_trader.rectangle_signals import analyze_breakout_signals, signal_
 from agentloop_trader.rectangle_timeframes import analysis_bars, completed_daily_bars, session_schedule, validate_interval
 
 
-DETECTOR_VERSION = 5
+DETECTOR_VERSION = 6
 WINDOWS = tuple(month*21 for month in range(3, 25))
 WEEKLY_WINDOWS = tuple(round(month*52/12) for month in range(3, 25))
 

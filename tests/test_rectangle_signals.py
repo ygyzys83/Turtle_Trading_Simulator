@@ -61,7 +61,7 @@ def tight_candles(interval):
 
 
 @pytest.mark.parametrize('interval', ['1d', '1w'])
-def test_tightness_requires_upper_third_midpoint_holding_and_actual_contraction(interval):
+def test_tightness_requires_upper_third_midpoint_holding_and_small_ranges(interval):
     frame = tight_candles(interval)
     assert assess(frame, interval)['tight_near_resistance'] is True
     lower = frame.copy()
@@ -69,16 +69,46 @@ def test_tightness_requires_upper_third_midpoint_holding_and_actual_contraction(
     assert assess(lower, interval)['tight_near_resistance'] is False
     below_midpoint = frame.copy()
     count = 10 if interval == '1d' else 4
-    n = int(count*.2)+1
+    n = int(count*.4)+1
     below_midpoint.iloc[-count:-count+n, below_midpoint.columns.get_indexer(['Open', 'High', 'Low', 'Close'])] = [100., 101., 99., 100.]
     assert assess(below_midpoint, interval)['tight_near_resistance'] is False
-    assert assess(candles(interval), interval)['tight_near_resistance'] is False  # No contraction.
+    assert assess(candles(interval), interval)['tight_near_resistance'] is True  # Already tight; contraction is unnecessary.
     wicks = frame.copy()
     wicks.iloc[-count:, wicks.columns.get_indexer(['High', 'Low'])] = [125., 105.]
     assert assess(wicks, interval)['tight_near_resistance'] is False  # Tiny bodies, large wicks.
     broken = frame.copy()
     broken.iloc[-1, broken.columns.get_indexer(['Open', 'High', 'Low', 'Close'])] = [121., 122., 120., 121.]
     assert assess(broken, interval)['tight_near_resistance'] is False
+
+
+@pytest.mark.parametrize('range_fraction, expected', [(.20, True), (.25, True), (.251, False), (.30, False)])
+def test_daily_tightness_uses_25_percent_box_height_cap(range_fraction, expected):
+    frame = candles()
+    half_range = 30*range_fraction/2
+    frame.loc[:, 'High'], frame.loc[:, 'Low'] = 115+half_range, 115-half_range
+    assert assess(frame)['tight_near_resistance'] is expected
+
+
+@pytest.mark.parametrize('above, expected', [(5, False), (6, True), (7, True), (10, True)])
+def test_daily_midpoint_holding_requires_six_of_ten_closes(above, expected):
+    frame = candles()
+    below = 10-above
+    if below:
+        frame.iloc[-10:-10+below, frame.columns.get_indexer(['Open', 'High', 'Low', 'Close'])] = [104., 105., 103., 104.]
+    assert assess(frame)['tight_near_resistance'] is expected
+
+
+def test_weekly_midpoint_rule_accepts_three_of_four_and_keeps_weekly_range_cap():
+    frame = candles('1w')
+    frame.iloc[-4, frame.columns.get_indexer(['Open', 'High', 'Low', 'Close'])] = [104., 105., 103., 104.]
+    assert assess(frame, '1w')['tight_near_resistance'] is True
+    frame.iloc[-3, frame.columns.get_indexer(['Open', 'High', 'Low', 'Close'])] = [104., 105., 103., 104.]
+    assert assess(frame, '1w')['tight_near_resistance'] is False
+    wide = candles('1w')
+    wide.loc[:, 'High'], wide.loc[:, 'Low'] = 120.25, 109.75  # Exactly 35% of box height.
+    assert assess(wide, '1w')['tight_near_resistance'] is True
+    wide.loc[:, 'High'], wide.loc[:, 'Low'] = 120.4, 109.6
+    assert assess(wide, '1w')['tight_near_resistance'] is False
 
 
 @pytest.mark.parametrize('interval', ['1d', '1w'])
