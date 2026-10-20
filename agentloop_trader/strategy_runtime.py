@@ -277,6 +277,11 @@ def _run_one(
     account_equity: float,
     risk_limits: RiskLimits | None,
 ) -> dict[str, Any]:
+    if strategy_type == "rectangle":
+        # A frozen research box is a current-plan entry mode, not a backtest
+        # family to optimize against the history used to discover that box.
+        from agentloop_trader.rectangle_trade import evaluate_rectangle_strategy
+        return evaluate_rectangle_strategy(market_data,settings,account_equity,risk_limits)
     entry_w = int(settings.get("entry_window", 20))
     exit_w = int(settings.get("exit_window", 10))
     atr_mult = float(settings.get("atr_stop_multiplier", 2.0))

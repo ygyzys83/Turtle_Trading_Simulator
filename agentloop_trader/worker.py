@@ -56,6 +56,7 @@ from agentloop_trader.strategy_runtime import (
     selected_strategy_result,
 )
 from agentloop_trader.strategy_levels import build_buy_level_snapshot
+from agentloop_trader.rectangle_trade import rectangle_order_price_reason
 
 
 _BAR_CACHE: dict[tuple[str, str, str, str], tuple[float, Any]] = {}
@@ -627,6 +628,11 @@ def _send_entry(
         pricing_price = _number(data_attrs.get("latest_price"), _number(intent.entry_price if intent else 0))
     intent = reprice_trade_intent(intent, pricing_price)
     intent = apply_buy_order_style(intent, control.order_style, control.limit_adjustment_pct, control.custom_limit_price)
+    if control.strategy_settings.get("strategy_type") == "rectangle":
+        for price in (pricing_price,intent.entry_price,intent.limit_price if intent.limit_price is not None else intent.entry_price):
+            block = rectangle_order_price_reason(control.strategy_settings,price)
+            if block:
+                return 0,tracked_orders,block
     if not market_open and intent is not None and intent.order_type != "limit":
         return 0, tracked_orders, "Outside-hours auto buys must be limit orders."
 

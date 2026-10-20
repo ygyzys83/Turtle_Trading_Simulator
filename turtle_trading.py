@@ -4326,6 +4326,7 @@ def render_buy_watchlist_manager() -> None:
                 key=f"load_buy_watch_plan_{selected_watch_plan.plan_id}",
                 on_click=load_buy_watch_plan_in_new_trade,
                 args=(selected_watch_plan.plan_id,),
+                disabled=selected_watch_plan.strategy_settings.get("strategy_type") == "rectangle",
                 help=(
                     "Loads this setup's ticker, price source, interval, history, strategy inputs, risk limits, "
                     "and paper-order settings into the sidebar, then opens New Trade so you can reproduce its backtest. "
@@ -4337,7 +4338,7 @@ def render_buy_watchlist_manager() -> None:
             add_setup_requested = saved_setup_action_cols[1].button(
                 "Add or Update Setup",
                 key=f"add_or_update_sidebar_setup_{selected_watch_plan.plan_id}",
-                disabled=current_setup_queue_disabled(),
+                disabled=current_setup_queue_disabled() or selected_watch_plan.strategy_settings.get("strategy_type") == "rectangle",
                 help=(
                     "Saves the ticker, interval, strategy, strategy inputs, risk limits, and paper-order settings currently "
                     "shown in the sidebar. Use Load This Setup in New Trade first when you want the sidebar to exactly match "
@@ -4350,6 +4351,9 @@ def render_buy_watchlist_manager() -> None:
                     st.rerun(scope="app")
                 except ValueError as exc:
                     st.error(str(exc))
+            if selected_watch_plan.strategy_settings.get("strategy_type") == "rectangle":
+                st.caption("This plan uses frozen research levels and has no retrospective backtest. "
+                           "Pause or remove it here; to replace it, remove the queue record and create a fresh trade plan from Ideas.")
         manage_cols = st.columns(2)
         toggle_label = "Pause Selected Setup" if selected_watch_plan.enabled else "Resume Selected Setup"
         if manage_cols[0].button(toggle_label, key="toggle_selected_buy_watch_plan"):
@@ -5308,7 +5312,9 @@ if command_center_view == "Positions & Queue":
     render_open_positions_panel()
 elif command_center_view == "Ideas":
     sub_section("Ideas", "Find daily trading ranges and save research candidates.")
-    render_rectangle_scanner(alpaca_config.api_key, alpaca_config.api_secret)
+    render_rectangle_scanner(alpaca_config.api_key, alpaca_config.api_secret,
+                             trade_settings=current_strategy_settings,trade_risk_limits=asdict(risk_limits),
+                             buy_queue_path=str(buy_watchlist_store.path))
     with st.expander("Strategy scanner and research", expanded=False):
         scanner_store = ScannerCandidateStore()
         default_scan_text = ", ".join(DEFAULT_SCAN_SYMBOLS)

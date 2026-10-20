@@ -329,3 +329,64 @@ remains under **Strategy scanner and research**.
 
 Rectangle research state and downloaded histories live under
 `automation_logs/rectangle_research/`, already excluded from Git.
+
+### From a research rectangle to a paper Buy queue plan
+
+Select a saved research candidate and click **Create trade plan** below its chart.
+This prepares an inline review with fresh Alpaca Daily candles. The review defaults
+to **Rectangle breakout**, with the ticker and saved box carried over, and lets
+you select an existing strategy instead. Risk %, ATR stop multiplier and Daily
+exit lookback start from the current sidebar settings. Other strategy/risk inputs
+are shown under **Saved risk limits and strategy inputs**. The draft is session
+state only; creating, editing or discarding it never enables a queued buy.
+
+**Save to Buy queue** is the explicit arming action. It writes an enabled plan to
+the existing executable queue, with **Repeat after exit Off**. A running worker,
+queued-buy permission, the paper-account switch, Kill Switch, market-hour rules,
+current quotes and all existing risk/exposure/order checks still govern execution.
+Saving does not start the worker or change those global controls. Only the selected
+candidate is queued; the research watchlist is unchanged. A duplicate ticker /
+Daily interval / strategy is rejected atomically instead of replacing or rearming
+an existing plan. Manage queued plans in **Positions & Queue**.
+
+Rectangle breakout is a current-plan entry mode, separate from the rolling-high
+Breakout continuation and descending Trendline breakout strategies. Its fixed
+defaults are:
+
+- Discovery can be Daily or Weekly, but execution is explicitly **Daily** in both
+  cases. The review says **Weekly setup / Daily entry** when appropriate.
+- Freeze the selected support/resistance, the review's Daily ATR, and a trigger
+  at resistance + 0.10 review ATR, rounded up to cents. No later scan moves them.
+- Require a **new completed Daily close**, after the Save timestamp, crossing
+  above the frozen trigger from a prior close at/below it. Intraday wicks and
+  breakouts completed before arming do not count.
+- Skip completed closes, latest quotes and final order prices above trigger +
+  0.50 review ATR (rounded down to cents). The current price must also remain
+  above the trigger when the worker submits its limit-at-current-price order.
+- Require fresh, consecutive Daily data, matching ticker, unchanged price basis
+  at the saved anchor (0.1% tolerance), no completed support loss since arming,
+  and a plan age no greater than 30 calendar days. Invalid/stale/expired plans
+  stay blocked with their reason visible; they are not silently redefined.
+- Recalculate the actual position size and initial ATR stop with current account
+  equity, the completed-bar ATR, and saved risk settings. Apply the existing
+  rolling-low strategy exit, initial protection, break-even and trailing rules
+  after entry. Entry expiry or a changed anchor does not disable position exits.
+
+The preview is illustrative: its stop/quantity use the trigger and review account,
+not a guaranteed fill. The worker reprices and constrains the actual order again.
+Previews older than 15 minutes or superseded by a new completed Daily candle must
+be recreated before Save. Preparing a draft verifies that research and Alpaca
+prices agree at the original anchor within 1%; material differences require a
+research refresh rather than an automatic translation of the desired box.
+
+Choosing one of the five existing strategies uses that strategy's own entry
+rules, which may already pass when saved. The frozen box then supplies provenance,
+not an additional trigger. Backtest-only RSI no-price-stop mode cannot be queued.
+
+Queued Rectangle plans show their original box, Daily trigger, entry cap and
+arming date in saved details and setup charts. They have no retrospective
+backtest: using a rectangle selected from that same history would introduce
+hindsight. Existing strategy optimizers/suites remain unchanged. Their **Load in
+New Trade** / sidebar-update actions are disabled for Rectangle mode; pause or
+remove it in the queue and create a new reviewed plan to replace it. Existing
+queued strategies retain their normal editing workflow.

@@ -75,10 +75,12 @@ class BuyWatchlistStore:
         with self._exclusive_lock():
             self._replace_all_unlocked(plans)
 
-    def upsert(self, plan: BuyWatchPlan) -> BuyWatchPlan:
+    def upsert(self, plan: BuyWatchPlan, *, allow_replace: bool = True) -> BuyWatchPlan:
         with self._exclusive_lock():
             plans = self.read()
             existing = next((row for row in plans if row.plan_id == plan.plan_id), None)
+            if existing is not None and not allow_replace:
+                raise ValueError("A Buy queue plan already exists for this ticker, interval and strategy. Manage or remove it in Positions & Queue first.")
             if existing is None and len(plans) >= MAX_BUY_WATCHLIST_ITEMS:
                 raise ValueError(f"Buy watchlist is limited to {MAX_BUY_WATCHLIST_ITEMS} setups.")
             now = datetime.now(PACIFIC_TIME).isoformat()
@@ -377,4 +379,14 @@ def buy_watch_plan_detail_records(plan: BuyWatchPlan) -> list[dict[str, str]]:
         {"Area": "Initial exit plan", "Input": "Trailing ATR distance", "Saved Value": number("trailing_atr_multiplier", " ATR")},
         {"Area": "Initial exit plan", "Input": "Confirm exit on bar close", "Saved Value": yes_no(settings.get("confirm_exit_on_bar_close", True))},
     ])
+    rectangle = settings.get("rectangle_context") or {}
+    if settings.get("strategy_type") == "rectangle" and rectangle:
+        rows.extend({"Area":"Frozen rectangle", "Input":label, "Saved Value":str(value)} for label,value in (
+            ("Discovered on",rectangle.get("discovery_interval")),
+            ("Rectangle dates",f"{rectangle.get('start')} to {rectangle.get('end')}"),
+            ("Support",rectangle.get("support")), ("Resistance",rectangle.get("resistance")),
+            ("Daily breakout trigger",rectangle.get("trigger")), ("Maximum entry",rectangle.get("maximum_entry")),
+            ("Armed at",settings.get("rectangle_armed_at")), ("Entry expiry","30 calendar days after arming"),
+            ("Historical backtest","Not available for a box selected from historical research"),
+        ))
     return rows

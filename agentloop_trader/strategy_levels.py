@@ -62,7 +62,21 @@ def build_buy_level_snapshot(
     if trend_level is None:
         trend_level = _number(live.get("last_sma"))
 
-    if setup_type == "breakout":
+    if setup_type == "rectangle":
+        context = live.get("rectangle_context") or {}
+        entry = _number(live.get("entry_level"))
+        actionable_target = entry
+        add("Frozen resistance",_money(context.get("resistance")),"Keep the saved box level fixed",_status(requirements,"price basis unchanged"),
+            "A changed corporate-action price basis blocks entry until a new plan is reviewed.")
+        add("New Daily breakout",_money(live.get("last_p")),f"New completed Daily close crosses above {_money(entry)} after saving",
+            "Pass" if requirements.get("Fresh cross above frozen trigger") and requirements.get("New completed close after arming") else "Not met",
+            "An old breakout or an unfinished candle cannot trigger this plan.",entry)
+        add("Maximum entry",_money(current),f"Current/order price above {_money(entry)} and no higher than {_money(context.get('maximum_entry'))}",
+            "Pass" if current is not None and entry is not None and entry < current <= (_number(context.get('maximum_entry')) or 0) else "Not met",
+            "The worker checks the latest quote and final order price again before sending.")
+        for rule in ("Current completed Daily data","Plan is within 30 days of arming","Range support has held since arming","Frozen ticker matches","Daily execution interval"):
+            add(rule,"Pass" if requirements.get(rule) else "Not met","Must pass","Pass" if requirements.get(rule) else "Not met",str(live.get("no_trade_reason") or rule))
+    elif setup_type == "breakout":
         entry = _number(live.get("entry_level"))
         add(
             "Breakout price",

@@ -4,7 +4,58 @@ Last updated: 2026-10-20 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 20, 2026 — Universe selection and revised tightness (current)
+## October 20, 2026 — Research-to-Buy-queue workflow (current)
+
+User explicitly authorized building a trade-plan handoff from a saved rectangle
+to the existing automatic paper Buy queue. The manual arming boundary is Save to
+Buy queue. Research saves, Create trade plan, preview edits, and discard never
+arm anything or alter global automation controls. An inline review lives below
+the selected research watchlist chart, with fresh Alpaca Daily history, entry
+strategy, risk %, ATR stop and Daily exit lookback. Defaults come from current
+sidebar settings/risk limits passed by turtle_trading.py. Credentials required
+for preview; only explicitly clicking Create downloads one ticker's preview.
+
+New current-plan strategy_type=rectangle / Rectangle breakout is routed through
+strategy_runtime._run_one and the existing worker, not added to historical
+STRATEGY_TYPES/optimizer suites. Default confirmation is Daily, including Weekly
+discoveries (explicit Weekly setup / Daily entry label). Freeze support/resistance
+and review ATR; trigger resistance+0.10 ATR rounded up to cents; max entry trigger
++0.50 ATR rounded down. Fresh completed Daily close must cross after exact arming
+timestamp. Require current consecutive sessions, matching ticker, no completed
+support loss after arming, anchor-basis unchanged within 0.1%, and age <=30 days.
+Worker additionally checks latest quote and final repriced order against the band.
+Initial stop/size use current execution ATR and actual paper account, followed by
+existing risk constraints, rolling-low exit and ATR profit protection. Entry
+expiry/invalid anchor leaves exit levels/ATR available for held-position exits.
+
+Preview estimates use review account/trigger; they are not fills. Review expires
+after 15 minutes or a new completed Daily candle. Research/Alpaca basis mismatch
+over 1% at original anchor requires refreshed research. New plan defaults to
+single use (Repeat Off). Save atomically refuses duplicate ticker/Daily/strategy
+via BuyWatchlistStore.upsert(allow_replace=False); it cannot silently overwrite
+or rearm a previous executable plan. Five existing strategies are selectable and
+follow their own rules; RSI no-price-stop mode remains backtest-only.
+
+Rectangle plans have no historical backtest (frozen geometry was selected from
+research history); historical strategy suites remain unchanged. Queue details
+and charts display frozen levels/cap/date. Queue Load in New Trade and sidebar
+update are disabled only for Rectangle mode to avoid loading an unsupported
+backtest family; manage pause/removal there and create a fresh reviewed plan
+from Ideas to replace it. Other existing strategy edit paths remain intact.
+
+No worker, app or real broker was started/called during development. Tests use
+isolated research/queue files and fake adapters; no actual queue was armed.
+
+Verification: 641 tests passed (48 new trade-plan checks). Includes Daily and
+Weekly research-to-Daily UI handoff, explicit Save-only persistence, existing
+strategy selection, duplicate-plan rejection, fresh-close/arming/expiry/basis
+gates, quote/limit-price rechecks, current-account sizing, and a fake-broker
+end-to-end queue order that attaches exits and disables after one submission.
+No actual research/Buy queue records or broker orders were created/changed.
+
+The sections below are earlier checkpoints, superseded where this section differs.
+
+## October 20, 2026 — Universe selection and revised tightness
 
 User approved the revised Daily tightness rule: >=6 of last 10 closes above
 midpoint, latest close inside upper third, median true range <=25% of box height.

@@ -151,6 +151,8 @@ def queued_price_levels(
         else None
     )
     buy_label = "Next numeric BUY level"
+    if settings.get("strategy_type") == "rectangle":
+        buy_label = "Frozen rectangle Daily breakout trigger"
     breakout_level = _number(live.get("trendline_breakout_level"))
     trend_filter_level = _number(live.get("trend_filter_level"))
     if next_buy_level is not None and breakout_level is not None and abs(next_buy_level - breakout_level) < 0.01:
@@ -268,7 +270,18 @@ def build_management_chart(
 
     entry_window = int(settings.get("entry_window", 20))
     exit_window = int(settings.get("exit_window", 10))
-    if strategy_type == "breakout":
+    if strategy_type == "rectangle":
+        context = settings.get("rectangle_context") or {}
+        for label,key,color in (("Frozen rectangle resistance","resistance",CHART_COLORS["trend"]),
+                                ("Frozen Daily breakout trigger","trigger",CHART_COLORS["entry"]),
+                                ("Maximum rectangle entry","maximum_entry",CHART_COLORS["exit"]),
+                                ("Frozen rectangle support","support",CHART_COLORS["sell"])):
+            level = _number(context.get(key))
+            if level is not None:
+                fig.add_trace(go.Scatter(x=x,y=[level]*len(x),mode="lines",name=label,
+                                        line=dict(color=color,width=1.4,dash="dot")))
+        overlays = [(f"{exit_window}-bar strategy exit",_rolling(low,exit_window,operation="min",shift=1),CHART_COLORS["exit"])]
+    elif strategy_type == "breakout":
         overlays = [
             (f"{entry_window}-bar BUY breakout", _rolling(high, entry_window, operation="max", shift=1), CHART_COLORS["entry"]),
             (f"{exit_window}-bar strategy exit", _rolling(low, exit_window, operation="min", shift=1), CHART_COLORS["exit"]),

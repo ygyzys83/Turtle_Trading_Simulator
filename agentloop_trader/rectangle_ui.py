@@ -16,6 +16,7 @@ from agentloop_trader.rectangle_scanner import (
 from agentloop_trader.rectangle_store import RectangleStore
 from agentloop_trader.rectangle_signals import SIGNAL_LABELS, signal_label
 from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, UNIVERSE_NOTES
+from agentloop_trader.rectangle_trade_ui import render_rectangle_trade_action
 from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, TIMEFRAME_LABELS
 from agentloop_trader.ui_theme import CHART_COLORS
 
@@ -177,7 +178,8 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
             st.caption("Setup factors were not assessed for this saved range. Run a new scan to assess current matches.")
 
 
-def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="automation_logs/rectangle_research"):
+def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="automation_logs/rectangle_research",
+                             trade_settings=None, trade_risk_limits=None, buy_queue_path=None):
     store = RectangleStore(store_root)
     st.markdown("#### Rectangle trading ranges")
     active = st.session_state.get("rectangle_scan_job") is not None
@@ -300,6 +302,9 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             symbol = records[index]["Ticker"]
             watch_key = watch_keys[index]
             _render_chart(store, originals[watch_key], watches[watch_key]["source"], "watch", watch=watches[watch_key])
+            render_rectangle_trade_action(store,originals[watch_key],watches[watch_key],
+                api_key=api_key,api_secret=api_secret,defaults=trade_settings,
+                risk_limits=trade_risk_limits,buy_queue_path=buy_queue_path)
             if st.button("Remove from Watchlist", key="rectangle_remove", disabled=active):
                 try:
                     store.remove_watch(symbol, interval)
