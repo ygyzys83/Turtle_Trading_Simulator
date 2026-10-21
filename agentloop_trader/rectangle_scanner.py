@@ -309,7 +309,7 @@ def rectangle_records(rows: list[Rectangle]) -> list[dict[str, Any]]:
 
 
 def refresh_saved_rectangle(original: Rectangle, original_anchor: float, data: pd.DataFrame,
-                            *, now=None) -> tuple[Rectangle, str]:
+                            *, now=None, assess_signals=False) -> tuple[Rectangle, str]:
     """Retain saved geometry, explicitly adjusting its basis after corporate actions."""
     frame = analysis_bars(data, original.interval, now)
     if pd.Timestamp(original.end) not in frame.index:
@@ -322,5 +322,14 @@ def refresh_saved_rectangle(original: Rectangle, original_anchor: float, data: p
                       resistance=original.resistance*factor, tolerance=original.tolerance*factor,
                       atr=original.atr*factor, last_close=float(frame.Close.iloc[-1]),
                       higher_low_prices=tuple(p*factor for p in original.higher_low_prices))
+    if assess_signals:
+        # The box and discovery ranking stay frozen. Only the recent setup
+        # assessment rolls forward against those same, rebased boundaries.
+        atrs = calc_atr(frame.Close.to_numpy(dtype=float), 14,
+                       frame.High.to_numpy(dtype=float), frame.Low.to_numpy(dtype=float))
+        atr = float(atrs[-1]) if atrs[-1] is not None else float("nan")
+        current = replace(current, **analyze_breakout_signals(
+            frame, start=original.start, end=frame.index[-1], support=current.support,
+            resistance=current.resistance, atr=atr, interval=original.interval))
     adjustment = "Price basis adjusted for corporate actions." if abs(factor-1) > .00001 else ""
     return current, adjustment

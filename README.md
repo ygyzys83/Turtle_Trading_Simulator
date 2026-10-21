@@ -253,10 +253,12 @@ These assessments use consecutive completed candles inside the candidate range,
 strictly through its saved scan date. Missing required candles or confirmed lows
 produce Unknown rather than invented evidence. The chart marks the assessed
 pullback lows and midpoint; **Setup details** explains each result and its date.
-Saved watchlist assessments retain their original scan date even if cached price
-history is refreshed later. Split adjustments also rebase plotted low markers.
-Old records remain readable with Unknown factors until a new scan produces new
-matches; original watchlist entries are not rewritten. These optional filters do
+Scan-result assessments retain their original scan date. Research watchlist
+assessments instead roll forward through the latest cached completed candle,
+using the original box boundaries (rebased after corporate actions) and current
+timeframe ATR. The watchlist table, chart pullback markers and Setup details show
+these current checks and their data date. The saved box, discovery quality and
+prior-trend ranking are not rewritten, including for legacy entries. These optional filters do
 not alter rectangle qualification, discovery history, or ranking, and do not
 estimate breakout probabilities.
 
@@ -322,7 +324,16 @@ saved ranges. Legacy entries default to Nasdaq provenance. Legacy records withou
 read as daily; they are not automatically rewritten or reinterpreted as weekly. Later scans refresh cached prices,
 including saved symbols no longer in the universe. Corporate-action basis changes
 are explicitly reflected when plotting/evaluating original levels; missing basis
-data and stale history remain visible. **Remove from Watchlist** removes only the
+data and stale history remain visible. **Refresh Watchlist** explicitly downloads
+only saved tickers, across both universes and both timeframes, on their original
+feeds; Daily and Weekly entries share one history download per ticker/feed.
+It runs in the background with progress and cancellation, sharing the scan lock.
+Fresh full histories reconcile corrections and splits and retain older saved
+research context. Missing, stale, incomplete or invalid-basis downloads keep the
+previous history and appear in a failure list; successful downloads remain if
+the refresh is canceled. No universe membership is fetched, no ranges are
+re-detected, and scan results/discovery history and trading queues are untouched.
+Opening a chart alone still never downloads prices. **Remove from Watchlist** removes only the
 research record. Scans never create broker orders, Buy watchlist entries or exit
 plans, and no periodic unattended scan is scheduled. The existing strategy scanner
 remains under **Strategy scanner and research**.

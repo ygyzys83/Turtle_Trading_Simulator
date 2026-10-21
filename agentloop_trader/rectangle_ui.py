@@ -9,7 +9,7 @@ from plotly.subplots import make_subplots
 import streamlit as st
 
 from agentloop_trader.rectangle_data import DailyHistoryProvider, history_bucket
-from agentloop_trader.rectangle_jobs import start_range_scan
+from agentloop_trader.rectangle_jobs import start_range_scan, start_watchlist_refresh
 from agentloop_trader.rectangle_scanner import (
     DETECTOR_VERSION, Rectangle, filter_rectangles, rectangle_from_record, rectangle_records, refresh_saved_rectangle,
 )
@@ -94,7 +94,7 @@ def _scan_progress():
         st.session_state["rectangle_scan_notice"] = snapshot
         st.rerun()
     st.progress(snapshot["progress"], text=snapshot["message"])
-    if st.button("Cancel scan", key="rectangle_cancel"):
+    if st.button("Cancel refresh" if snapshot.get("kind") == "watchlist_refresh" else "Cancel scan", key="rectangle_cancel"):
         job.cancel.set()
         st.caption("Canceling after the current download returns...")
 
@@ -121,12 +121,13 @@ def _table_selection(records, key):
 def _render_chart(store, rectangle, source, key, *, watch=None):
     frame, bucket = store.read_history(rectangle.symbol, source)
     if frame is None:
-        st.warning("Cached chart history is missing. Run Scan for Trading Ranges to reload it.")
+        st.warning("Cached chart history is missing. Click Refresh Watchlist to reload it." if watch is not None
+                   else "Cached chart history is missing. Run Scan for Trading Ranges to reload it.")
         return
     adjustment = ""
     try:
         if watch is not None:
-            rectangle, adjustment = refresh_saved_rectangle(rectangle, watch["anchor_close"], frame)
+            rectangle, adjustment = refresh_saved_rectangle(rectangle, watch["anchor_close"], frame, assess_signals=True)
         else:
             # Later/canceled scans can update history. Keep this result's as-of date.
             frame = frame.loc[frame.index <= pd.Timestamp(rectangle.end)]
@@ -152,7 +153,8 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
         f"{label} candles through {frame.index[-1]:%Y-%m-%d} · {source}."
     )
     if frame.index[-1] < latest_completed_date(rectangle.interval):
-        st.caption("Saved history may be out of date. Run a scan to refresh it.")
+        st.caption("Saved history may be out of date. Click Refresh Watchlist to load new completed candles."
+                   if watch is not None else "Saved history may be out of date. Run a scan to refresh it.")
     if adjustment:
         st.caption(adjustment)
     if rectangle.prior_return_percent is not None:
@@ -168,10 +170,9 @@ def _render_chart(store, rectangle, source, key, *, watch=None):
                     width="stretch", theme=None, config={"scrollZoom": True}, key=f"rectangle_chart_{key}")
     with st.expander("Setup details"):
         if rectangle.signal_details:
-            st.caption(f"Setup assessed through {rectangle.signals_as_of} · saved scan assessment. "
+            assessment = "current assessment against saved rectangle" if watch is not None else "saved scan assessment"
+            st.caption(f"Setup assessed through {rectangle.signals_as_of} · {assessment}. "
                        "✓ Passes · — Does not pass · Unknown: insufficient evidence. These factors do not change the ranking.")
-            if watch is not None:
-                st.caption("These setup factors describe the saved candidate; the latest price status above can be newer.")
             for (name, label), reason in zip(SIGNAL_LABELS.items(), rectangle.signal_details):
                 st.write(f"**{label}: {signal_label(getattr(rectangle, name))}** · {reason}")
         else:
@@ -205,6 +206,14 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
             st.error(notice["error"])
         elif notice["canceled"]:
             st.info(notice["message"])
+        elif notice.get("kind") == "watchlist_refresh":
+            if notice.get("problems"):
+                st.warning(notice["message"])
+            else:
+                st.success(notice["message"])
+        if notice.get("kind") == "watchlist_refresh" and notice.get("problems"):
+            with st.expander("Watchlist histories that could not be refreshed"):
+                st.dataframe(pd.DataFrame(notice["problems"]), hide_index=True, width="stretch")
     try:
         scan, all_watches = store.read_scan(interval, universe_id), store.read("watchlist", {})
         results = [rectangle_from_record(row) for row in scan.get("rectangles", [])]
@@ -271,7 +280,15 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
     with watch_tab:
         st.caption(f"Showing saved {label.lower()} ranges from both universes. The research watchlist is shared; "
                    "switching Universe only changes scan results. Switch Timeframe to view the other saved ranges. "
-                   "Saving research does not enable a queued buy or change an exit plan. Prices refresh when you run a scan.")
+                   "Saving research does not enable a queued buy or change an exit plan.")
+        if st.button("Refresh Watchlist", key="rectangle_refresh_watchlist", disabled=active or not all_watches,
+                     help="Update completed candles and setup checks for all saved Daily and Weekly ranges in both universes. Preserves original boxes and rankings; does not run a universe scan."):
+            provider = DailyHistoryProvider(api_key, api_secret)
+            st.session_state["rectangle_scan_job"] = start_watchlist_refresh(store, provider)
+            st.session_state.pop("rectangle_scan_notice", None)
+            st.rerun()
+        st.caption("Refresh updates saved tickers on their original data feeds. Weekly charts use completed weeks only. "
+                   "Original boxes stay fixed; setup checks follow the latest cached candles.")
         if not watches:
             st.info("Save a candidate from Scan results to track its original rectangle here.")
         else:
@@ -283,9 +300,10 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                 symbol = original.symbol
                 frame, bucket = store.read_history(symbol, watch["source"])
                 status, price, as_of = "History unavailable", None, ""
+                current = None
                 try:
                     if frame is not None:
-                        current, _ = refresh_saved_rectangle(original, watch["anchor_close"], frame)
+                        current, _ = refresh_saved_rectangle(original, watch["anchor_close"], frame, assess_signals=True)
                         bars = analysis_bars(frame, original.interval)
                         price, as_of = current.last_close, bars.index[-1].strftime("%Y-%m-%d")
                         status = "Broke above" if current.location == "Above range" else "Broke below" if current.location == "Below range" else current.location
@@ -293,9 +311,12 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                             status += " · needs refresh"
                 except (ValueError, RuntimeError):
                     status = "Price basis unavailable"
+                    current = None
                 records.append({"Ticker": symbol, "Timeframe": label, "Range (months)": original.months,
                                 "Found in": "S&P 500" if watch.get("universe_id", "nasdaq") == "sp500" else "Nasdaq",
                                 "Price": price, "Status": status, "Data date": as_of,
+                                **{label: signal_label(getattr(current, name) if current is not None else None)
+                                   for name, label in SIGNAL_LABELS.items()},
                                 "Saved": pd.Timestamp(watch["saved_at"]).strftime("%Y-%m-%d")})
             key = hashlib.sha256(str((interval, [(r["Ticker"], r["Saved"]) for r in records])).encode()).hexdigest()[:10]
             index = _table_selection(records, f"rectangle_watches_{key}")

@@ -11,7 +11,9 @@ from agentloop_trader.rectangle_data import (
     DailyHistoryProvider, ScanCancelled, fetch_universe,
     HISTORY_DAYS, full_history_start, history_bucket, merge_history,
 )
-from agentloop_trader.rectangle_scanner import DETECTOR_VERSION, daily_bars, detect_rectangles
+from agentloop_trader.rectangle_scanner import (
+    DETECTOR_VERSION, daily_bars, detect_rectangles, rectangle_from_record, refresh_saved_rectangle,
+)
 from agentloop_trader.rectangle_store import RectangleStore, exclusive_file
 from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, validate_interval, TIMEFRAME_LABELS
 from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, universe_cache_name, validate_universe_id
@@ -26,6 +28,9 @@ class ScanJob:
     progress: float = 0.0
     error: str = ""
     canceled: bool = False
+    kind: str = "scan"
+    refreshed: int = 0
+    problems: list = field(default_factory=list)
 
     def update(self, **values):
         with self.lock:
@@ -34,7 +39,8 @@ class ScanJob:
 
     def snapshot(self):
         with self.lock:
-            return {key: getattr(self, key) for key in ("done", "message", "progress", "error", "canceled")}
+            return {key: getattr(self, key) for key in (
+                "done", "message", "progress", "error", "canceled", "kind", "refreshed", "problems")}
 
 
 def run_range_scan(store: RectangleStore, provider: DailyHistoryProvider, job: ScanJob,
@@ -213,4 +219,92 @@ def start_range_scan(store, provider, *, interval="1d", universe_id="nasdaq") ->
     threading.Thread(target=run_range_scan, args=(store, provider, job),
                      kwargs={"interval": interval, "universe_id": universe_id}, daemon=True,
                      name="rectangle-research-scan").start()
+    return job
+
+
+def run_watchlist_refresh(store: RectangleStore, provider: DailyHistoryProvider, job: ScanJob):
+    """Refresh only saved histories; never rewrite discovery records or trade plans.
+
+    Fetch full history for this small list to reconcile provider corrections and
+    splits. Daily/weekly entries share one download per ticker and original feed.
+    Successful downloads survive cancellation; failed histories remain untouched.
+    """
+    try:
+        with exclusive_file(store.root / "scan.lock", timeout=.1):
+            provider.check_cancel()
+            grouped = {}
+            for watch in store.read("watchlist", {}).values():
+                original = rectangle_from_record(watch["rectangle"])
+                grouped.setdefault((watch["source"], original.symbol), []).append((original, watch["anchor_close"]))
+            total, finished, refreshed, problems = len(grouped), 0, 0, []
+            for source in sorted({source for source, _ in grouped}):
+                selected = provider if source == provider.source else DailyHistoryProvider(cancel=provider.cancel)
+                symbols = sorted(symbol for feed, symbol in grouped if feed == source)
+                for offset in range(0, len(symbols), 20):
+                    provider.check_cancel()
+                    batch = symbols[offset:offset+20]
+                    job.update(message=f"Refreshing watchlist · {finished:,} of {total:,} ticker histories",
+                               progress=finished/max(total, 1))
+                    # Retain old research context even after a saved box ages
+                    # beyond the scanner's normal three-year download horizon.
+                    starts = [pd.Timestamp(original.start)-pd.DateOffset(months=6)-pd.Timedelta(days=7)
+                              for symbol in batch for original, _ in grouped[source, symbol]]
+                    start = min([pd.Timestamp(full_history_start()), *starts]).strftime("%Y-%m-%d")
+                    try:
+                        if selected.source != source:
+                            raise ValueError("Saved feed unavailable; configure its credentials before refreshing.")
+                        frames = selected.fetch(batch, start)
+                    except ScanCancelled:
+                        raise
+                    except Exception:
+                        frames = {}
+                        reason = ("Saved feed unavailable; configure its credentials before refreshing."
+                                  if selected.source != source else "Download failed; previous history kept.")
+                    else:
+                        reason = "No history returned; previous history kept."
+                    for symbol in batch:
+                        provider.check_cancel()
+                        try:
+                            if symbol not in frames:
+                                raise ValueError(reason)
+                            frame = daily_bars(frames[symbol])
+                            if frame.empty or frame.index[-1] < latest_completed_date("1d"):
+                                raise ValueError("Latest completed daily candle is missing; previous history kept.")
+                            previous, _ = store.read_history(symbol, source)
+                            if previous is not None:
+                                retained = previous.index[previous.index >= pd.Timestamp(start)]
+                                if not retained.isin(frame.index).all():
+                                    raise ValueError("Download is missing previously cached sessions; previous history kept.")
+                            for original, anchor in grouped[source, symbol]:
+                                bars = analysis_bars(frame, original.interval)
+                                if bars.empty or bars.index[-1] < latest_completed_date(original.interval):
+                                    raise ValueError("Latest completed candle is incomplete; previous history kept.")
+                                if pd.Timestamp(original.start) not in bars.index:
+                                    raise ValueError("Saved range history is incomplete; previous history kept.")
+                                refresh_saved_rectangle(original, anchor, frame, assess_signals=True)
+                            store.write_history(symbol, source, frame, history_bucket(), history_days=HISTORY_DAYS)
+                            refreshed += 1
+                        except Exception as exc:
+                            problem = str(exc) if isinstance(exc, ValueError) else "History refresh failed; previous history kept."
+                            problems.append({"Ticker": symbol, "Source": source, "Problem": problem})
+                        finished += 1
+                        job.update(refreshed=refreshed, problems=list(problems), progress=finished/max(total, 1))
+            provider.check_cancel()
+            job.update(message=f"Watchlist refreshed: {refreshed:,} of {total:,} ticker histories updated.", progress=1.0)
+    except ScanCancelled:
+        job.update(canceled=True, message="Watchlist refresh canceled. Completed downloads were kept; remaining histories were unchanged.")
+    except Exception as exc:
+        safe = str(exc) if isinstance(exc, (ValueError, PermissionError, RuntimeError)) else "Watchlist refresh failed; saved research was preserved."
+        for secret in (getattr(provider, "api_key", None), getattr(provider, "api_secret", None)):
+            if secret:
+                safe = safe.replace(secret, "[redacted]")
+        job.update(error=safe)
+    finally:
+        job.update(done=True)
+
+
+def start_watchlist_refresh(store, provider) -> ScanJob:
+    job = ScanJob(cancel=provider.cancel, kind="watchlist_refresh", message="Loading saved watchlist...")
+    threading.Thread(target=run_watchlist_refresh, args=(store, provider, job), daemon=True,
+                     name="rectangle-watchlist-refresh").start()
     return job

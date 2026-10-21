@@ -1,10 +1,35 @@
 # Trading Simulator - Conversation State Handoff
 
-Last updated: 2026-10-20 (Pacific Time)
+Last updated: 2026-10-21 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 20, 2026 — Research-to-Buy-queue workflow (current)
+## October 21, 2026 — Research watchlist refresh (current)
+
+Added explicit Refresh Watchlist in Ideas, updating all saved tickers from both
+universes/timeframes using their original feeds. Downloads are deduplicated per
+ticker/feed, batched, cancelable, and share scan.lock with full scans. Refresh
+uses full history (including older saved range context) to reconcile splits and
+corrections. Missing/stale/incomplete/invalid-basis downloads preserve previous
+history and appear in a failure list; completed downloads survive cancellation.
+It does not fetch universe membership, detect new rectangles, rewrite saved
+research or scan snapshots, or change trading queues/worker controls.
+
+Watchlist table and chart now assess higher lows, tightness and supportive volume
+through the latest cached completed candle against the preserved original box,
+with current timeframe ATR. The date, details and pullback markers reflect that
+assessment; discovery quality and prior-trend ranking stay frozen. Scan-result
+assessments still remain historical snapshots. Ordinary rerenders never fetch.
+This section supersedes older statements below about frozen watchlist factors.
+
+Validation: full regression suite passed, 653 tests in 56.01 seconds (12 new
+watchlist-refresh cases), including the explicit UI action and latest chart
+candle, feed preservation, shared Daily/Weekly downloads, fixed geometry and
+current checks, splits, failures, cancellation and scan locking. git diff --check
+passed. No real refresh, scan, worker or broker was run during development;
+test histories are isolated fixtures.
+
+## October 20, 2026 — Research-to-Buy-queue workflow
 
 User explicitly authorized building a trade-plan handoff from a saved rectangle
 to the existing automatic paper Buy queue. The manual arming boundary is Save to
