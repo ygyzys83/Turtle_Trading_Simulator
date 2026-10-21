@@ -15,7 +15,7 @@ from agentloop_trader.rectangle_scanner import (
 )
 from agentloop_trader.rectangle_store import RectangleStore
 from agentloop_trader.rectangle_signals import SIGNAL_LABELS, signal_label
-from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, UNIVERSE_NOTES
+from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, UNIVERSE_NOTES, UNIVERSE_SHORT_LABELS
 from agentloop_trader.rectangle_trade_ui import render_rectangle_trade_action
 from agentloop_trader.rectangle_timeframes import analysis_bars, latest_completed_date, TIMEFRAME_LABELS
 from agentloop_trader.ui_theme import CHART_COLORS
@@ -278,11 +278,11 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                 with st.expander("Stocks that could not be checked"):
                     st.dataframe(pd.DataFrame(scan["errors"]), hide_index=True, width="stretch")
     with watch_tab:
-        st.caption(f"Showing saved {label.lower()} ranges from both universes. The research watchlist is shared; "
+        st.caption(f"Showing saved {label.lower()} ranges from all universes. The research watchlist is shared; "
                    "switching Universe only changes scan results. Switch Timeframe to view the other saved ranges. "
                    "Saving research does not enable a queued buy or change an exit plan.")
         if st.button("Refresh Watchlist", key="rectangle_refresh_watchlist", disabled=active or not all_watches,
-                     help="Update completed candles and setup checks for all saved Daily and Weekly ranges in both universes. Preserves original boxes and rankings; does not run a universe scan."):
+                     help="Update completed candles and setup checks for all saved Daily and Weekly ranges in all universes. Preserves original boxes and rankings; does not run a universe scan."):
             provider = DailyHistoryProvider(api_key, api_secret)
             st.session_state["rectangle_scan_job"] = start_watchlist_refresh(store, provider)
             st.session_state.pop("rectangle_scan_notice", None)
@@ -313,7 +313,7 @@ def render_rectangle_scanner(api_key=None, api_secret=None, *, store_root="autom
                     status = "Price basis unavailable"
                     current = None
                 records.append({"Ticker": symbol, "Timeframe": label, "Range (months)": original.months,
-                                "Found in": "S&P 500" if watch.get("universe_id", "nasdaq") == "sp500" else "Nasdaq",
+                                "Found in": UNIVERSE_SHORT_LABELS.get(watch.get("universe_id", "nasdaq"), "Unknown"),
                                 "Price": price, "Status": status, "Data date": as_of,
                                 **{label: signal_label(getattr(current, name) if current is not None else None)
                                    for name, label in SIGNAL_LABELS.items()},

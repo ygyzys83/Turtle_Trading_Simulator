@@ -183,7 +183,7 @@ Shadow mode records would-have-traded decisions without submitting orders. Audit
 
 ## Rectangle Range Scanner
 
-On **Ideas**, choose **Universe: Nasdaq common stocks (Composite-style) / S&P 500**
+On **Ideas**, choose **Universe: Nasdaq common stocks (Composite-style) / S&P 500 / Russell 2000**
 and **Timeframe: Daily / Weekly**, then click **Scan for Trading Ranges**.
 Only the selected universe is screened. Both modes search approximately **3–24 months**: 63–504 daily sessions
 or 13–104 weekly candles. The scanner uses shared daily OHLCV independently of
@@ -291,6 +291,17 @@ the UTC day, and its source/as-of date stays visible. Malformed, partial-count
 (outside 490–520 stocks), or stale (over 10 days) S&P holdings fail clearly and
 preserve previous results; there is no silent substitution of another universe.
 
+The **Russell 2000** choice similarly uses published equity holdings of the
+[iShares Russell 2000 ETF (IWM)](https://www.ishares.com/us/products/239710/ishares-russell-2000-etf)
+as an explicitly labeled holdings-based proxy, not licensed index constituents.
+Listed Nasdaq, NYSE, NYSE American and Cboe equities are eligible, including
+separate share classes. Cash, funds, derivatives, unlisted/OTC residuals and
+zero-price entries without tradable tickers are excluded. Malformed holdings,
+unrecognized listed symbols/venues, counts outside 1,800–2,200, dates over 10
+days old (or more than one day ahead) and oversized responses fail clearly and
+keep previous results. Rectangle rules, ranking, liquidity floors and the three
+optional filters are the same for all universes.
+
 Configured Alpaca credentials select **Alpaca IEX**; otherwise scans use **Yahoo**.
 Authentication failures do not silently switch feeds. IEX volume is feed-specific,
 not consolidated-market volume. A shared three-year daily cache provides 24-month
@@ -314,9 +325,12 @@ in `scan.json`; Nasdaq weekly uses `scan_weekly.json`. S&P daily/weekly use
 `universe.json` for Nasdaq and `universe_sp500.json` for S&P. Legacy scans default
 to Nasdaq without automatic migration. Switching universe/timeframe shows only
 that combination's saved results. Running one never replaces another's results.
+Russell uses `scan_russell2000.json` / `scan_russell2000_weekly.json` and
+`universe_russell2000.json`; its discovery history is independent, while
+overlapping tickers reuse the shared price cache.
 
 **Save to Watchlist** creates research only, separate from the executable Buy
-watchlist. It is shared across both universes, filtered only by timeframe;
+watchlist. It is shared across all universes, filtered only by timeframe;
 **Found in** identifies the original discovery universe. One original rectangle
 per ticker/timeframe is preserved, so overlap does not create duplicate entries
 or replace an existing saved box. A ticker can have separate daily and weekly
@@ -325,7 +339,7 @@ read as daily; they are not automatically rewritten or reinterpreted as weekly. 
 including saved symbols no longer in the universe. Corporate-action basis changes
 are explicitly reflected when plotting/evaluating original levels; missing basis
 data and stale history remain visible. **Refresh Watchlist** explicitly downloads
-only saved tickers, across both universes and both timeframes, on their original
+only saved tickers, across all universes and both timeframes, on their original
 feeds; Daily and Weekly entries share one history download per ticker/feed.
 It runs in the background with progress and cancellation, sharing the scan lock.
 Fresh full histories reconcile corrections and splits and retain older saved

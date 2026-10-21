@@ -21,6 +21,7 @@ from agentloop_trader.rectangle_universes import UNIVERSE_LABELS, UNIVERSE_NOTES
 
 DIRECTORY_URL = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 SP500_HOLDINGS_URL = "https://www.ishares.com/us/products/239726/ishares-core-s-p-500-etf/latest-holdings.csv"
+RUSSELL2000_HOLDINGS_URL = "https://www.ishares.com/us/products/239710/ishares-russell-2000-etf/latest-holdings.csv"
 HISTORY_DAYS = 1100  # Three years: 24-month ranges plus ATR and pivot warmup.
 UNIVERSE_LABEL = UNIVERSE_LABELS["nasdaq"]  # Backward-compatible exports.
 UNIVERSE_NOTE = UNIVERSE_NOTES["nasdaq"]
@@ -65,6 +66,14 @@ def fetch_nasdaq_universe() -> dict:
 
 
 def parse_sp500_holdings(text: str) -> tuple[list[str], str]:
+    return _parse_ishares_holdings(text, fund="iShares Core S&P 500 ETF", label="S&P 500")
+
+
+def parse_russell2000_holdings(text: str) -> tuple[list[str], str]:
+    return _parse_ishares_holdings(text, fund="iShares Russell 2000 ETF", label="Russell 2000", small_caps=True)
+
+
+def _parse_ishares_holdings(text: str, *, fund: str, label: str, small_caps=False) -> tuple[list[str], str]:
     """Read the provider's metadata-prefixed CSV, including separate share classes.
 
     Never treat a partial response or malformed equity ticker as a smaller valid
@@ -73,13 +82,13 @@ def parse_sp500_holdings(text: str) -> tuple[list[str], str]:
     rows = list(csv.reader(io.StringIO(text.lstrip("\ufeff"))))
     required = {"Ticker", "Name", "Asset Class", "Exchange"}
     header = next((i for i, row in enumerate(rows) if required.issubset(row)), None)
-    if header is None or not rows or rows[0] != ["iShares Core S&P 500 ETF"]:
-        raise ValueError("iShares returned unrecognized S&P 500 holdings.")
+    if header is None or not rows or rows[0] != [fund]:
+        raise ValueError(f"iShares returned unrecognized {label} holdings.")
     date = next((r[1].strip() for r in rows[:header] if len(r) > 1 and r[0].strip() == "Fund Holdings as of"), "")
     try:
         as_of = datetime.strptime(date, "%b %d, %Y").date().isoformat()
     except ValueError:
-        raise ValueError("S&P 500 holdings are missing a valid as-of date.") from None
+        raise ValueError(f"{label} holdings are missing a valid as-of date.") from None
     symbols = set()
     for fields in rows[header+1:]:
         if len(fields) < len(rows[header]):
@@ -88,46 +97,63 @@ def parse_sp500_holdings(text: str) -> tuple[list[str], str]:
                 # An equity-looking truncated row must never be silently lost.
                 asset_column = rows[header].index("Asset Class")
                 if len(fields) > asset_column and fields[asset_column].strip() == "Equity":
-                    raise ValueError("S&P 500 holdings contain a truncated equity row.")
+                    raise ValueError(f"{label} holdings contain a truncated equity row.")
             continue
         row = dict(zip(rows[header], fields))
         if row["Asset Class"].strip() != "Equity":
             continue
         if row["Exchange"].strip().upper() == "NO MARKET (E.G. UNLISTED)":
             continue  # Residual positions after delisting are not tradable stocks.
-        if row["Exchange"].strip().upper() not in {"NASDAQ", "NYSE", "NEW YORK STOCK EXCHANGE INC.", "CBOE BZX"}:
-            raise ValueError("S&P 500 holdings contain an unrecognized equity exchange.")
+        if small_caps and row["Exchange"].strip().upper() == "NON-NMS QUOTATION SERVICE (NNQS)":
+            continue  # OTC/escrow residuals are outside the listed-stock universe.
+        exchanges = {"NASDAQ", "NYSE", "NEW YORK STOCK EXCHANGE INC.", "CBOE BZX"}
+        if small_caps:
+            exchanges |= {"NYSE MKT LLC", "NYSE AMERICAN"}
+        if row["Exchange"].strip().upper() not in exchanges:
+            raise ValueError(f"{label} holdings contain an unrecognized equity exchange.")
+        if small_caps and row["Ticker"].strip() == "-" and row.get("Price", "").strip() == "0.00":
+            continue  # Explicitly unpriced residuals with no tradable ticker.
         symbol = re.sub(r"[ .-]([A-Z])$", r".\1", row["Ticker"].strip())
         if not re.fullmatch(r"[A-Z][A-Z0-9]*(?:\.[A-Z])?", symbol) or len(symbol) > 10:
-            raise ValueError("S&P 500 holdings contain an unrecognized equity symbol.")
+            raise ValueError(f"{label} holdings contain an unrecognized equity symbol.")
         symbols.add(symbol)
     if not symbols:
-        raise ValueError("No S&P 500 equity holdings were returned.")
+        raise ValueError(f"No {label} equity holdings were returned.")
     return sorted(symbols), as_of
 
 
 def fetch_sp500_universe() -> dict:
-    request = Request(SP500_HOLDINGS_URL, headers={
+    return _fetch_ishares_universe("sp500", SP500_HOLDINGS_URL, parse_sp500_holdings, 490, 520)
+
+
+def fetch_russell2000_universe() -> dict:
+    return _fetch_ishares_universe("russell2000", RUSSELL2000_HOLDINGS_URL, parse_russell2000_holdings, 1800, 2200)
+
+
+def _fetch_ishares_universe(universe_id, url, parser, minimum, maximum) -> dict:
+    label = UNIVERSE_LABELS[universe_id]
+    request = Request(url, headers={
         "User-Agent": "Mozilla/5.0 (compatible; AgentLoopTrader/1.0; personal research)",
     })
     with urlopen(request, timeout=25) as response:
         raw = response.read(4_000_001)
     if len(raw) > 4_000_000:
-        raise ValueError("S&P 500 holdings response exceeded the expected size.")
-    symbols, as_of = parse_sp500_holdings(raw.decode("utf-8-sig"))
+        raise ValueError(f"{label} holdings response exceeded the expected size.")
+    symbols, as_of = parser(raw.decode("utf-8-sig"))
     # A top-ten-only page or truncated download cannot replace a full universe.
-    if not 490 <= len(symbols) <= 520:
-        raise ValueError("S&P 500 holdings count is incomplete or unexpected; previous results were kept.")
+    if not minimum <= len(symbols) <= maximum:
+        raise ValueError(f"{label} holdings count is incomplete or unexpected; previous results were kept.")
     age = (datetime.now(UTC).date()-datetime.fromisoformat(as_of).date()).days
     if not -1 <= age <= 10:
-        raise ValueError("S&P 500 holdings date is stale or unexpected; previous results were kept.")
-    return {"symbols": symbols, "directory_date": as_of, "universe_id": "sp500",
-            "fetched_at": datetime.now(UTC).isoformat(), "source": SP500_HOLDINGS_URL}
+        raise ValueError(f"{label} holdings date is stale or unexpected; previous results were kept.")
+    return {"symbols": symbols, "directory_date": as_of, "universe_id": universe_id,
+            "fetched_at": datetime.now(UTC).isoformat(), "source": url}
 
 
 def fetch_universe(universe_id="nasdaq") -> dict:
     validate_universe_id(universe_id)
-    return fetch_nasdaq_universe() if universe_id == "nasdaq" else fetch_sp500_universe()
+    return {"nasdaq": fetch_nasdaq_universe, "sp500": fetch_sp500_universe,
+            "russell2000": fetch_russell2000_universe}[universe_id]()
 
 
 class DailyHistoryProvider:

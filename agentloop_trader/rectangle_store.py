@@ -90,7 +90,7 @@ class RectangleStore:
     def _scan_name(interval="1d", universe_id="nasdaq"):
         validate_interval(interval)
         validate_universe_id(universe_id)
-        prefix = "scan" if universe_id == "nasdaq" else "scan_sp500"
+        prefix = "scan" if universe_id == "nasdaq" else f"scan_{universe_id}"
         return prefix if interval == "1d" else prefix+"_weekly"
 
     def read_scan(self, interval="1d", universe_id="nasdaq"):

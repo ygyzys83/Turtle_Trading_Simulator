@@ -4,7 +4,32 @@ Last updated: 2026-10-21 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 21, 2026 — Research watchlist refresh (current)
+## October 21, 2026 — Russell 2000 universe (current)
+
+Added Russell 2000 (russell2000) as the third Universe option, using IWM equity
+holdings as an explicitly labeled proxy. Shared strict iShares parser/fetcher
+retains IVV behavior and supports NYSE American small caps. Russell excludes
+unlisted/OTC residuals and zero-price rows without tickers, validates the exact
+fund/header/date, requires 1,800–2,200 stocks and age at most 10 days, and rejects
+oversized/partial/malformed responses. No fallback to another universe.
+
+Daily/weekly snapshots: scan_russell2000.json / scan_russell2000_weekly.json;
+membership cache: universe_russell2000.json. Existing Nasdaq/S&P names unchanged.
+Discovery is separate, price caches and research watchlist remain shared, and
+Found in correctly identifies original Russell saves without duplicating or
+replacing saved boxes. Refresh Watchlist includes all universes. Rules, ranking,
+liquidity and filters unchanged; switching universes does not download or scan.
+This supersedes older references to only two universes below.
+
+Validation: 666 tests passed in 58.11 seconds (13 new Russell cases), with
+parser exclusions/aliases, bad feeds/counts/dates, separate Daily/Weekly scans,
+cache reuse, failure preservation, explicit UI dispatch and shared watchlist
+provenance covered. git diff --check passed. Public IWM CSV downloaded during
+development contained 1,968 eligible listed equities, as of 2026-10-19, and
+parsed successfully. No real scan, watchlist refresh, trade queue changes,
+worker or broker operation was performed.
+
+## October 21, 2026 — Research watchlist refresh
 
 Added explicit Refresh Watchlist in Ideas, updating all saved tickers from both
 universes/timeframes using their original feeds. Downloads are deduplicated per
