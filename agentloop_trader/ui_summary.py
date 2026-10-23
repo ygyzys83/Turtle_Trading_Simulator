@@ -697,14 +697,23 @@ def compact_status_records(
     broker_state_stale: bool,
     kill_switch_enabled: bool,
     live_writes_blocked: bool = True,
+    intent_present: bool = True,
 ) -> list[dict]:
+    # This status belongs to the current New Trade research setup, not the
+    # independent Buy watchlist. An absent setup is normal waiting, not rejection.
+    if not intent_present:
+        trade_value, trade_state = "Waiting for setup", "info"
+    elif risk_approved:
+        trade_value, trade_state = "Risk check passed", "ok"
+    else:
+        trade_value, trade_state = "Blocked by risk checks", "block"
     return [
         {"Status": "Mode", "Value": mode_label, "State": "info"},
-        {"Status": "Trade Check", "Value": "passed" if risk_approved else "blocked", "State": "ok" if risk_approved else "block"},
+        {"Status": "New Trade Setup", "Value": trade_value, "State": trade_state},
         {"Status": "Alpaca", "Value": "connected" if broker_connected else "disconnected", "State": "ok" if broker_connected else "block"},
         {"Status": "Alpaca Data", "Value": "needs refresh" if broker_state_stale else "current", "State": "block" if broker_state_stale else "ok"},
         {"Status": "Stop Trading", "Value": "on" if kill_switch_enabled else "off", "State": "block" if kill_switch_enabled else "ok"},
-        {"Status": "Live Orders", "Value": "blocked" if live_writes_blocked else "available", "State": "ok" if live_writes_blocked else "block"},
+        {"Status": "Real-money Orders", "Value": "Off" if live_writes_blocked else "Available", "State": "ok" if live_writes_blocked else "warning"},
     ]
 
 

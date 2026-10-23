@@ -29,10 +29,19 @@ def test_compact_status_records_surface_daily_operator_state():
     statuses = {row["Status"]: row for row in rows}
 
     assert statuses["Mode"]["Value"] == "Paper trading"
-    assert statuses["Trade Check"]["State"] == "ok"
+    assert statuses["New Trade Setup"]["State"] == "ok"
     assert statuses["Alpaca"]["State"] == "block"
     assert statuses["Alpaca Data"]["Value"] == "needs refresh"
-    assert statuses["Live Orders"]["Value"] == "blocked"
+    assert statuses["Real-money Orders"]["Value"] == "Off"
+
+    # Waiting for a strategy signal must not look like a rejected trade or a
+    # global block on the independently evaluated queued setups.
+    waiting = compact_status_records("Paper trading", False, True, False, False, intent_present=False)
+    assert waiting[1]["Value"] == "Waiting for setup" and waiting[1]["State"] == "info"
+    rejected = compact_status_records("Paper trading", False, True, False, False, intent_present=True)
+    assert rejected[1]["Value"] == "Blocked by risk checks" and rejected[1]["State"] == "block"
+    live = compact_status_records("Live with approval", True, True, False, False, live_writes_blocked=False)
+    assert live[-1]["Value"] == "Available" and live[-1]["State"] == "warning"
 
 
 def test_agent_loop_stage_records_show_human_gate():

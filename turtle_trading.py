@@ -3880,6 +3880,7 @@ if loaded_queued_setup_notice and command_center_view == "New Trade":
 status_rows = compact_status_records(
     mode_label=mode_label,
     risk_approved=risk_check.approved,
+    intent_present=intent is not None,
     broker_connected=alpaca_status.connected,
     broker_state_stale=alpaca_state_health.stale,
     kill_switch_enabled=effective_kill_switch,

@@ -1,10 +1,23 @@
 # Trading Simulator - Conversation State Handoff
 
-Last updated: 2026-10-21 (Pacific Time)
+Last updated: 2026-10-23 (Pacific Time)
 
 Purpose: give a future Codex conversation enough context to continue this project without replaying the full conversation. This is a structured handoff, not a verbatim transcript. Read this file before proposing or implementing additional work.
 
-## October 21, 2026 — Russell 2000 universe (current)
+## October 23, 2026 — Clearer status-strip wording (current)
+
+Renamed Trade Check to New Trade Setup, explicitly tied to the current research
+intent. No intent displays Waiting for setup with neutral styling; a real intent
+shows Risk check passed or Blocked by risk checks. Live Orders is now Real-money
+Orders: Off in the existing locked/paper state, Available with amber styling if
+the existing live-availability condition passes. This changes display wording
+only, not risk decisions, live gates, queued setups or worker controls.
+Validation: 46 UI-summary and app documentation tests passed in 1.70 seconds,
+including waiting versus rejected setup states and real-money availability.
+Python syntax and git diff --check passed. No app, worker or trading controls
+were started or changed during development.
+
+## October 21, 2026 — Russell 2000 universe
 
 Added Russell 2000 (russell2000) as the third Universe option, using IWM equity
 holdings as an explicitly labeled proxy. Shared strict iShares parser/fetcher
